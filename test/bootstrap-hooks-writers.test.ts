@@ -256,7 +256,7 @@ describe('removeClaudeHooks [G5]', () => {
 });
 
 describe('MCP registration argv builders [G1, CX-P1.4]', () => {
-  test('registerClaudeMcp: stdio shape with scope + source env; serve pinned to --surface full', () => {
+  test('registerClaudeMcp: stdio shape with scope + source env; serve pinned to --surface full (REGISTRATION_SURFACE)', () => {
     const cmds = registerClaudeMcp({ gbrainBin: BIN, scope: 'project', sourceId: 'workspace' });
     expect(cmds).toEqual([
       ['claude', 'mcp', 'add', 'gbrain', '--scope', 'project', '-e', 'GBRAIN_SOURCE=workspace', '--', BIN, 'serve', '--surface', 'full'],
@@ -273,7 +273,7 @@ describe('MCP registration argv builders [G1, CX-P1.4]', () => {
     ]);
   });
 
-  test('registerCodexMcp: --env shape, no scope flag; serve pinned to --surface full', () => {
+  test('registerCodexMcp: --env shape, no scope flag; serve pinned to --surface full (REGISTRATION_SURFACE)', () => {
     const cmds = registerCodexMcp({ gbrainBin: BIN, sourceId: 'workspace', gbrainHome: '/ws' });
     expect(cmds).toEqual([
       ['codex', 'mcp', 'add', 'gbrain', '--env', 'GBRAIN_SOURCE=workspace', '--env', 'GBRAIN_HOME=/ws', '--', BIN, 'serve', '--surface', 'full'],

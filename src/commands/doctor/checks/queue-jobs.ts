@@ -7,9 +7,28 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import { resolveEnvNumber } from '../../../core/env-number.ts';
 import type { Check } from '../../doctor.ts';
+import { checkError, doctorVerify } from '../check-fix.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
+import { queueWorkerAlive, runWaitingJobsFix } from '../../../core/minions/no-worker.ts';
 
 /** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveEnvNumber = resolveEnvNumber;
+
+type RegistryFailure = { errno: string; path: string | null };
+
+/** A remote doctor caller never sees the host's filesystem path to the worker registry. */
+function registryFailureDetails(failure: RegistryFailure, remote: boolean): Record<string, unknown> {
+  return {
+    worker_registry_unreadable: true,
+    worker_registry_errno: failure.errno,
+    ...(remote ? { worker_registry_path_redacted: true } : { worker_registry_path: failure.path }),
+  };
+}
+
+function registryFailureLabel(failure: RegistryFailure, remote: boolean): string {
+  if (remote) return `${failure.errno}; path withheld from remote callers, run \`gbrain doctor\` on the brain host`;
+  return `${failure.errno}${failure.path ? ` at ${failure.path}` : ''}`;
+}
 
 /**
  * v0.41.18.0 batch_retry_health doctor check (codex H-9 thresholds).
@@ -31,7 +50,7 @@ const _resolveEnvNumber = resolveEnvNumber;
  * startup so bad GBRAIN_BULK_* config fails at doctor time, not first-retry.
  */
 /**
- * queue_health: Postgres Minion queue diagnostics.
+ * queue_health: Minion queue diagnostics (PGLite: waiting rows with no worker, see computePgliteQueueHealth).
  *
  * Includes the original stalled/depth/memory/prompt checks plus the #2557
  * no-worker signal: old `embed-backfill` jobs waiting on a queue with no live
@@ -45,21 +64,17 @@ export async function computeQueueHealthCheck(
     waitingDepthThreshold?: number;
     oldWaitingHours?: number;
     readWorkers?: () => Array<{ queue: string }>;
+    remote?: boolean;
   } = {},
 ): Promise<Check> {
-  if (engine.kind === 'pglite') {
-    return {
-      name: 'queue_health',
-      status: 'ok',
-      message: 'Skipped (PGLite — no multi-process worker surface)',
-    };
-  }
+  if (engine.kind === 'pglite') return computePgliteQueueHealth(engine, opts.readWorkers);
 
   try {
     // issue #1801: column is `status`, not `state` (schema.sql:780).
-    const stalledRows: Array<{ id: number; name: string; started_at: string }> =
+    // #7145: total counts every stalled job, not only the five listed.
+    const stalledRows: Array<{ id: number; name: string; started_at: string; total: number }> =
       await engine.executeRaw(
-        `SELECT id, name, started_at::text AS started_at
+        `SELECT id, name, started_at::text AS started_at, count(*) OVER ()::int AS total
            FROM minion_jobs
           WHERE status = 'active'
             AND started_at IS NOT NULL
@@ -91,15 +106,20 @@ export async function computeQueueHealthCheck(
     );
     const rssKillCount = Number(rssKillRows[0]?.cnt ?? 0);
 
-    const promptTooLongRows: Array<{ cnt: number }> = await engine.executeRaw(
-      `SELECT count(*)::int AS cnt
-         FROM minion_jobs
-        WHERE name = 'subagent'
-          AND status = 'dead'
-          AND finished_at > now() - interval '24 hours'
-          AND error_text LIKE 'prompt_too_long:%'`,
+    const promptTooLongRows: Array<{ phase: 'patterns' | 'synthesize' | 'other'; cnt: number }> = await engine.executeRaw(
+      `SELECT CASE WHEN key LIKE 'dream:patterns:%' THEN 'patterns'
+                   WHEN key LIKE 'dream:synth%' THEN 'synthesize'
+                   ELSE 'other' END AS phase,
+              count(*)::int AS cnt
+         FROM (SELECT COALESCE(idempotency_key, data->>'__released_idempotency_key') AS key
+                 FROM minion_jobs
+                WHERE name = 'subagent'
+                  AND status = 'dead'
+                  AND finished_at > now() - interval '24 hours'
+                  AND error_text LIKE 'prompt_too_long:%') dead
+        GROUP BY 1`,
     );
-    const promptTooLongCount = Number(promptTooLongRows[0]?.cnt ?? 0);
+    const promptTooLong = Object.fromEntries(promptTooLongRows.map(r => [r.phase, Number(r.cnt)]));
 
     const oldWaitingHours = opts.oldWaitingHours
       ?? _resolveEnvNumber('GBRAIN_QUEUE_NO_WORKER_WARN_HOURS', 1);
@@ -118,18 +138,22 @@ export async function computeQueueHealthCheck(
           AND name = 'embed-backfill'
         GROUP BY name, queue
        HAVING min(created_at) < now() - ($1::text::interval)
-        ORDER BY oldest_age_seconds DESC
-        LIMIT 5`,
+        ORDER BY oldest_age_seconds DESC`,
       [`${oldWaitingHours} hours`],
     );
 
     // Read the live-worker registry unconditionally (was: only when old
     // embed-backfill rows existed) — the structured `details.worker_alive`
-    // below needs it on every run. Cheap: one directory enumeration.
-    const workers = opts.readWorkers
-      ? opts.readWorkers()
-      : (await import('../../../core/minions/worker-registry.ts')).readWorkers();
-    const liveWorkerQueues = new Set(workers.map((w) => w.queue));
+    // below needs it on every run. Cheap: one directory enumeration. An
+    // unreadable registry is unknown liveness (null), never "no worker".
+    const registry = await import('../../../core/minions/worker-registry.ts');
+    let liveWorkerQueues: Set<string> | null = null;
+    let registryFailure: { errno: string; path: string | null } | null = null;
+    try {
+      liveWorkerQueues = new Set((opts.readWorkers ?? registry.readWorkers)().map((w) => w.queue));
+    } catch (e) {
+      registryFailure = registry.workerRegistryReadFailure(e);
+    }
 
     // Minions-visibility wave: structured details so machine callers stop
     // parsing prose. depth = total waiting jobs; oldest_age_seconds = age of
@@ -163,7 +187,8 @@ export async function computeQueueHealthCheck(
         },
         null,
       ),
-      worker_alive: waitingByQueue.every((r) => liveWorkerQueues.has(r.queue)),
+      worker_alive: liveWorkerQueues === null ? null : waitingByQueue.every((r) => liveWorkerQueues.has(r.queue)),
+      ...(registryFailure ? registryFailureDetails(registryFailure, opts.remote === true) : {}),
     };
 
     const problems: string[] = [];
@@ -172,7 +197,7 @@ export async function computeQueueHealthCheck(
         .map(r => `#${r.id}(${r.name})`)
         .join(', ');
       problems.push(
-        `${stalledRows.length} stalled-forever job(s): ${sample}. ` +
+        `${Number(stalledRows[0]!.total)} stalled-forever job(s)${Number(stalledRows[0]!.total) > stalledRows.length ? ` (oldest ${stalledRows.length} listed)` : ''}: ${sample}. ` +
         `Fix: gbrain jobs get <id> to inspect; gbrain jobs cancel <id> to force-kill.`
       );
     }
@@ -185,9 +210,17 @@ export async function computeQueueHealthCheck(
         `Fix: set maxWaiting on the submitter (or raise GBRAIN_QUEUE_WAITING_THRESHOLD).`
       );
     }
-    for (const row of oldWaitingRows) {
-      if (liveWorkerQueues.has(row.queue)) continue;
+    // #7145: queues with a live worker are dropped before the five-queue cap, so they cannot hide one without.
+    for (const row of oldWaitingRows.filter(r => !liveWorkerQueues?.has(r.queue)).slice(0, 5)) {
       const hours = Math.max(1, Math.round(Number(row.oldest_age_seconds ?? 0) / 3600));
+      if (registryFailure) {
+        problems.push(
+          `${row.depth} ${row.name} job(s) have waited on queue '${row.queue}' for up to ${hours}h; ` +
+          `the worker registry is unreadable (${registryFailureLabel(registryFailure, opts.remote === true)}), ` +
+          `so worker liveness is unknown. Check that directory's permissions, then run \`gbrain jobs supervisor status\`.`
+        );
+        continue;
+      }
       problems.push(
         `${row.depth} ${row.name} job(s) have waited on queue '${row.queue}' for up to ${hours}h ` +
         `and no live worker is registered for that queue. ` +
@@ -257,13 +290,26 @@ export async function computeQueueHealthCheck(
         );
       }
     } catch { /* best-effort — divergence probes never break doctor */ }
-    if (promptTooLongCount > 0) {
+    if (promptTooLong.patterns) {
       problems.push(
-        `${promptTooLongCount} subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
+        `${promptTooLong.patterns} dream patterns subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
+        `The reflections batch exceeded the patterns model's input context. ` +
+        `Fix: set a larger-context \`models.dream.patterns\`, or shorten \`dream.patterns.lookback_days\`.`
+      );
+    }
+    if (promptTooLong.synthesize) {
+      problems.push(
+        `${promptTooLong.synthesize} dream synthesize subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
         `Dream/synthesize transcripts exceeded the model's input context. ` +
         `Fix: \`gbrain dream --phase synthesize --dry-run --json\` to identify fat transcripts; ` +
         `set \`dream.synthesize.max_prompt_tokens\` to bound the per-chunk budget, or use a ` +
         `larger-context model (Opus 4.7 = 1M tokens vs Sonnet 4.6 = 200K).`
+      );
+    }
+    if (promptTooLong.other) {
+      problems.push(
+        `${promptTooLong.other} subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
+        `The prompt exceeded the model's input context; use a larger-context model or a shorter prompt.`
       );
     }
 
@@ -275,18 +321,50 @@ export async function computeQueueHealthCheck(
         details,
       };
     }
+    const noWorkerQueue = liveWorkerQueues === null
+      ? undefined
+      : oldWaitingRows.find(r => !liveWorkerQueues.has(r.queue))?.queue;
     return {
       name: 'queue_health',
       status: 'warn',
       message: problems.join(' '),
       details,
+      ...(noWorkerQueue !== undefined
+        ? { fix: { ...runWaitingJobsFix(engine.kind, noWorkerQueue), verify: doctorVerify('queue_health') } }
+        : { fix_unavailable_reason: 'operator_judgement' as const }),
     };
   } catch (e) {
+    return checkError('queue_health', 'scan queue health', e);
+  }
+}
+
+/**
+ * queue_health on PGLite (agent-first operator wave E5): there is no
+ * background worker, so every waiting row (outside parent-owned dream-inline
+ * queues) waits until a foreground `gbrain jobs work` drain runs it. Counted
+ * and reported as `no_worker` with that drain as the fix (it needs the brain
+ * exclusively). A live drain registered for the queue reads as ok.
+ */
+async function computePgliteQueueHealth(engine: BrainEngine, readWorkers?: () => Array<{ queue: string }>): Promise<Check> {
+  try {
+    const rows = await engine.executeRaw<{ queue: string; depth: number | string; oldest_age_seconds: number | string | null }>(
+      `SELECT queue, count(*)::int AS depth, EXTRACT(EPOCH FROM (now() - min(created_at)))::int AS oldest_age_seconds
+         FROM minion_jobs WHERE status = 'waiting' GROUP BY queue ORDER BY count(*) DESC, queue`,
+    );
+    const { isDreamInlinePrivateQueue } = await import('../../../core/minions/queue.ts');
+    const waiting = rows.filter(r => !isDreamInlinePrivateQueue(r.queue) && queueWorkerAlive(r.queue, readWorkers) !== true);
+    const depth = waiting.reduce((n, r) => n + Number(r.depth), 0);
+    const details = { engine: 'pglite', depth, by_queue: Object.fromEntries(waiting.map(r => [r.queue, Number(r.depth)])), worker_alive: depth === 0 };
+    if (depth === 0) return { name: 'queue_health', status: 'ok', message: 'PGLite: no jobs waiting for a worker.', details };
+    const top = waiting[0]!;
+    const hours = Math.floor(Number(top.oldest_age_seconds ?? 0) / 3600);
     return {
-      name: 'queue_health',
-      status: 'warn',
-      message: `queue_health scan skipped: ${e instanceof Error ? e.message : String(e)}`,
+      name: 'queue_health', status: 'warn', details,
+      message: `no_worker: ${depth} job(s) are waiting (${waiting.map(r => `${r.queue}=${Number(r.depth)}`).join(', ')}; oldest ${hours}h) and PGLite has no background worker, so they run only when a \`gbrain jobs work\` drain does.`,
+      fix: { ...runWaitingJobsFix('pglite', top.queue), verify: doctorVerify('queue_health') },
     };
+  } catch (e) {
+    return checkError('queue_health', 'count waiting jobs', e);
   }
 }
 
@@ -310,7 +388,7 @@ export async function computeQueueHealthCheck(
  */
 export async function computeWedgedQueueCheck(
   engine: BrainEngine,
-  opts: { readWorkers?: () => Array<{ queue: string }> } = {},
+  opts: { readWorkers?: () => Array<{ queue: string }>; remote?: boolean } = {},
 ): Promise<Check> {
   if (engine.kind !== 'postgres') {
     return { name: 'wedged_queue', status: 'ok', message: 'PGLite — no queue to check' };
@@ -349,6 +427,12 @@ export async function computeWedgedQueueCheck(
     if (wedged.length === 0) {
       return { name: 'wedged_queue', status: 'ok', message: 'No wedged queues' };
     }
+    // The verify-step doctor of an engine graduation runs on the fenced target before any worker may
+    // start, so waiting jobs carried from the quiesced source cannot have progressed yet.
+    if (process.env.GBRAIN_GRADUATION_RUN) {
+      return { name: 'wedged_queue', status: 'warn', message: `Graduation exemption: ${wedged.map(w => w.label).join(', ')} carried from the quiesced source; workers start after cutover.`,
+        details: { graduation_exempt: true, run_id: process.env.GBRAIN_GRADUATION_RUN, queues: wedged.map(w => w.queue) } };
+    }
     // #3063: "worker alive but not claiming work" would be a false claim
     // for a queue no worker process was ever subscribed to. Split the
     // wedged set by whether a registered live worker actually exists for
@@ -357,33 +441,29 @@ export async function computeWedgedQueueCheck(
     // operator toward restarting a worker that was never there — a queue
     // with no worker needs `start`, not `stop && start`.
     let liveWorkers: Array<{ queue: string }> = [];
-    let registryReadable = true;
+    let registryFailure: { errno: string; path: string | null } | null = null;
+    const registry = await import('../../../core/minions/worker-registry.ts');
     try {
-      // Lazy import mirrors computeQueueHealthCheck's own registry access
-      // above — the registry module stays off this file's eager import
-      // graph and only loads once a wedge actually needs the signal.
-      const getLiveWorkers = opts.readWorkers
-        ?? (await import('../../../core/minions/worker-registry.ts')).readWorkers;
-      liveWorkers = getLiveWorkers();
-    } catch {
+      liveWorkers = (opts.readWorkers ?? registry.readWorkers)();
+    } catch (e) {
       // A registry read error must not turn this check green (the queue is
       // demonstrably wedged) — but it also must not fabricate a liveness
       // verdict either way. Fall through to the liveness-unknown wording.
-      registryReadable = false;
+      registryFailure = registry.workerRegistryReadFailure(e);
     }
-    if (!registryReadable) {
+    if (registryFailure) {
       return {
         name: 'wedged_queue',
         status: 'fail',
         message:
-          `Wedged queue(s) — worker registry unreadable, worker liveness unknown: ` +
+          `Wedged queue(s) — worker registry unreadable (${registryFailureLabel(registryFailure, opts.remote === true)}), worker liveness unknown: ` +
           `${wedged.map((w) => w.label).join('; ')}. ` +
           `If a worker is running for the queue, restart it: ` +
           '`gbrain jobs supervisor stop && gbrain jobs supervisor start [--queue <name>]`; ' +
           'if none is, start one: `gbrain jobs supervisor start --queue <name> --detach`.',
         details: {
           wedged_queues: wedged.length,
-          worker_registry_unreadable: true,
+          ...registryFailureDetails(registryFailure, opts.remote === true),
           threshold_minutes: thresholdMin,
         },
       };
@@ -495,7 +575,8 @@ export async function computeOrphanedPrivateQueueCheck(engine: BrainEngine): Pro
          EXTRACT(EPOCH FROM min(created_at)) * 1000 AS birth_epoch_ms
        FROM minion_jobs
        WHERE queue LIKE 'dream-inline-%'
-       GROUP BY queue`,
+       GROUP BY queue
+       ORDER BY queue`,
     );
     // Live cycle locks with their acquisition time, for ownership correlation.
     // Liveness matches db-lock's own model: an unexpired TTL, OR a lapsed TTL
@@ -596,6 +677,17 @@ export async function computeOrphanedPrivateQueueCheck(engine: BrainEngine): Pro
       flaggedWaiting += candidateWaiting[i];
     }
     const flagged = recoverable.length + legacyUnowned.length + ownerPending.length;
+    // #7145: candidates past the classification cap were not checked, so none flagged among the first is not clear.
+    if (flagged === 0 && truncatedCandidates > 0) {
+      return {
+        name: 'orphaned_private_queue',
+        status: 'warn',
+        message: `Orphaned private queues unknown: ${truncatedCandidates} candidate queue(s) were left unclassified past the ${CLASSIFY_CAP} classified per run (no setting); `
+          + `none of the ${CLASSIFY_CAP} classified is provably orphaned (${suppressedByLiveLock + suppressedByLiveLease} possibly owned by a live cycle).`,
+        details: { paused_jobs: pausedTotal, suppressed_by_live_lock: suppressedByLiveLock, suppressed_by_live_lease: suppressedByLiveLease,
+          unclassified_candidates: truncatedCandidates, ...boundUnknownDetails('rows'), limit: CLASSIFY_CAP },
+      };
+    }
     if (flagged === 0) {
       const suppressed = suppressedByLiveLock + suppressedByLiveLease;
       return {
@@ -603,16 +695,14 @@ export async function computeOrphanedPrivateQueueCheck(engine: BrainEngine): Pro
         status: 'ok',
         // Truncation must stay visible on the ok path too: 100 live + 50
         // never-classified candidates is NOT a clean bill of health.
-        message: suppressed > 0 || truncatedCandidates > 0
-          ? `No provably-orphaned private queues (${suppressed} possibly owned by a live cycle` +
-            (truncatedCandidates > 0 ? `, ${truncatedCandidates} unclassified — re-run doctor to page through them` : '') + `)`
+        message: suppressed > 0
+          ? `No provably-orphaned private queues (${suppressed} possibly owned by a live cycle)`
           : 'No orphaned private queues',
-        ...(pausedTotal > 0 || suppressed > 0 || truncatedCandidates > 0
+        ...(pausedTotal > 0 || suppressed > 0
           ? { details: {
               paused_jobs: pausedTotal,
               suppressed_by_live_lock: suppressedByLiveLock,
               suppressed_by_live_lease: suppressedByLiveLease,
-              ...(truncatedCandidates > 0 ? { unclassified_candidates: truncatedCandidates } : {}),
             } }
           : {}),
       };
@@ -642,7 +732,8 @@ export async function computeOrphanedPrivateQueueCheck(engine: BrainEngine): Pro
       status: 'fail',
       message:
         `Orphaned private dream queue(s): ${[...recoverable, ...legacyUnowned, ...ownerPending].join('; ')}. ` +
-        `A supervisor restart cannot consume these parent-owned queues. ${remediation.join(' ')}`,
+        `A supervisor restart cannot consume these parent-owned queues. ${remediation.join(' ')}`
+        + (truncatedCandidates > 0 ? ` ${truncatedCandidates} more candidate queue(s) past the ${CLASSIFY_CAP} classified per run were not checked.` : ''),
       details: {
         orphaned_private_queues: flagged,
         recoverable_queues: recoverable.length,
@@ -806,10 +897,6 @@ export async function checkBatchRetryHealth(_engine: BrainEngine): Promise<Check
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'batch_retry_health',
-      status: 'warn',
-      message: `Could not check batch_retry audit: ${msg}`,
-    };
+    return checkError('batch_retry_health', 'check batch_retry audit', msg);
   }
 }

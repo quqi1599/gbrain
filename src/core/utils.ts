@@ -6,6 +6,8 @@ import type { StaleTakeRow } from './takes-row-types.ts';
 // truth for the hash-ephemeral frontmatter keys shared with the importer.
 import { QUARANTINE_KEY, CONTENT_FLAG_KEY } from './quarantine.ts';
 import { EMBED_SKIP_KEY } from './embed-skip.ts';
+import { guardSegmentedBody } from './page-body/page-shape.ts';
+import type { BodyStorage } from './page-body/types.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -91,6 +93,11 @@ export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
   // (paraphrases defeat content_hash_duplicates). The marker is re-derived
   // deterministically from the body, so dropping it from the hash is safe.
   ATOMS_SCAN_HASH_KEY,
+  // #5575 CEO-21: the lower-only `trust_tier` marker a below-owner write-through stamps. It labels the
+  // content, it is not content: page purge tombstones match (source_id, content_hash) with or without it,
+  // and an agent stamping it onto identical content is no content change. (The tier trigger still treats
+  // it as content: trust/schema.ts TRUST_EPHEMERAL_FRONTMATTER_KEYS excludes it.)
+  'trust_tier',
 ];
 
 /**
@@ -112,21 +119,34 @@ export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
  * callers usually leave them inside — both now hash identically).
  */
 export function contentHash(page: PageInput): string {
-  const fm: Record<string, unknown> = { ...(page.frontmatter || {}) };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete fm[k];
-  const rawTags = page.tags ?? fm.tags;
-  delete fm.tags;
-  const tags = Array.isArray(rawTags) ? rawTags.map(t => String(t)).sort() : [];
+  const { frontmatter, tags } = contentHashFrontmatterAndTags(page);
   return createHash('sha256')
     .update(JSON.stringify({
       title: page.title,
       type: page.type,
       compiled_truth: page.compiled_truth,
       timeline: page.timeline || '',
-      frontmatter: fm,
+      frontmatter,
       tags,
     }))
     .digest('hex');
+}
+
+/**
+ * The `frontmatter*` and `tags*` members of the content hash envelope: a copy
+ * of the frontmatter without HASH_EPHEMERAL_FRONTMATTER_KEYS and `tags`, and
+ * `page.tags ?? frontmatter.tags` as sorted strings. Shared with the streamed
+ * form (page-body/content-hash-stream.ts) so both hash identical bytes.
+ */
+export function contentHashFrontmatterAndTags(page: Pick<PageInput, 'frontmatter' | 'tags'>): {
+  frontmatter: Record<string, unknown>;
+  tags: string[];
+} {
+  const fm: Record<string, unknown> = { ...(page.frontmatter || {}) };
+  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete fm[k];
+  const rawTags = page.tags ?? fm.tags;
+  delete fm.tags;
+  return { frontmatter: fm, tags: Array.isArray(rawTags) ? rawTags.map(t => String(t)).sort() : [] };
 }
 
 /**
@@ -212,17 +232,19 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
     ? undefined
     : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
-  return {
+  const segmented = row.body_storage === 'segmented';
+  const page: Page = {
     id: row.id as number,
     slug: row.slug as string,
     type: row.type as string,
     title: row.title as string,
-    compiled_truth: row.compiled_truth as string,
-    timeline: row.timeline as string,
+    compiled_truth: segmented ? '' : row.compiled_truth as string,
+    timeline: segmented ? '' : row.timeline as string,
     frontmatter: (typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter) as Record<string, unknown>,
     content_hash: row.content_hash as string | undefined,
+    ...(segmented && { body_storage: row.body_storage as BodyStorage, body_bytes: row.body_bytes == null ? null : Number(row.body_bytes) }),
     ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
-    ...(row.knowledge_revision !== undefined && { knowledge_revision: String(row.knowledge_revision) }),
+    ...(row.knowledge_revision != null && { knowledge_revision: String(row.knowledge_revision) }),
     ...(row.text_projection_revision !== undefined && { text_projection_revision: row.text_projection_revision as string | null }),
     // v0.29 (column added in migration v40). Old brains pre-migration return undefined.
     emotional_weight: row.emotional_weight == null ? undefined : Number(row.emotional_weight),
@@ -240,6 +262,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // optional read; absent SELECT projections compile unchanged.
     ...(sourceKind !== undefined && { source_kind: sourceKind }),
     ...(sourceUri !== undefined && { source_uri: sourceUri }),
+    ...(row.withheld_source_path !== undefined && { withheld_source_path: row.withheld_source_path as string | null }),
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
     ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
@@ -255,6 +278,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // silently mis-attribute).
     source_id: (row.source_id as string | undefined) ?? 'default',
   };
+  return segmented ? guardSegmentedBody(page, 'rowToPage') : page;
 }
 
 /**
@@ -376,6 +400,45 @@ export function isUndefinedTableError(error: unknown): boolean {
   return /relation .* does not exist|no such table|undefined table/i.test(message);
 }
 
+/**
+ * #6599: strict old-schema predicate. True only when the error names exactly
+ * one of `names` as a missing table (42P01) or column (42703). With a SQLSTATE
+ * present, the code must match and the named object must too (driver metadata
+ * `table_name`/`column_name` wins over message text); a driver that drops the
+ * code is accepted only on the exact PostgreSQL/PGLite diagnostic. Unlike
+ * `isUndefinedColumnError`, a different missing object, a permission error or
+ * a data error that merely mentions the name never reads as "not migrated yet".
+ */
+export function isMissingSchemaObject(error: unknown, kind: 'table' | 'column', names: string | readonly string[]): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const wanted = new Set(typeof names === 'string' ? [names] : names);
+  const err = error as Record<string, unknown>;
+  const code = err.code === undefined || err.code === null ? '' : String(err.code);
+  if (code && code !== (kind === 'table' ? '42P01' : '42703')) return false;
+  if (code) {
+    const identifiers = (kind === 'table' ? ['table_name', 'table'] : ['column_name', 'column'])
+      .map(field => err[field]).filter((value): value is string => typeof value === 'string');
+    if (identifiers.length) return identifiers.every(identifier => wanted.has(identifier));
+  }
+  const message = typeof err.message === 'string' ? err.message.trim() : '';
+  const match = kind === 'table'
+    ? /^relation "([^"]+)" does not exist$/.exec(message)
+    : /^column (?:"([^"]+)"|([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?))(?: of relation "[^"]+")? does not exist$/.exec(message);
+  const identifier = match?.[1] ?? match?.[2];
+  return identifier !== undefined && wanted.has(identifier.split('.').pop()!);
+}
+
+/**
+ * SQLSTATE 22007 / 22008: a date or timestamp the database could not parse.
+ * On a read path that is the caller's input, never a degraded result or a
+ * server fault: list_pages reports it as invalid_params and the hybrid
+ * lexical arms rethrow it instead of failing open.
+ */
+export function isDatetimeInputError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === '22007' || code === '22008';
+}
+
 const _warnedKeys = new Set<string>();
 
 /**
@@ -386,9 +449,21 @@ const _warnedKeys = new Set<string>();
  * Test seam: `_resetWarnOnceForTests()` clears the set so per-process
  * warn-once contracts can be reasserted across test cases.
  */
+let warnOnceScope: (() => Set<string> | undefined) | null = null;
+
+/**
+ * A resident serve answering for a one-shot CLI (the warm CLI socket) gives
+ * each request its own once-set, so the CLI sees the warnings its own process
+ * would have printed.
+ */
+export function setWarnOnceScope(scope: () => Set<string> | undefined): void {
+  warnOnceScope = scope;
+}
+
 export function warnOncePerProcess(key: string, message: string): void {
-  if (_warnedKeys.has(key)) return;
-  _warnedKeys.add(key);
+  const warned = warnOnceScope?.() ?? _warnedKeys;
+  if (warned.has(key)) return;
+  warned.add(key);
   console.warn(message);
 }
 
@@ -441,10 +516,47 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
     modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
+    ...(includeEmbedding && row.embedding_image != null && { embedding_image: parseEmbedding(row.embedding_image) }),
+    // v244: projected UTF-8 span (bigint on Postgres); only when the SELECT carried the column.
+    ...(row.projected_byte_start !== undefined && { projected_byte_start: row.projected_byte_start == null ? null : Number(row.projected_byte_start) }),
+    ...(row.projected_byte_end !== undefined && { projected_byte_end: row.projected_byte_end == null ? null : Number(row.projected_byte_end) }),
     // Only present when the SELECT included it (getChunks); undefined elsewhere
     // so callers can tell "not selected" from "vector present".
     ...(row.embedding_is_null !== undefined && { embedding_is_null: Boolean(row.embedding_is_null) }),
   };
+}
+
+/**
+ * v0.34: effective_date / effective_date_source carried through from the
+ * pages join. Same three-state read as readOptionalDate elsewhere: the
+ * field is left UNTOUCHED when the column isn't in the projection (so
+ * legacy callers see undefined), set to null when the column was selected
+ * but the page row has no date, and to YYYY-MM-DD when populated. Postgres
+ * returns Date objects via postgres.js; PGLite returns strings. Normalize
+ * to date-only ISO so downstream prompt-builders don't see noise from
+ * midnight-UTC timestamps. Shared by search rows and frozen-hit rows.
+ */
+export function applyEffectiveDate(result: SearchResult, row: Record<string, unknown>): void {
+  if ('effective_date' in row) {
+    const raw = row.effective_date;
+    if (raw === null) {
+      result.effective_date = null;
+    } else if (raw instanceof Date) {
+      result.effective_date = raw.toISOString().slice(0, 10);
+    } else if (typeof raw === 'string' && raw) {
+      // Postgres TIMESTAMPTZ already serializes as "YYYY-MM-DD ..." — slice
+      // the date portion. PGLite returns the same shape via its parser.
+      result.effective_date = raw.slice(0, 10);
+    }
+  }
+  if ('effective_date_source' in row) {
+    const raw = row.effective_date_source;
+    if (raw === null) {
+      result.effective_date_source = null;
+    } else if (typeof raw === 'string' && raw) {
+      result.effective_date_source = raw;
+    }
+  }
 }
 
 export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
@@ -467,34 +579,7 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
   if (typeof row.source_id === 'string') {
     result.source_id = row.source_id;
   }
-  // v0.34: effective_date / effective_date_source carried through from the
-  // pages join. Same three-state read as readOptionalDate elsewhere: the
-  // field is left UNTOUCHED when the column isn't in the projection (so
-  // legacy callers see undefined), set to null when the column was selected
-  // but the page row has no date, and to YYYY-MM-DD when populated. Postgres
-  // returns Date objects via postgres.js; PGLite returns strings. Normalize
-  // to date-only ISO so downstream prompt-builders don't see noise from
-  // midnight-UTC timestamps.
-  if ('effective_date' in row) {
-    const raw = row.effective_date;
-    if (raw === null) {
-      result.effective_date = null;
-    } else if (raw instanceof Date) {
-      result.effective_date = raw.toISOString().slice(0, 10);
-    } else if (typeof raw === 'string' && raw) {
-      // Postgres TIMESTAMPTZ already serializes as "YYYY-MM-DD ..." — slice
-      // the date portion. PGLite returns the same shape via its parser.
-      result.effective_date = raw.slice(0, 10);
-    }
-  }
-  if ('effective_date_source' in row) {
-    const raw = row.effective_date_source;
-    if (raw === null) {
-      result.effective_date_source = null;
-    } else if (typeof raw === 'string' && raw) {
-      result.effective_date_source = raw;
-    }
-  }
+  applyEffectiveDate(result, row);
   if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
     result.message_id = row.message_id;
   }

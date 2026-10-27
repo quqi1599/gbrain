@@ -1,5 +1,681 @@
 # TODOS
 
+## RLS backfill follow-ups (filed 2026-10-26, GBRA-95, #7625)
+
+- [ ] **P1 — Guard triggers fail open under a scoped write role without lookup-table policies (#7632).**
+  **What:** make `gbrain_refuse_purging_derivation`, `gbrain_mark_derivation_scope_entry`, `gbrain_preserve_fact_withdrawal` and `gbrain_guard_inserted_facts` `SECURITY DEFINER`, owned by the schema owner with `search_path` pinned, through a new migration and the schema blob. **Why:** they run as SECURITY INVOKER, so a write role that neither owns the tables nor bypasses RLS, with write policies on the guarded table but none on `page_segment_derivation_purges` / `page_segment_derivation_purge_pages` / `fact_withdrawals`, reads no rows there: a purged derivation claim or a withdrawn fact can be stored again. Fresh installs already have RLS on those tables; v275 extends it to migrations-only brains. **Test:** e2e red/green under a scoped NOBYPASSRLS non-owner write role (red on master: the write succeeds; green: the guard refuses). **Effort:** M. **Priority:** P1.
+
+## Run-child heap follow-ups (filed 2026-10-24, GBRA-133)
+
+- [ ] **P3 — Heap growth of a managed sync/lint run-child after a history rewrite.** **What:** the per-child `--max-rss` cap from #7467 contains it, but the holder is unknown; synthetic lint --fix with 15k holds, a concurrent 60k-file sync drain plus lint, and a force-pushed rewrite with 15k `file_drift` holds all stayed flat, and every module-level cache is bounded. **Next:** a long-lived run-child across many cycles with a heap snapshot diff per publication. Reopen with the job's data if `ChildRssLimitError` fires. **Effort:** M. **Priority:** P3.
+
+## LHF wave 2 follow-ups (filed 2026-10-15, GBRA-107)
+
+Context: gbrain-evals `docs/plans/2026-10-15-lhf-wave-2/PLAN.md` ("NOT in scope" and "Round-2 dispositions"), audits in `docs/plans/2026-10-15-lhf-wave-2/audit/`. Reviewer findings are in `docs/plans/2026-10-15-lhf-wave-2/reviews/`: round-2 ids (`ceo-native-N`, `eng-outside-N`, ...) are in `findings.jsonl` and the matching `<phase>-<voice>.md`; round-1 findings are in the `*.r1.md` files.
+
+- [ ] **P2 — Tool-result size: one payload plan (old item 8 and the larger levers).** **What:** agent tool results are the cost lever left (gbrain's own provider calls are about 1% of a Cat 40 bill; only GPT-6.1 Sol is dearer per successful task than plain files, 0.32 vs 0.24 $ on Hard world M). `chunk_text` is 59% of search output and repeated searches 6.5%. Lean-row default elision needs structured per-brain `row_defaults` that `query` can recover by machine and that keep the `[gbrain dates]` labels and the `create_safety` guard; `context_pack` compaction needs an opt-in format or a v2 protocol decision, because `MEMORY_VERBS_v1` freezes card fields and `budget_used`. **Gate:** a powered, preregistered Cat 40 rule decided before any spend. **Findings:** `eng-native.r1.md` F3, F11; `eng-outside.r1.md` F9, F10, F15; `dx-outside.r1.md` F1, F2, F4; `ceo-outside.r1.md` F2, F3; `audit/cost.md`. **Effort:** L. **Priority:** P2.
+- [ ] **P2 — Skip the PGLite keyword count above a page threshold (old item 4).** **What:** the count runs serially with the search on PGLite's one connection, so deferring it saves about 0 ms; the saving is in skipping it. Needs a distinct `skipped` state (not `unavailable`), an honest denominator, and the original grace deadline preserved. **Gate:** the rule in "Measure the keyword count at scale" (under 1% `keyword_count_unavailable`, under 100 ms added p50 on the 55k slot). **Findings:** `eng-native.r1.md` F4; `eng-outside.r1.md` F4; `dx-outside.r1.md` F8. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Expansion model and rewrite count (old item 10).** **What:** Haiku 5.5 for query expansion needs one resolver shared by serving and `gbrain models`, an unchanged OCR fallback (the expansion model is also the OCR fallback) and unchanged init auto-pin rules. Expansion is off by default since item 0, so the saving is small. Goes with TODO-D (`TIER_DEFAULTS`, `synthesize`/`think` on Opus 4.7 at $0.094 per call, other utility-tier callers); #6335 stays open as TODO-D input. **Findings:** `eng-native.r1.md` F14, F15; `eng-outside.r1.md` F14; `ceo-outside.r1.md` F6, F7; `dx-outside.r1.md` F6. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Post-fusion read fan-out, fusion prefetch and the CLI config snapshot (from item 5).** **What:** item 5 kept the MCP per-request config snapshot, one settings statement per search, concurrent response-meta reads and concurrent entity resolve. These three each need their own failure-semantics and staleness design: one `Promise.all` must not become one failure domain for post-fusion ranking, the fan-out needs a pool-2 check, and a CLI snapshot needs a staleness rule for long-running commands. **Findings:** `eng-native.r1.md` F8, F9; `eng-outside.r1.md` F3, F11. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Off-reply `mcp_request_log` insert (dropped from item 5).** **What:** writing the request-log row after the reply takes its insert off every MCP call's reply path, but a bounded queue can drop rows, and an in-memory drop counter in `serve --http` is invisible to `gbrain doctor` (another process) and resets on restart, while the admin dashboard, per-client usage and `last_used_at` read the table. **Fix:** persist losses (a summary row or a counter row doctor reads), a config switch for blocking inserts when an operator needs complete audit rows, usage reports qualified over incomplete windows, and shutdown that awaits in-flight inserts; test forced backpressure, insert failure and restart from a fresh process. **Findings:** `dx-native-1`, `dx-native-2`, `eng-native-9`, `eng-outside-9`, `dx-outside-3`. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Saved-fact threshold move and the gated OR retry (not taken from #6734 by @troyhoffman-oss).** **What:** #6734 moved the saved-fact match threshold into SQL, which returns facts the old 200-row cap missed, and added a gated OR retry (55dc07cb) for strict keyword misses. Both change which results a search returns, so neither fits a parity-clean latency wave. **Fix:** take each with a retrieval-quality gate (saved-fact recall at the cap boundary; OR-retry precision on Cat 13 and Cat 40 development data) after the trigram index entry below is decided. **Source:** `audit/latency.md` (#6734 review), item 5 lane report. **Effort:** S-M each. **Priority:** P3.
+- [ ] **P2 — Automatic expression-statistics recovery on Postgres (item 6's heavier fix).** **What:** item 6 analyzes after every index build and recovers an already-present expression index automatically on PGLite; on Postgres doctor `planner_stats_stale` names it and an operator runs `gbrain repair planner-stats --apply`, because autovacuum waits for 10% of a table to change. **Fix:** a bounded maintenance owner (for example `post-upgrade` or the resident `serve` running `repairPlannerTable` once for flagged tables), with retry after a failed first ANALYZE, restricted roles kept as unknown, and no statement added to any search. **Findings:** `eng-native-7`, `ceo-outside-4`, `dx-outside-4`, `eng-outside-6`. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Paraphrased attendance questions (item 9, dropped by its preregistered gate).** **What:** the narrowed lexicon ("were present at", "was in the room for", "took part in", "participated in", "sat in on", the "participants" noun frame, with a funding-object guard) fired the development paraphrase split 150 of 150 on world-v1-attendees (0 before; recall@5 on 0.530 to 0.707) but the held-out set of 30 independently written questions fired 18 of 90 runs (20%; base 6 of 90) against the 80% floor: 6 of 30 held-out questions parse as attendance (base 2). The held-out author used frames such as "showed up", "made it to", "turned out for", roster and guest-list nouns. One competing-intent question (school attendance) already routes to attendance on master. "joined", "was at" and "went to" would route employment, education and location questions unless guarded by the anchor's type, and a resolver-only guard still changes keyword weights and title-mention ranking (`relational-plan.ts` `isRelationalQuery` feeds `hybrid/rank.ts` and `hybrid/request.ts`); a guard must follow schema-pack aliases of meeting types. **Gate:** a fresh held-out set (the 2026-10-15 one is spent), zero false routes on chosen relations and returned evidence. **Receipt:** gbrain-evals `docs/benchmarks/2026-10-16-lhf-wave-2-attendance-preregistration.md` and its result. **Findings:** `eng-outside-1`, `eng-native-13`, `ceo-native-11`, `ceo-outside.r1.md` F5. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Saved-facts trigram index (item 2, dropped by its insert gate; from #6734 by @troyhoffman-oss).** **What:** a GIN trigram index on the saved-fact match expression serves master's unchanged statement after ANALYZE on both engines (p50 19.6 to 3.4 / 94 to 12 / 167 to 23 ms on PGLite at 10k/50k/100k facts; 32 to 4.9 / 87 to 12 / 83 to 21 ms on Postgres), but with `fastupdate=on` the pending list makes the planner pick a seq scan, `fastupdate=off` costs +27-40% insert p50 and -45% batch throughput, and a 256k-1MB pending list keeps p50/p95/p99 flat but costs -11-37% batch throughput and 15-30 ms flush spikes, so every configuration fails the +25% insert gate. A shelved patch (1MB pending list, own rebuild command, EXPLAIN test) is in the GBRA-107 thread. **Fix:** a cheaper write path (for example a separate narrow match table or an index on the fact text only) or a gate that weighs batch imports separately. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Year tokens in planner anchors (old item 9b).** **What:** the planner refuses a quoted anchor before the year rule runs, so the year-title exception never applies to it; the fix needs anchor spans kept through the parser. **Findings:** `eng-native.r1.md` F16; `eng-outside.r1.md` F13. **Effort:** S. **Priority:** P3.
+- [ ] **P2 — Type-filtered vector search through the index walk.** **What:** a `type`/`types`/date filter marks the vector statement narrowed and disables the walk (`vector-statement.ts`), so the planner seq-scans `content_chunks` and sorts every candidate: `searchVector` p50 with `types: ['email']` 462 ms against 56 ms unfiltered on Postgres 20k, 195 against 58 ms on PGLite 10k. The second half of the email-typed symptom in "Profile email-typed searches on a real-corpus slot". **Fix:** let the walk serve type filters, choosing by the filter's page share from `pg_stats`. **Source:** `audit/latency.md` §2. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — PGLite keyword arm computes `stale` for every matched chunk.** **What:** `pglite-engine.ts` evaluates `SELECT MAX(te.created_at) FROM timeline_entries` per chunk before `ORDER BY … LIMIT` (Postgres uses `false AS stale`); removing it took `searchKeyword(limit 60)` at 10k pages from 78.6 to 72.0 ms with an empty timeline. **Fix:** compute it in the outer per-page select, after the limit, with the existing stale-flag tests as the equivalence check. **Source:** `audit/latency.md` §10. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Query-embed in-flight dedupe.** **What:** the query-embed cache stores only resolved vectors, so two concurrent identical queries (an agent's AND/OR prefetch, `query` escalation) both call the provider. **Fix:** memoize the in-flight promise per key. **Source:** `audit/latency.md` §9. **Effort:** S. **Priority:** P3.
+- [ ] **P2 — Size budget for the `full` tool surface.** **What:** every registration pins `full` (about 27.5k tokens per turn against 5.1k for `starter`), and the 25k-character ceiling in `test/mcp-schema-budget.test.ts` covers only `starter`. Narrowing the listing is out (hidden-tool tasks fail on `starter`, 0/20 vs 17/20), so the lever is description size on `full`. **Fix:** extend the per-tool budget to full-only tools, largest first, toward about 80k characters, moving long guidance to `docs/mcp/TOOL_REFERENCE.md`. **Gate:** the keyless ceiling test plus a Cat 40 dev smoke on `full` including family H (about $40). **Source:** `audit/cost.md` C5; `eng-native.r1.md` (deferred to its own DX plan). **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Chat-key-only `tokenmax` without a reranker.** **What:** with only a chat key the reranker is skipped silently and fused hybrid lost to bare vectors on concept questions (Cat 13: 99 vs 118 of 181 first-place, an old pin). **Fix:** re-measure on the current tree first, then pick the default for reranker-less installs. **Source:** `audit/evals-findings.md` §9. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Retrieval findings carried from gbrain-evals, each needing a fresh measurement before a fix.** Family E (long meeting transcripts ranked below short mail: renewal briefs 4-5/30 hybrid vs 14/30 keyword-only, stale numbers); mention links only on the next stale sweep, not on write; H1 aggregation at the floor on sealed and S worlds (4-11 of 60-120 cells, oracle about 100%); proactive brief gaps (task-start requests without a lexicon word fired 0/8; a cold first `turn_context` of 169-339 ms against the 300 ms cutoff dropped the brief in 3/9 smoke cells); scoped HNSW recall (10% source scope on 1M chunks: recall@50 0.777). **Source:** `audit/evals-findings.md` §11-15. **Effort:** S to L each. **Priority:** P3.
+- [ ] **P2 — `entity names` batch time goes to the identity-sibling read.** **What:** on a synthetic 55k-page PGLite brain a 50-name batch takes about 2.4 s, and most of the statement time is `readIdentitySiblings` (`src/core/mentions/siblings.ts`), whose `lower(title) LIKE '%: <subject>'` arm cannot use an index and scans every page of the linkable types once per name, then the per-name `page_aliases` reads. ANALYZE does not change it (LHF wave 2 item 6 receipt). **Fix:** an index-served form of the suffix match (for example a trigram index on `lower(title)` or a stored title-subject column), checked with EXPLAIN at 55k pages. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — #6771 (@lubosxyz): repair code metadata without re-embedding.** **What:** a contributor PR in a different subsystem (about $1 avoided per 15M-token repository on repair); out of this wave's scope, to revise in its own fix wave. **Source:** `audit/cost.md` C9. **Effort:** S. **Priority:** P3.
+
+## Cat 40 Hard fix wave follow-ups (filed 2026-10-07, GBRA-39)
+
+Context: gbrain-evals `docs/plans/2026-10-07-cat40-hard-fix/PLAN.md`; this wave fixes document retrieval only.
+
+- [ ] **P1 — Owner-phrase resolution with validity windows (deferred F1.3, C4).** **What:** references like "Dana Example's freight account" depend on who owned the account on that date; no extractor produces owner or handoff facts from page text. **Design:** the card gains `known_as` rows with each owner phrase's validity window, and the mention index links documents that use the phrase inside the window. **Gate:** ship only after a measured design: on development data, the share of needed owner-phrase documents an agent sees rises and no Cat 40 family regresses against the wave's development round. **Status (2026-10-13):** built as F5 on the Cat 40 Part 1 branch (owner-phrase windows, `owner_phrase` mention links, card `known_as` rows). F5 failed its preregistered d1b gate: the agent saw no more of the needed owner-phrase documents (+0.2 pp, interval −3.3 to +3.6; gbrain-evals `docs/benchmarks/2026-10-13-cat40-dev-d1b/`), because control already finds 81% through search and F5 surfaced documents only through F1 records in the all-on arm. Garry restored it by override ("approve all"): in round 3, all-on without F5 lost the gain (−5.3 pp [−9.5, −1.3] against all-on; H4 48/60 with 12 wrong), so F5 carries all-on's H4 result through F1's records. **Then:** F5 failed its precision ship condition on gbrain-evals `messy-company-v1` under a pre-hashed rule (6 links on 226 pages, 0 wrong, but 22 required: Wilson lower bound 0.610 against 0.85; recall 3.0% dev / 6.9% held-out, against 99.8% on M's templated text). Of the 118 misses, 67 had the right window but no phrase match and 51 had no window. F5 stays out of the shipped Part 1. **Next design:** must reach varied human prose. Tune on messy-company-v1's dev split only; its held-out split stays the gate. **Effort:** L. **Priority:** P1.
+- [ ] **P1 — H5 merge-chain recall.** **What:** recall should follow "A now uses B's discount code" redirections to B's current value, and corrections of B. **Gate:** H5 completions on development data at or above the fs arm. **Effort:** M. **Priority:** P1.
+- [ ] **P2 — Notice hygiene for unattended agents.** **What:** first-run ask and coaching notices ride on every session's tool results (498 results in the held-out run). **Gate:** share of tool results carrying notices drops with no loss in safety-notice delivery, measured on a Cat 40 development run. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Opt-in LLM alias extraction.** **What:** names declared only in free prose without a cue ("we just say Copper Fox") are not parsed; the card excerpt shows them. **Fix:** an opt-in, spend-gated extractor that proposes aliases with their source line. **Gate:** precision on a labeled real-brain sample at a Wilson 95% lower bound of 85% or more. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Scale-ladder eval above 200k documents (gbrain-evals).** **What:** the Hard world is 55k documents; alias fan-out, keyword counts and sibling grouping are unmeasured at 200k+. **Effort:** M. **Priority:** P3.
+- [ ] **P2 — Document-retrieval onboarding walkthrough on the `starter` surface.** **What:** the coding-agent tutorial registers `--surface verbs`, which has no `search`, so the card's search guidance points at a tool the agent lacks. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — Timed fresh-install check.** **What:** a timed run from install to the first MCP write and read, to catch onboarding regressions. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Read-only alias preview before an upgrade.** **What:** show which names the new alias grammar would derive on a brain before the version bump re-derives them. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `page_status` on card `edges[]` once edges carry a source.** **What:** F3 adds `page_status` to `context_pack` cards, newer-mention rows and `get_backlinks` rows, but not card `edges[]`, which name a slug with no source id, so a status looked up by slug could come from the wrong page. **Fix:** when edges carry the endpoint's `source_id`, read it with `readPageStatusByRef` under the card's read scope. **Effort:** S. **Priority:** P3.
+
+- [ ] **P2 — `degraded_recall` dedup hides a different later degradation on stdio.** **What:** the notice is deduped by code per process, so a rerank failure after an `embed_timeout` notice is never shown; AGENT_OPERATOR_v1 says stdio shows it on every affected call. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Profile email-typed searches on a real-corpus slot.** **What:** in the Hard run, `types` filters including `email` were 13% of searches and 44% of search time (p50 1.7 to 2.5 s, 16 to 18 s when short of the limit); a synthetic 55k brain did not reproduce it. **Fix:** `--explain` and `EXPLAIN ANALYZE` of the vector statement with `types: ['email']` on a calibration slot, then fix the plan. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Replay `remember(items)` by its canonical UUID.** **What:** children derive from the root string as sent, so a replay by the canonical UUID derives new children (items still dedup by text). **Fix:** store the root's client string and derive from it. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Store `client_request_id` on CLI-delegated and `extract_facts` writes.** **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Show the keyword count and `next` in CLI `gbrain search` output.** **Effort:** S. **Priority:** P3.
+- [ ] **P2 — Measure the keyword count at scale.** **What:** on PGLite the count runs serially with the search (one connection). **Gate:** `keyword_count_unavailable` under 1% of searches and added p50 under 100 ms on a 55k calibration slot; otherwise skip the count on large PGLite brains. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Quarantined referrers still appear in card `edges[]` (`context_pack` and `entity`).** **What:** the inbound edge read in `src/core/verbs/entity-card.ts` applies the private-page and private-origin filters but not the quarantine filter or the caller's trust floor, so an untrusted caller's `context_pack` card (and full `entity` card) lists a quarantined referrer's slug, link type and `links.context` sentence in `edges[]`, and a below-floor referrer on `context_pack`, while `records[]`, `referenced_by`, `newer_mentions` and F3 `page_status` leave them out (seen on the entity-records test world: `contracts/acme-quarantined` in `edges[]`, absent from `records`). Left as is in Cat 40 next wave Part 1. **Fix:** apply `quarantineFilterFragment` (unless an authorized `include_quarantined` read) and the pack's eligibility to the inbound edge query and `backlink_count`, with a hidden-referrer test on both engines. **Effort:** S. **Priority:** P2.
+- [x] **P2 — Analyze `pages` after the v240 name-lookup indexes on an upgraded PGLite brain.** **Done (LHF wave 2 item 6):** `buildIndexOnline` analyzes the table after every index build on both engines, and an already-present expression index without statistics gets them at the next PGLite maintenance pass (doctor names it; `gbrain repair planner-stats --apply` on Postgres); `test/planner-stats-expression-index.test.ts` covers the upgraded brain. The latency gain did not reproduce on a synthetic 55k-page PGLite brain: the title arm's estimate went from 275 rows to 1 with the same BitmapOr plan, and the 50-name batch stayed at 2,469 vs 2,396 ms p50 (2 interleaved rounds of 3), because most of its time goes to the sibling read below. Not re-measured on the World M slot. **What (as filed):** v240 builds `idx_pages_source_title_lower` and `idx_pages_slug_trgm` without refreshing planner statistics, and PGLite runs no autovacuum. On the 55,838-page World M PGLite brain with the indexes freshly built, a 50-name `entity names` batch took p50 5,378 ms on master `09d21554d`, and 1,200 ms after `ANALYZE pages` (1 name: 89 → 42 ms; 10 names: 1,128 → 276 ms). The pre-index path took 17,728 ms. **Fix:** `ANALYZE pages` after the v240 handler on PGLite, or a planner-stats refresh like `plannerStatsForLinkDrain`, with a plan test on an upgraded brain. **Effort:** S. **Priority:** P2.
+
+## CI runtime follow-ups (filed 2026-10-09, GBRA-64)
+
+- [x] **P2 — Bump Bun when a release carries 13a98b0 (oven-sh/bun#44581); check the compare, not the version number.** **Done (#6586):** Bun 1.4.3 carries it (`compare/bun-v1.4.3...13a98b0` reports `behind`); CI, the release compiler, the local and Ubicloud gates and the in-agent runtime pin move to 1.4.3. The install floor stays 1.4.0; the floor matrix cells still carry the defect, and `scripts/capture-test-log.ts` names it live.
+
+## Content-repair lane follow-ups (filed 2026-10-09, GBRA-72, #6377)
+
+Deferred by the plan (`docs/plans/2026-10-09-001-fix-content-repair-lane-6377-plan.md`, §2 B4 and §8 rows 4-7). The lane recommends a page merge and never executes one; interpretive frontmatter fixes stay consent-gated.
+
+- [ ] **P3 — Judgment prompt v2: reciprocal duplicate notes mean agreement.** **What:** in the 2026-10-09 eval (gbrain-evals `docs/benchmarks/2026-10-09-content-repair-judgment.md`) nearly every true duplicate the models deferred was a pair whose two hygiene notes each read "Duplicate of the other"; the `why` sentences say the models read the identity as the same but the notes as disagreeing about which page is primary (prompt rule 2 → rule 8). **Fix:** a rule in `src/core/content-repair/judgment.ts` that treats reciprocal notes as agreement on identity (the canonical is then the page the path slug names, or the one with more content), bump `JUDGMENT_PROMPT_VERSION`, rerun the preregistered eval under the new version and update `CONTENT_REPAIR_MEASURED_MODELS` from it. **Effort:** S.
+- [ ] **P2 — A page merge executor for `merge_recommended` holds.** **What:** a `frontmatter_slug_conflict` hold whose two pages describe the same thing ends in `merge_recommended` (`meta.content_repair.action: merge_into`, the canonical slug on the hold, the paragraph in `sync status`), and a person merges the unique sections by hand. The only merge primitive is the phantom-redirect shape (`cycle/phantom-redirect.ts`, `phantom-redirect-managed.ts`), which refuses custom frontmatter and timeline residue; `deletePageThrough` is best-effort and takes no commit subject. **Fix (Codex's requirements, outside review of the plan):** a coordinated two-page intent that binds both page ids, both revisions, the source incarnation, the owner epoch and both file hashes, so a concurrent writer on either page fails the merge instead of being overwritten; withdrawals moved before facts (a withdrawn claim must stay withdrawn after the merge); metadata, visibility, tags and timeline rows preserved or the merge refused (never silently dropped, never loosened); a revision-bound deletion of the duplicate with a redirect alias left behind; database-aware recovery for a merge that dies between the two writes (the recovery path finds both halves from the receipt, not from the files); and a concurrent-writer test that edits the duplicate between the plan and the apply and proves nothing is lost. The eval's hard-failure rule (`evals/content-repair-judgment/`) gates which model may recommend a merge; the executor runs only on a recommendation the user approved by hash. Until then `gbrain sync status` names the canonical page and nothing is merged.
+- [ ] **P3 — Unattended interpretation of recoverable frontmatter.** **What:** the issue's brain needed 198 YAML frontmatter repairs in one week (`invalid_frontmatter` with `needs_interpretation`: folded title lines, duplicated keys, unclosed lists), each applied by an external agent against `gbrain repair frontmatter --include-ambiguous`; the lane leaves them consent-gated because every one changes what the file says. **Fix:** classify the recoverable shapes whose interpretation is unique (a continuation line that can only belong to the previous key, a duplicate key with byte-identical values) and let the lane apply those unattended with a receipt, keeping the rest (`ambiguous_identity_key`, `ambiguous_protected_key`, a duplicate key with two values) on the hash-bound consent path; measure on the issue's week of repairs before turning any shape on by default.
+
+## Managed sync reliability contract follow-ups (filed 2026-10-08, GBRA-61, #6317)
+
+Deferred by the plan (`docs/plans/2026-10-08-001-fix-managed-sync-reliability-contract-6317-plan.md`, §7 and ENG-10). One consumer per host ships as a preference; these are the pieces that would make it a guarantee or extend it.
+
+- [ ] **P2 — Postgres thin-client parity: every write operation delegates to a live owner over IPC.** **What:** on PGLite every write from a second process goes through the owner's persistence IPC socket (`src/mcp/local-client.ts`); on Postgres each process keeps its own consumer or runs waiter-only against the `persistence_consumers` row, and only the managed catch-up delegates (through the serve-delegated sync family). **Fix:** a Postgres transport for the write operations (admission, receipt waits, settlement wake) to the resident owner, a multi-PR change that retires the waiter-only seam. **Effort:** L. **Priority:** P2.
+- [ ] **P3 — DB-resident lane state for a catch-up driven from another process.** **What:** lane state (`LaneState` in `sync-lanes.ts`: claimed/begun sets, task counts, step-down) lives in the process that opened the run; D1 (a′) sidesteps it by running the whole drain in the serve. **Fix:** lane rows and step-down in the database so a driver process and an owner process can share one lane run (D1 option (b)). Only needed if (a′) is ever reversed. **Effort:** M. **Priority:** P3.
+- [ ] **P2 — A fenced exclusive consumer role.** **What:** the heartbeat row is evidence of a process, not a fenced role: two processes that start within one renewal can both start full, nothing demotes a consumer that started full, and the overlap is only reported (`two_consumers_on_host`). **Fix:** a fencing token on the `persistence_consumers` row (compare-and-set on promotion, carried on every claim statement) so a second full consumer cannot claim, with the demotion path and a split-brain test. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Cross-process consumer wake (`pg_notify` on admission).** **What:** `awaitWrite`'s wake is in-process only (`service.ts` `consumer.wake(true)`), and the owner's idle backoff reaches 5 s, so short-lived foreground commands (`put`, `import`, `dream`, `cycle`) keep their own consumer instead of running waiter-only; a waiter-only `gbrain put` would often return `writer_pending`. **Fix:** `pg_notify` on admission with a LISTEN in every full consumer, then move the foreground kinds to waiter-only. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — External alerting on `data_moving`.** **What:** `sources status --json`, doctor `managed_sync_not_moving` and one `[gbrain notice]` from `serve` are the only signals that a managed source stopped moving; nothing reaches a pager or a metrics endpoint. **Fix:** expose `data_moving` / `not_moving_since` on the authenticated metrics surface (never `/health`, which stays liveness-only and unauthenticated) and document a supervisor probe around `gbrain sources writer movement --warn-only --json`. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `gbrain sources writer dump <request-id>` (C2, G6 deferred).** **What:** `writer status --json` names the parked step, `waiting_on` and `last_sql`; a frame list of the parked preparation (step, waiting_on, started_at, last_sql) over the resolve IPC kind `claim_dump` was designed and deferred because a stack captured at step entry does not show where the await is suspended and a signal path cannot identify a process across pid namespaces. **Fix:** build it IPC-only (same socket and secret as the `sync_*` family, owner must be the resident serve) if `last_sql` turns out not to name the await in practice; never a `--signal` path. **Effort:** M. **Priority:** P3.
+
+Same-host dead-owner release (G2, "a consumer that finds a running claim whose stamped owner pid is dead on this host releases it at once") stays the open entry under "Foundations 2 crash robot follow-ups" below (*A restarted Postgres owner waits out its dead predecessor's claims*); the `persistence_consumers` row now carries the pid, nonce and pid namespace it needs.
+
+## Managed sync preparation stall follow-ups (filed 2026-10-08, GBRA-59, #6278)
+
+- [ ] **P3 — Repeated facts fences merge as a deterministic repair.** **What:** two facts fences in one section are a `manual` `repeated_marker` hold today; #6278 only makes the hold visible (maintenance writes on such a page are skipped before submission). **Fix:** a Tier 1 merge when the fences' row numbers are disjoint, with its own preservation proof and fixtures: section context, superseded references and protected rows (`fence-repair/types.ts`), and a row-number allocation rather than concatenation when a fence has none. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `writer status --probe` captures `pg_stat_activity` for the blocker.** **What:** a stalled preparation reports `waiting_on` only where gbrain observed it (`git`, `fs`, `db`, `pool`, else `unknown`); a Postgres lock wait is not observable without the server's view. **Fix:** with `--probe`, read the blocker backend's `wait_event_type`, `wait_event` and `query_start` so `waiting_on` can report `lock` with evidence. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Structural preservation of unadopted legacy rows inside destructive reconcile.** **What:** #6278 keeps a page that still holds unadopted legacy fact rows out of destructive reconciliation (`cycle/extract-facts.ts`), so that page's fact index stays frozen until its rows are adopted. **Fix:** exclude active `row_num IS NULL` rows from stale classification inside the reconcile itself so every page reconciles; larger and riskier, and it needs the mixed-page test run on both engines. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Worker-process isolation for preparation awaits that cannot be cancelled.** **What:** a preparation that ignores cancellation (a transaction, synchronous git or filesystem work, PGLite WASM) can only be raced and then abandoned; the abandoned await keeps its connection until it settles, bounded by the per-process cap and a one-shot sync exiting. **Fix:** run non-cancellable preparation in a worker process the owner can kill at the ceiling, so a resident owner (`serve`, the jobs worker) never needs a restart. **Effort:** L. **Priority:** P3.
+
+## Fix wave 12 follow-ups (filed 2026-10-07, GBRA-57)
+
+- [ ] **P2 — Free relabel for a legacy bare `embedding_model` row (#6113, carried from wave 11 W4.7).** **What:** wave 12 ships the refusal that names `gbrain migrate embeddings --to <provider:model> --dry-run`; the zero-cost relabel is not built. **Fix:** a restamp-only branch taken only when bare row, recipe, unambiguous model, dimensions, gateway config and every stored chunk/fact/take stamp agree (a NULL stamp on a non-null vector refuses), translating the model-bound chunk input hashes (`embedding-input-hash.ts`) and recording prior labels (doctor `embedding_identity_unqualified` already names the paid preview). Needs a concurrent old-model worker test on Postgres. **Effort:** M-L. **Priority:** P2.
+- [x] **P2 — Hard ceiling for a stuck managed write (W3.3b, #6176).** **Completed: v0.60.112.0** — every managed write's preparation has a budget and a hard ceiling (`persistence.sync_preparation_ms`, `persistence.maintenance_preparation_ms`, `persistence.preparation_ceiling_ms`, `persistence.max_preparation_attempts`; the `preparation_deadlines` switch turns them off), and a write cut off twice (`persistence.max_preparation_attempts`, a kill mid-preparation counts too) is finished `failed` with `preparation_stalled` (#6278; this entry proposed `write_stalled` after 3 releases and reusing `persistence.max_claim_ms`, which keeps its doctor meaning). A sync holds the file and keeps going; publication stays detection-only (see the open entry below). Pinned by `test/persistence-consumer-scheduling.test.ts`, `test/e2e/persistence-preparation-deadline.e2e.test.ts`, `test/e2e/persistence-group-deadline-postgres.test.ts`.
+- [ ] **P3 — Transcript budget for dream patterns children (#6236).** **What:** wave 12 de-duplicates claim records and counts deaths per source; a per-job transcript budget and subagent tool wrapper are not built. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Quarantine junk classifier masks code (#6259).** **What:** fenced and inline code still trip junk patterns; wave 12 ships the override only. **Effort:** S. **Priority:** P3.
+- [x] **P3 — Restore image pages' text projection after managed activation (#6223).** **Completed: #6803 wave** — `gbrain projections drain` seals the image pages the importer already attested (`sealable`) keyless and in place; doctor `text_projection_readiness` counts every class of the queue and routes the rest (`reimport`) to `gbrain embed --stale --images`. Pinned by `test/projection-image-drain.test.ts` and `test/e2e/projection-image-drain-postgres.test.ts`.
+- [ ] **P3 — `type: code` pages skip body link extraction (#6228).** **What:** code pages no longer abort extraction but still add noise rows to `gbrain wanted`. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Cyrillic-aware slug folding (#6235's bug).** **What:** `Сергей` slugs to `сергеи` because й loses its breve; #6235 was declined (undisclosed changes, a self-granting migration). Needs its own designed wave covering aliases and in-place upgrade. **Effort:** L. **Priority:** P3.
+- [ ] **P3 — `extract all --source db` keeps finished pages on an abort (#6228 S4).** **What:** only the stale sweep stamps finished pages; the `all` path runs links then timeline, so stamping on a links abort would mark pages timeline-fresh. **Fix:** per-phase stamps. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Postgres vector arm without Materialize (#6039, second half).** **What:** `enable_material=off` was moved out of wave 12 because one scale run can't show no regression. **Fix:** a retrieval-latency eval at several brain sizes before changing the default. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Wave 12 CSO lows (GBRA-57 review of v0.60.106.0).** Each fails closed or needs a trusted path today. (T1) `quarantine_override`'s body hash isn't keyed, so a file synced on a trusted path (an upstream repo behind a read-only mirror source) can compute its own and bypass the content-quality gate: key it with a brain-local secret. (G1) The hardened-Git blocklist misses Git's option abbreviations (`--textc`, `--filt` ran textconv and clean): switch to an exact allow-list of full options. (G2) `hardenedPathDirty` passes paths as pathspecs, so `[ab].md` and `*.md` glob: use `:(literal)`. (G3) A `.git` planted in a world-writable ancestor (`/tmp`) parks Git effects as `git_unavailable`: stop discovery at an ownership change. (G4, pre-existing) an inherited `GIT_DIR` makes a plain directory report durable. (L1) The skill-lint paid-consent check is lexical and bypassable; treat it as a tripwire, not a gate. Plus the review's hardening notes (quote `pollCommand` arguments, return the parsed `LLMS_REPO_BASE` URL). **Effort:** S each. **Priority:** P3.
+- [ ] **P3 — Batch `remember` accepts a non-UUID top-level `request_id`.** **What:** wave 12's agent smoke saw a batch `remember` (with `items`) accept `7c1e2a9e-5b3f-4d0a-9e61-qul1-20260915`; single-fact `remember`, `edit_page` and `add_timeline_entry` refuse non-UUID ids. **Fix:** validate the top-level `request_id` on the batch path the same way, with a test. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `forget` caveat inside Claude Code's 2,048-character head (wave 11 CSO E4).** **What:** wave 12 moved it next to the "facts saved with remember" sentence and Opus 5.5 write-back fell 20/20 -> 15/20 (attribution 19/20 with the old text; gbrain-evals branch `capy/w12-agent-smoke`), so it was reverted. Any added clause before clause 7 pushes "Answering from the brain" further past the cap on the full surfaces. **Fix:** a net-zero-length rewrite of clauses 1-6 that fits the caveat, then 20 Opus write-back cells (about $4.50) before shipping. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Connector tests asserting a complete run under the 1.5 s fixture budget.** **What:** `test/helpers/connector-fixture.ts` cuts every connector wait to `testWaitMs(1_500)`; a cold consumer start on a loaded VM can exceed it, so a healthy-owner run returns `writer_pending` (root-caused in wave 12 for `connector-wave3`, fixed with `withHealthyOwnerBudget`). About 30 other files using `createConnectorFixture` assert `not.toBe('partial')` the same way (e.g. `connector-holds`, `persistence-connectors`). **Fix:** wrap their healthy-owner runs in `withHealthyOwnerBudget`. **Effort:** S. **Priority:** P3.
+
+## Fix wave 11 follow-ups (filed 2026-10-07, GBRA-55)
+
+- [ ] **P2 — Ceiling for a stuck managed publication (W3.3b, #6176).** **What:** a publication that hangs inside a live consumer keeps renewing its claim; only the preparation phase has a ceiling now (#6278), so publication keeps detection only (`claim_phase`, doctor `persistence_write_stall` past `persistence.max_claim_ms`). **Fix:** a phase-split ceiling: a statement timeout inside `publishMutation`, a recovery handoff that releases the root, and a bounded abandonment counter, written against the consumer/coordinator after GBRA-45's sync-feeder work lands. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Free relabel for a legacy bare `embedding_model` row (W4.7, #6113).** **What:** brains seeded before the qualified default store `text-embedding-3-large` without a provider, and the managed facts resolver refuses it. **Fix:** a restamp-only branch in `gbrain migrate embeddings --to <provider:model>` taken only for a positively established legacy identity (known seed default, every chunk/fact/take stamp equal to the bare value, known provider recipe, equal dimensions), then a resolver refusal and doctor finding that name it. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Run the keyword and vector arms concurrently on Postgres (#5989).** **What:** the CJK keyword arm's time adds to every hybrid search. **Fix:** start both arms together in `hybrid.ts`, with a retrieval eval before the default changes. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — CJK relevance judgments and a pg_trgm decision (W6.2, D11).** **What:** the capped keyword retry and the OR fallback are covered by invariant tests, not relevance judgments; a trigram index on `chunk_text` was deferred. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `extract.ts` rebuilds the basename index per lookup.** **What:** `resolveBasenameMatchesFromSlugs` rebuilds the whole index on every call (O(N) per wikilink on the filesystem path); this, not Unicode normalization, is the cost #6178 targeted. **Fix:** build once per run in the caller. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `--json` BigInt ratchet.** **What:** about 223 `JSON.stringify(…, null, 2)` command sites can crash on Postgres BigInt values (#6193 was one). **Fix:** a lint that `--json` paths use `writeJsonDocument` or the BigInt replacer, then convert the sites. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Agent-operator conformance suite in CI.** **What:** run every bundled skill's headless command in dry/offline mode plus every command's `--help` and `--json` on a seeded brain. Subsumes the help gate, the skill-command lint and the BigInt ratchet. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `schema remove-*` read the type name from the first non-flag token.** **What:** `schema remove-type --pack mine people` reads `mine` as the type (fails loudly); the same class W1.6 fixed for `add-type`. **Fix:** parse the name as the first positional that isn't a flag value. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `search modes --reset --source <mode>` should be `--mode`.** **What:** `--source` means a brain source everywhere else. **Fix:** add `--mode`, keep `--source` as a deprecated alias with a notice. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Per-source `pages purge-deleted`.** **What:** the purge is brain-wide; wave 11 refuses `--source` instead of silently purging everything. **Fix:** scope the purge by source when asked. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Doctor warning for harnesses with an instruction cap (#6170).** **What:** wave 11 moved the writeback contract inside Claude Code's 2,048-character cap; other harnesses with caps aren't detected. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Expire capture-lane facts created after an explicit writeback `off`.** **What:** wave 11 stops new capture under `off`; facts captured before the fix stay. **Fix:** record the off time, then a preview/apply repair that retires facts captured after it. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Workspace-lane (`bootstrap-v1`) hook marker durability.** **What:** the same lost-marker problem W2.2 fixed for the harness lane. **Fix:** stamp the lane first, then match by command shape. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `remember` replay hitting `source_changed` stalls `repair failed-writes` (#5994 side note).** **Fix:** classify it in the preview as `file_database_drift` with the reconcile command. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `waiting` follow-ups (#6174).** **What:** the 500-row fetch cap and the unbounded count term in the score. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Measure dream patterns sizing on a real paid run (W5.11).** **What:** `planPatternsRun` assumes cost is linear in reflections; it's unmeasured. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Deferred product calls from the wave 11 plan.** Coordinated type cleanup on managed brains (#6196 C), #6122 (b)/(c) and a managed commit path for agreed git-dirty bytes (#6138), connector contact pages yielding mentions to their main-brain twin (#6158), coordinated raw-file uploads (#5963 part B). Each needs a decision before code. **Priority:** P3.
+- [ ] **P3 — #6131 Darwin export publication.** **What:** not reproduced on macOS 26 (800k publications, arm64 and x64); the report is from macOS 27. **Fix:** rerun the C loop when a macOS 27 runner is available; ship our own fix and rebuilt prebuilds only if it reproduces. **Priority:** P3.
+## Fix wave 9 follow-ups, round 2 (filed 2026-10-07, GBRA-41)
+
+Context: the wave 9 follow-up wave (plan reviewed 2026-10-06; Garry approved every recommended decision on 2026-10-07). These are the items that wave deliberately leaves out.
+
+- [ ] **P3 — Stall detection for subagent turns, both transports.** **What:** `ai.chat.per_turn_timeout_ms` bounds a whole subagent turn (default 30 min) because neither transport streams, so a hung provider holds the turn for the full budget. Deferred from the wave 9 follow-ups (Decision 1) until GBRA-52 (#6066, which edits the Google instantiation in `ai/gateway.ts`) lands. **Fix:** cover both transports, never only one: (1) the default Anthropic-direct path (`makeSubagentHandler` in `src/core/minions/handlers/subagent.ts` calls `messages.create` on the Anthropic SDK client) moves to `messages.stream` with an idle timer; (2) the gateway path (non-Anthropic routes through `toolLoop`) moves to `streamText` with execute-less tools and `timeout.chunkMs`, raising the `ai` floor in `package.json` to `^6.0.174`. Measure first-chunk and between-chunk windows on current frontier routes before picking defaults (thinking routes can stay silent for minutes; a 120-300 s window kills legitimate reasoning). Add a stall error code with `fix.next`, an error-catalogue entry and a config override (for example `ai.chat.stall_timeout_ms`). **Effort:** M. **Priority:** P3.
+- [ ] **P2 — Receipts for the pages, timeline and alias derived writers.** **What:** the wave 9 follow-ups put admitted persistence requests (receipts) on the managed-brain facts and takes writers it touches and add a coverage test that names every other guarded-table writer; the derived writers in `src/core/page-state/materialize.ts`, `src/core/timeline-extract.ts`, `src/commands/reindex-aliases.ts`, `src/core/mentions/pass.ts` and the `gbrain repair timeline-comments` row cleanup (`src/core/repair/timeline-comments.ts`, wave 12) still write on managed brains without one and are listed there with a TODO. **Fix:** admit a persistence request per derived batch (page revision as the CAS), then drop their TODO rows from the coverage table. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Production fail-closed receipt guard.** **What:** the receipt requirement (`gbrain.write_request` for facts and takes writes on managed brains) is enforced only in the contract-test harness plus the coverage table (Decision 10). **Fix:** once the coverage table lists no unreceipted writer, enforce it in the production guard function as well (fail closed; a function-only replace, no table lock), behind a `BEHAVIOR_CHANGES` row. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — Owner delegation for every `gbrain repair` kind under a live serve.** **What:** while `gbrain serve` owns a PGLite brain, repair kinds that open the engine wait on its lock or refuse with stop, repair, restart. **Fix:** delegate each repair kind's preview and apply through the owner (as `takes remove` does), keeping preview hashes and `--expect` consent identical to the local path. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Typed `ShutdownInterruptedError` for cooperative handlers.** **What:** during worker shutdown only `UnrecoverableError` now burns an attempt (Decision 7); every other error from an in-process handler is still treated as a shutdown interruption, because cooperative handlers throw plain `Error`s (`subagent.ts`, `shell.ts`). **Fix:** have every cooperating handler throw a typed `ShutdownInterruptedError` on the shutdown abort, then take the requeue path only for that type so ordinary failures during a deploy burn an attempt. **Effort:** M. **Priority:** P3.
+- [ ] **P2 — Judge-panel refresh to current frontier models.** **What:** the takes-quality panel (`openai:gpt-5.2`, `anthropic:claude-opus-4-7`, `google:gemini-2.5-flash`) and the cross-modal slots (`openai:gpt-5.2`, `anthropic:claude-opus-4-7`, `deepseek:deepseek-v4-pro`) predate the project's newest-model-per-family eval rule. **Fix:** an eval-owned, preregistered panel change in gbrain-evals first (keep at most one older model as the link to previous results), then update the defaults, their recipe listings and the default-panel tests together. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — gpt-6 judges cannot lower reasoning effort.** **What:** the pinned `@ai-sdk/openai` (3.0.58) does not recognise gpt-6 ids as reasoning models and drops `reasoningEffort` with a warning, so `thinking: 'off'` on gpt-6-sol/-luna cannot send `none` and on gpt-6-astra/6.1-sol cannot send the `low` floor; `thinking-off.ts` has no gpt-6 row, so those routes send no option and keep the requested cap (fence repair's `openai:gpt-6.1-sol` per-page cost depends on it; a 32,000-token reservation would exceed its $0.30 cap). **Fix:** bump `@ai-sdk/openai` to a release that knows gpt-6 (or set `forceReasoning`), verify the request live (including how much gpt-6 reasons under a judge-sized cap), and add the gpt-6 rows to the capability table, re-checking fence repair's per-page cap. **Effort:** S. **Priority:** P3.
+
+## Fix wave 10 lane H follow-ups (filed 2026-10-06, GBRA-51)
+
+- [ ] **P2 — `gbrain jobs smoke --sigkill-rescue` and `--wedge-rescue` always throw.** **What:** both cases forge a claimed job with a raw `UPDATE minion_jobs SET status='active', lock_token=…`, which the `enforce_minion_queue_protocol` trigger refuses ("Minion queue protocol 1 required: old workers cannot claim upgraded queue jobs"), so neither regression check (#219 stall rescue, wall-clock eviction) runs at all; the command exits through the thrown error. `test/jobs-smoke-cleanup.test.ts` pins the refusal and that no smoke job is left behind. **Fix:** put the forged job into `active` through the queue's own claim path (claim it with a short-lived lock token, then age `lock_until`/`started_at`), or a test-only protocol-conformant transition, so both cases reach their assertions again; then flip the cleanup test's sigkill case to assert the rescue verdict. **Effort:** S. **Priority:** P2.
+
+## Always-loaded core memory follow-ups (filed 2026-10-04)
+
+Context: `docs/guides/core-memory.md`, `docs/architecture/key-files/core-memory.md`.
+
+- [ ] **P2 — Codex hook lane for core.** **What:** deliver core through a Codex SessionStart hook instead of the static `$CODEX_HOME/AGENTS.md` block. **Why:** the static block goes stale until `compile-context --target codex-global` reruns. **Fix:** register the session-start hook for Codex in `bootstrap harness` (hooks.json plus the trust hash) once the hook path is verified on the current Codex release. **Effort:** M.
+- [ ] **P2 — Hermes memory-provider plugin.** **What:** a provider whose `system_prompt_block()` returns the core block and whose `on_pre_compress` saves with `remember` + `items`. **Why:** `.hermes.md` is static and Hermes has no pre-compaction save. **Effort:** M.
+- [ ] **P2 — Compiled-file auto-refresh.** **What:** refresh the files recorded in `~/.gbrain/compiled-core.json` when the core revision changes. **Why:** doctor names stale copies but nothing refreshes them. **Effort:** S.
+- [ ] **P3 — Agent-proposed core edits.** **What:** let an agent propose adding or removing a core page as a pending item the owner approves. **Why:** marking is owner-only today; the agent can only tell the user the command. **Effort:** M.
+- [ ] **P3 — PostToolUse pressure lane.** **What:** run the pressure check after tool calls too. **Why:** a long tool-heavy turn can cross the threshold and compact before the next prompt. **Effort:** S.
+- [ ] **P2 — Writer-version fence for core.** **What:** refuse `gbrain core add` while an older gbrain writer that lacks the core guard is still registered on the brain. **Why:** an old serve publishes remote edits to core pages without the budget or owner-only checks. **Fix:** record a `core_guard_v1` capability per writer registration and check it in `core add` and the `core_memory` doctor check. **Effort:** M.
+- [ ] **P3 — Per-turn context drops core slugs.** **What:** the per-turn context (hook `turn_context`, OpenClaw reflex) still volunteers core pages that are already in the session. **Fix:** pass the core slugs as already-delivered. **Effort:** S.
+- [ ] **P3 — Pressure notice record-after-write.** **What:** the once-per-segment state is written before the hook's stdout lands; a deadline-expired turn loses that segment's notice. **Fix:** commit the state after the write, like the session-start deferred records. **Effort:** S.
+
+## Dependency hygiene (filed 2026-10-06, GBRA-40)
+
+
+## Contributor audit wave follow-ups (filed 2026-10-05, GBRA-40)
+
+### delta (owner: GBRA-40 (delta follow-ups))
+
+- [ ] **P2 — Commit-visibility watermark for delta.** **What:** rows are stamped with their transaction's start time, so a transaction that commits more than 2 s (`DELTA_COMMIT_LAG_MS`) after it started can be passed by an empty wake that advanced the cursor meanwhile. `test/delta-cursor-integrity.test.ts` ("commit visibility", Postgres) pins the bound. **Fix:** advance each arm only to a watermark below the oldest in-flight writer (e.g. `pg_snapshot_xmin` mapped to time, or a commit-sequence column), so the bound becomes zero. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Paginated thread arm.** **What:** thread events key on event date through `buildEntityCard`, which caps and swallows internally, so delta's threads are best-effort and follow the pages' time cursor. **Fix:** give threads their own keyset (event id or date + id) and an overflow signal like the pages and facts arms. **Effort:** M. **Priority:** P3.
+
+### Agent contract (former GBRA-42 hand-offs; owner: whoever picks up the next agent-contract wave)
+
+- [ ] **P2 — A structured retry delay on `Action`.** **What:** `fix.next: wait` is derived from `actor: provider`, and the delay lives only in prose (`why`: "Retry the same call in about 30 seconds"). delta's `delta_incomplete` notice and its `unavailable`/`session_state` refusal use it today (`src/core/ops/facts.ts` `incompleteNotice`, `sessionUnavailableError`). **Fix:** add an optional `retry_after_ms` (or `retry_after_s`) to `Action` in `src/core/agent-output.ts`, render it in the CLI `[AGENT]` block, the MCP notice block (`retry_after:` line) and `_meta`, extend the decision table in `docs/protocol/AGENT_OPERATOR_v1.md` ("`wait` → retry after `retry_after`"), regenerate the agent-operator goldens, and switch delta to it. Additive under contract v1. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — `GrantError` family onto the why/fix contract.** **What:** `src/core/grants/cli.ts` throws about 19 `invalid_grant` `GrantError`s (two added by #6008 for `--operations all`) with a message only: no `code`-level `why`, no structured `fix`. **Fix:** convert the family together so the fix echoes the flag the user actually typed (`--operations`, `--allowed-operations`, `--profile`, `--takes-holders`), with a read-only verify (`gbrain auth clients --json`); keep `invalid_grant` as the code and add `reason` values instead of new codes. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Scanner rule for CLI parser usage errors.** **What:** #5942 and #6002 printed raw `console.error` usage lines and exited 1 instead of throwing `invalid_params` (exit 2); `scripts/check-agent-contract.ts` has no rule for it, so the audit found them by hand (fixed in this wave for `connectors sync` and `recall --limit`). **Fix:** a scanner rule flagging `console.error('Usage:` / `process.exit(1)` pairs in `src/commands/**` parsers, baselined at today's count. **Effort:** S. **Priority:** P3.
+
+### OAuth grants
+
+- [ ] **P2 — List the operations an unbounded OAuth client gained after an upgrade.**
+  **What:** `gbrain auth clients` marks a client with no operation snapshot `operations: "all"` with `includes_future_operations: true` (#6008 visibility), but it cannot say which operations became reachable since the client's last regrant: the server knows only today's operation set. **Why:** an operator reviewing an unbounded client after an upgrade sees "all", not "these five are new". **Fix:** a versioned operation inventory (operation name → first release that shipped it, generated at build time from `operations.ts`), plus the release each client was last granted under, so `auth clients` and doctor can list operations added since then; reuse the legacy-token `--refresh-operations` preview shape. **Effort:** M. **Priority:** P2.
+
+### Measurement
+
+- [ ] **P3 — Paid retrieval-quality eval of #5783's smaller transcript parts.** **What:** the wave measured the free cost (pages ×6.75, chunks ×1.116, embedding tokens ×1.087 on a synthetic 1 MB session, `scripts/measure-transcript-split-cost.ts`) but not whether 45,000-byte parts retrieve better or worse. **Fix:** a gbrain-evals run on a transcript-heavy corpus at both part targets, newest frontier models only. **Effort:** M. **Priority:** P3.
+
+## Test, eval and CI fix wave follow-ups (filed 2026-10-04, GBRA-47)
+
+Context: `.github/nightly-known-red.tsv` rows point here; nightly-watch keeps their incidents open until the row is deleted. Scale-tier evidence: per-batch `vectors` lines and the phase watchdog in `scripts/scale/`.
+
+- [ ] **P2 — PGLite bulk-embedding cost at 20k+ chunks.**
+  **What:** the 36-minute PGLite `vectors` stall at 20k pages (nightly run 37196223708) no longer reproduces with the WAL checkpoint guard on autocommit writes: branch dispatch 37221090928 finished PGLite 20k `vectors` in 173 s (40 batches of 500 pages, dimension 1024, RSS ~2.5 GiB), against 56 s on Postgres. Per-batch time still grows from 2.1 s to 6.3 s across the phase. **Why:** a default PGLite brain that embeds 50k+ chunks at once may hit the superlinear part. **Fix:** read the per-batch `vectors` lines on the 50k promotion runs; if the batch time keeps climbing, measure through the shipped `gbrain embed` path and decide the engine fix (HNSW maintenance around bulk updates, PGLite memory settings). **Effort:** M. **Priority:** P2.
+- [ ] **P1 — PR time to green is 696-874 s against the ~650 s target.**
+  **What:** the wave cut PR CI from 1010-1067 s to 696-874 s (median 743 s over three acceptance runs) and from 899-940 to 739-755 Ubicloud vCPU-minutes (`docs/test-audit/2026-10-04/baseline.md`). The unit shards are the critical path: max 614-732 s against a 544-567 s mean on the re-mined weights; the spread comes from single files (`claw-test.slow`, `persistence-large-manifest`) running slower than their one-run weights. **Fix:** mine weights from several runs (median per file) instead of one, then add unit shards or split the heaviest unit files before revisiting runner sizes; recompute the 30-PR median two weeks after merge. **Effort:** M. **Priority:** P1.
+- [ ] **P2 — Clone initialized homes for CLI-spawn and agent-journey fixtures (D5 adoption).**
+  **What:** `test/helpers/brain-template.ts` clones initialized disk brains for in-process fixtures, but the CLI-spawn and agent-journey helpers still run `gbrain init` per test. An initialized `GBRAIN_HOME` holds identity tied to its own paths (managed-roots files named by a hash of the data-dir path, the owner record, `content/<brain_id>`), so a copied home cannot be rebased. **Fix:** a production re-identity path for a copied home, then adopt the template in `cli-spawn` and the journey helpers. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Executed-test receipts for the remaining lanes.**
+  **What:** the security-regressions matrix (Windows runs PowerShell), the nightly `coverage-full-slow` inline `bun test` calls and `persistence-validation.yml` write no receipts, so the ledger (`scripts/ci-executed-counts.ts`) cannot prove their identities. **Fix:** route each through `scripts/run-with-receipt.sh` (a PowerShell twin for Windows), upload `receipts-<lane>` artifacts and add them to `executed-receipts`. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Give the export-scale Postgres arm a scheduled lane.**
+  **What:** `test/export-scale.slow.test.ts`'s 100,001-page Postgres arm passes but takes about 527 s, so it is the one `ALLOWLIST` row in `scripts/check-postgres-lane-coverage.ts`. **Fix:** a nightly job with a pgvector service and a 20-minute budget that names the file, then delete the allowlist row. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Build the nightly coverage report from Test's own artifacts (C7).**
+  **What:** the nightly runs the unit, serial and slow corpus twice: `e2e.yml`'s `coverage-full-{unit,serial,slow}` at 06:00 and `test.yml`'s coverage lanes at 07:23 (about 314 vCPU-min a night). **Fix:** move `coverage-full-e2e` and `coverage-full-report` into `test.yml`'s scheduled run so producers and merger share one SHA and attempt; fail with the missing lane and the dispatch command on a missing producer or mismatched SHA; keep a `reconcile-crash.slow` coverage producer; keep artifact namespaces distinct; compare the lane inventory and line percentage before and after. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Move the remaining PGLite-only files out of the Postgres E2E lane (C9).**
+  **What:** about 87 files in `test/e2e/` construct PGLite only and run sequentially on the Postgres runner on every PR. **Fix:** continue the 2026-09-29 pilot's method (`docs/test-audit/2026-09-29/implementation/lane-pilot.md`): move by suffix to unit, serial or slow, with per-file executed-count evidence and `move` rows for the ledger. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — One test-multiplier knob.**
+  **What:** `GBRAIN_TEST_TIMEOUT_MULTIPLIER` scales Bun's `--timeout` in `run-unit-shard.sh` while `GBRAIN_TEST_WAIT_MULTIPLIER` scales `waitFor` deadlines. **Fix:** derive both from one variable (coverage lanes set 2), keeping the 50 s scaled-deadline ceiling. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — One mulberry32 for eval statistics (E9).**
+  **What:** `src/core/eval/paired-bootstrap.ts` (`seededRandom`) and `src/eval/shared/bootstrap.ts` (`mulberry32`) each carry the same PRNG, plus eight copies in scripts/ and test/. **Fix:** export one `mulberry32` from `src/eval/shared/bootstrap.ts` and import it; keep both bootstrap algorithms. `test/eval-paired-bootstrap.test.ts` and `test/longmemeval-judge.test.ts` pass unchanged. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — PostgreSQL contract tests in one Bun process per file.**
+  **What:** persistence-validation's "PostgreSQL contract tests" step runs its whole list in one Bun process; a failing file can leak env into later files, the class that hit `unit-postgres-arms`. **Fix:** the same per-file loop with `::error file=` lines. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Skip `.git` in the physical-root walk with a registration refusal.**
+  **What:** the root-overlap and size walks tolerate vanishing subdirectories but still walk `.git`. **Fix:** skip `.git` and refuse a registration nested inside another brain's `.git` explicitly. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Regenerate artifacts on PR branches automatically.**
+  **What:** `bun run regen:all --check` fails a stale artifact in verify, and the contributor reruns `regen:all`. **Fix:** an opt-in workflow that pushes the regenerated artifacts to same-repo PR branches. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Coverage-derived E2E selection.**
+  **What:** E2E narrowing is retired (a file-to-test import map selected every file). **Fix:** measure, from the nightly fullCorpus lcov, what share of recent PRs a coverage-derived file-to-test map would narrow; build the selector only if that share is large. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `bun run doctor:dev` and an example-PR walkthrough.**
+  **What:** a contributor has no one-command check of Bun, Docker and Python before running the gate, and no worked example PR. **Fix:** a `doctor:dev` script that checks prerequisites and runs `bun run test` and `verify`, plus a CONTRIBUTING walkthrough of one small PR. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Fold the remaining opt-in prefixes into `GBRAIN_TEST_*`.**
+  **What:** `GBRAIN_REAL_*`, `GBRAIN_E2E_*`, `GBRAIN_CI_*`, `GBRAIN_TRIAGE_CALIBRATION_LIVE` and `GBRAIN_LIVE_TYPESAFE` survive the scrub as compatibility exceptions. **Fix:** rename them under `GBRAIN_TEST_` with `RENAMED` rows in `test/helpers/operator-env-policy.ts` and fail-fast on old names. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Dead scripts/ and test/ references in TODOS.md.**
+  **What:** about 25 TODOS.md entries name scripts or tests that no longer exist; `test/docs-repo-paths.test.ts` does not scan TODOS.md. **Fix:** sweep them, then add TODOS.md to the scan with a historical marker for completed entries. **Effort:** S. **Priority:** P3.
+
+## Foundations 2 crash robot follow-ups (filed 2026-10-04, follow-up from v0.60.53.0)
+
+Context: `scripts/persistence/README.md` ("Crash robot"), `scripts/persistence/{generator,model,crash-robot}.ts`.
+
+- [ ] **P2 — A restarted Postgres owner waits out its dead predecessor's claims.**
+  **What:** after a Postgres owner process dies, its running effects resume only when their 2-minute lease expires (requests: 30 s), and a withdrawal mirror it held blocks writes to that page until then. PGLite releases them at once (one process per datastore). **Why:** a crashed `gbrain serve` on Postgres stalls Git, embedding and withdrawal work for 2 minutes. **Fix:** record the claiming host and process (pid plus start time) on each claim; a consumer on the same host releases claims whose process has exited. Other hosts keep the lease. The crash robot then drops its 140 s Postgres drain bound to 20 s and pull requests stop skipping lease-bound seams. **Effort:** M. **Priority:** P2.
+- [ ] **P1 — A held sync lock reaches agents as internal_error.**
+  **What:** after an owner dies mid connector run, the source's sync lock row stays until its TTL lapses (a same-host dead holder is stolen after the grace window). Meanwhile a connector run (`LockUnavailableError`) and a sync (`SyncLockBusyError`) reach MCP callers as `internal_error` ("server-side failure, report it"). Crash robot: `sync_and_connector_race_direct_write`, seed 5105, SIGKILL at `publication:after_commit` #31 (Postgres), recorded under the manifest's `deferred`. **Why:** the agent reports a bug instead of waiting and retrying. **Fix:** map both errors to the registered `sync_in_progress` (retryable) with the holder, its age and the retry-after in `why`/`fix` (agent-output rows, GBRA-42's contract), then drop the robot's `KNOWN_DEFERRALS` entry and un-skip the test in `test/persistence-crash-robot.test.ts`. **Effort:** S. **Priority:** P1.
+- [ ] **P1 — Process faults: ENOSPC on the file target and a lost child exit.**
+  **What:** the robot covers SIGKILL at every seam, a stale `index.lock`, a hung git commit and Postgres session drops. **Fix:** an ENOSPC fault on the canonical file write (a tmpfs-sized checkout) and a git child whose exit event is lost; each must end in a terminal state or a typed error. **Effort:** M. **Priority:** P1.
+- [ ] **P1 — Seeded mutation pass over the coordinator and effects.**
+  **What:** report the robot's kill rate against seeded mutants (a dropped receipt update, a double-applied effect, a skipped withdrawal fence). **Effort:** M. **Priority:** P1.
+- [ ] **P1 — Source add/remove/refresh and writer activate/deactivate ops.**
+  **What:** the generator drives page, memory, takes, timeline, sync, connector and revocation ops; topology and writer-lifecycle ops are not in the protocol yet, so the existing `topology-clone.ts`, `topology-recovery.ts`, `worktree-refresh.ts` and `bundle-files.ts` boundary hooks are not crashed. **Effort:** M. **Priority:** P1.
+- [ ] **P2 — CI check that every mutating operation is registered in the generator.**
+  **What:** `MODEL` is a `Record<OpKind, Fold>` and `EFFECT_SEAMS` a `Record<EffectKind, …>`, so a new op kind or effect kind without a fold or seam fails typecheck; a new mutating operation in `operations.ts` is not forced into `OP_KINDS`. **Fix:** a test listing every `mutating: true` operation as either a robot op or an explicit exclusion with its reason. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Pre-activation claim lock order.**
+  **What:** the unmanaged `claimWorktree` locks brain > sources > worktrees; managed paths lock worktrees before sources. No publication runs before activation, so nothing deadlocks today. **Fix:** reorder the unmanaged claim to brain > worktrees > sources so `lock-order.ts` can trace setup too. **Effort:** S. **Priority:** P2.
+
+## Engine graduation follow-ups (filed 2026-10-04, GBRA-50)
+
+Context: `docs/guides/move-to-postgres.md`, `docs/ENGINES.md#engine-migration-refused`.
+
+- [ ] **P2 — Postgres → PGLite graduation.**
+  **What:** `gbrain migrate --to pglite` uses the legacy copier, which refuses any brain with write history, withdrawals or worktree ownership. **Why:** a brain that moved to Postgres (or started there) cannot come back to a single-machine PGLite brain without losing its history. **Fix:** a reverse adapter (Postgres source, PGLite target) for the graduation inventory, copier and verify in `src/core/persistence/engine-graduation.ts`, with the same plan, fence, verify, cutover and crash tests. **Effort:** L. **Priority:** P2.
+- [ ] **P3 — `gbrain migrate --discard-source`.**
+  **What:** after a verified graduation the PGLite copy stays at `<path>.graduated-<run_id>` and the user deletes it by hand (doctor's `pglite_leftovers` names the command). **Why:** the copy still holds private memory and token hashes. **Fix:** a confirmation-gated command that deletes the retained copy and the tombstone only when the run is `graduated` and no rollback is pending, with `--yes --expect` and a dry run. **Effort:** S. **Priority:** P3.
+- [ ] **P2 — Windows graduation.**
+  **What:** on Windows a PGLite brain with history gets `graduation_unsupported_platform` (history-free brains use the legacy copier). **Why:** the tombstone, kernel-lock retention and SIGKILL crash tests have not run on a Windows runner, so custody across a crash is unproven there. **Fix:** run the tombstone, older-binary and crash suites on a Windows CI runner, fix what fails, then lift the platform refusal. **Effort:** M. **Priority:** P2.
+
+## Held files follow-ups (filed 2026-10-04, follow-up from v0.60.47.0)
+
+Context: `docs/guides/repair.md#held-files`, `docs/guides/write-refusals.md#held-files-and-content-refusals`.
+
+- [ ] **P2 — Degraded import for held files.**
+  **What:** a held file imports nothing until it is repaired: a held new file has no page, and a held modified file keeps its last good revision. **Why:** for a large backlog (hundreds of generator-written files that each need an interpretation) the agent answers from partial coverage until the user reviews every proposal. **Fix:** an opt-in degraded import that stores the body text and the keys gbrain reads exactly (never a protected or identity key, never an interpreted value), marks the page `degraded` in `get_page` and search, keeps the hold and its repair proposal, and upgrades the page in place when the file is repaired. Needs the privacy rules for protected keys (`visibility` defaults to the most restrictive value) and the drift check for degraded pages. **Effort:** M. **Priority:** P2.
+
+## Agent-first operator wave follow-ups (filed 2026-10-03, follow-up from v0.60.46.0)
+
+Spec: `docs/designs/AGENT_OPERATOR_WAVE.md` (Deferred list). Contract: `docs/protocol/AGENT_OPERATOR_v1.md`.
+
+- [ ] **P2 — Tool-call proxy for a second `gbrain serve`.**
+  **What:** a second stdio serve on a held brain answers in status-only mode with one `gbrain_status` tool. **Why:** the user has to move both harnesses to a shared `serve --http` to get memory in the second session. **Fix:** authenticated IPC forwarding to the owning serve, carrying the proxied caller's surface and scopes. **Effort:** L. **Priority:** P2.
+- [x] **P2 — Status-only mode for `serve --http` lock contention.** **Completed: v0.60.61.0** — a `serve --http` that cannot open its brain stays up in status-only mode on the same port (`/health` 503 + `Retry-After: 5`, `/mcp` with only `gbrain_status`), re-probes every 5 s through the shared `runStatusModeServe`/`reprobe` path and swaps in the full app on the same listener. Pinned by `test/serve-http-status-mode.serial.test.ts`.
+- [ ] **P2 — Support policy and removal of legacy shapes.**
+  **What:** legacy JSON shapes, frozen `error` values and duplicate receipt copies stay under contract v1. **Why:** they double the surface harness authors read. **Fix:** a written support policy plus consumer evidence, then removal in `AGENT_OPERATOR_v2`. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Exit 3 for `mcp expose` and `google` under contract v2.**
+  **What:** both still exit 2 for `confirmation_required` (documented v1 legacy); `mcp expose`'s document already carries the consent fields. **Fix:** move them to 3 with the v2 contract. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — `run_doctor` and CLI `doctor` from one registry with a `remote_safe` flag.**
+  **What:** MCP `run_doctor` and CLI `doctor` agree on the same brain through parity tests, but the check lists are still two code paths. **Why:** a new check can land on one surface only. **Fix:** one registry; each entry declares `remote_safe`, and `run_doctor` runs exactly the remote-safe subset. **Effort:** M. **Priority:** P2.
+- [x] **P2 — Submit-time job authorization and pre-upgrade queued jobs.** **Completed: v0.60.61.0** — `book-mirror`, `enrich --background` and `jobs submit enrich|subagent` store the approval on every queued job (migration v205); the worker holds a command's jobs to one approved total, and pre-upgrade rows run as `legacy_default` under $5. Pinned by `test/minions-spend-authorization*.test.ts`, `test/enrich-background-consent.test.ts`, `test/cli-jobs-submit-consent.test.ts`.
+- [ ] **P2 — `consent.preapprove.paid.max_usd_per_day`.**
+  **What:** only the per-run preapproval ships. **Fix:** a daily preapproval through the durable reservation model (`src/core/minions/budget-meter.ts`, `delegated-policy.ts`) with concurrency and crash-recovery tests, plus the C9 rows. **Effort:** M. **Priority:** P2.
+- [x] **P2 — Onboarding notices over MCP.** **Completed: v0.60.61.0** — stdio MCP sessions get the onboarding coaching notices on calls whose results show the gap, plus the first-run decisions bundle; stdio `mute_notice` applies. Pinned by `test/mcp-onboarding.test.ts`.
+- [ ] **P2 — Connectors two-step OAuth.**
+  **What:** `connectors auth --try-oauth` refuses headless and hands over the cookie lane. **Fix:** print the authorize URL and exit awaiting consent, then a second command completes with the pasted redirect (the Google connect shape). **Effort:** M. **Priority:** P2.
+- [x] **P2 — Unify MCP surfaces across wiring paths.** **Completed: v0.60.61.0** — every stdio registration gbrain writes pins `--surface starter` (`src/core/mcp-registration.ts`), stdio `serve` honours `GBRAIN_SURFACE`, and `request_tools {surface}` widens a stdio session. Pinned by `test/mcp-registration.test.ts`, `test/request-tools-stdio.test.ts`.
+- [ ] **P2 — Make `gbrain bootstrap verify` read-only, then mark it `read_only`.**
+  **What:** it is excluded from the verify-field scanner rule until it writes nothing. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — `structuredContent` with per-op `outputSchema`.**
+  **What:** emitted only as a semantic superset of `content`, after client behaviour converges. **Fix:** include Codex and VS Code scenarios proving the body reaches the model. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Re-baseline BrainBench after the wave** if notice blocks change harness behaviour. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Tier 3 carry-over: D3's remaining curated helps.**
+  **What:** B10 shipped in this release; D3's remaining curated helps are the 33 rows in `test/fixtures/cli-contract/help-baseline.json` (stub helps, `missing_yes`, `exit`). **Fix:** burn them down; the D5 baseline is shrink-only. **Effort:** M. **Priority:** P2.
+- [x] **P2 — Backfill the last 74 suggestion-less `OperationError` sites (31 files).** **Completed: v0.60.61.0** — every refusal site carries a site-specific suggestion (about 210 sites in 33 files, including funnel call sites); the baseline file is deleted and the `defaulted-suggestion` and `generic-suggestion` scanner rules are zero-tolerance.
+- [x] **P3 — Module-local `fail(code, message)` helpers carry a generic next step.** **Completed: v0.60.61.0** — `shared-skills` `fail`, `persistence/administration` `invalid` and the other funnels require a suggestion per call site.
+- [ ] **P2 — `gbrain agent run` asks for consent for paid job names.**
+  **What:** `book-mirror`, `enrich --background` and `jobs submit enrich|subagent` ask before queueing paid work; `gbrain agent run` with a paid job name does not. **Fix:** the same consent gate and stored spend record. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Pin the OpenClaw plugin manifest to `starter`.**
+  **What:** every other stdio registration pins `--surface starter`; OpenClaw's manifest stays a bare `serve`. **Fix:** run the starter-gap check over the OpenClaw skill list, then pin it. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — Onboarding coaching for owner-principal HTTP sessions.**
+  **What:** stdio sessions get onboarding notices; HTTP gets none. **Fix:** emit them once HTTP sessions are session-bound. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `book-mirror`'s default model has no provider prefix.**
+  **What:** the default `--model claude-opus-4-7` is rejected by `queue.add` as an unknown provider. **Fix:** default to `anthropic:claude-opus-4-7` (or the configured chat model). **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — Ratchet burn-down of the other agent-contract scanner baselines.**
+  **What:** counts at filing (`scripts/agent-contract-baselines/`, after B10): legacy advice keys 237, hand-built command strings 51, marker literals 26, `stdio: 'inherit'` 12, flag text in MCP-visible strings 6, raw "re-run with --yes" 5, in-scope placeholders 4, `throw new Error` in ops 3, non-read-only verify 1; suggestion-less `OperationError` is the 74 above; interactive I/O and retry-on-mutating are at 0. **Fix:** shrink per file as files are touched; the baselines refuse growth. **Effort:** L. **Priority:** P3.
+- [ ] **P3 — `sync_freshness` fix placeholder.**
+  **What:** the check's fail/warn message still says ``gbrain sync --source <id>`` instead of naming each stale source's command, because `checkSyncFreshness` sits at its function-size ceiling. **Fix:** split the function, then emit one filled `fix` per stale source. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Collapse the five error classes into `opError` + the registry.** **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Harness-author community channel** linked from `AGENT_OPERATOR_v1.md`. **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — Recall relevance on tiny keyless brains.** Measure first. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Trim the AGENTS.md pre-install preamble** (owner rewrite). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — MCP elicitation for consent.**
+  **What:** trigger is the first MCP op whose fix has non-empty consent and an MCP-callable re-invocation; stdio first, HTTP needs a session-bound transport. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Doctor report `schema_version: 3`** with a first-class informational status (today `ok` + `severity: 'info'`). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Retire the `--json` exit-time fallback document** once direct-exit paths reach zero. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Retire the `promptLine` / `promptLineStderr` / `promptYesNo` and legacy `readStdinBounded` shims.** **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Curated annotation titles and a `destructiveHint` / `openWorldHint` review** for every mutating op. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — HTTP session-scoped coaching dedupe** when the transport becomes session-bound (today principal + transport session id, principal only when absent). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Status-mode recovery for clients that ignore `tools/list_changed`.** Measure per harness and document. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Keep `getStats` / `getHealth` off agent paths** (cross-ref #5061; the readiness cache is the pattern). **Effort:** S. **Priority:** P3.
+
+## auto_chronicle wave follow-ups (filed 2026-10-04, follow-up from v0.60.45.0, #5876)
+
+- [x] **P1 — facts-backstop jobs have no executor on PGLite.** **Completed:** the automatic facts drain (`src/core/facts/drain.ts`) runs them inside `gbrain serve`, `serve --http` and the `facts_drain` cycle phase, bounded per run and per day; doctor `facts_drain` reports it.
+  **What:** `facts_backstop` effects enqueue jobs that nothing ran on PGLite unless someone typed `gbrain jobs work`.
+- [ ] **P2 — Drop future-dated events extracted from past pages.**
+  **What:** the measured run wrote 2 not-yet-happened events per 24 judged pages (a planned offsite date and a leave start date mentioned in past meetings) and 2 events for a launch plan stated in a chat. **Fix:** refuse proposals dated after the extraction time (or after the page's own date plus a margin) before publication, and tell the judge prompt to emit only what already happened; re-measure on the labeled fixture described in `docs/fix-wave-notes/capy-fix-wave-chronicle.md`. **Effort:** S. **Priority:** P2.
+- [x] **P2 — Event slug identity collapses distinct same-day proposals.** **Completed: 2026-10-04 (Foundations 2)** — `src/core/chronicle/event-identity.ts` resolves same-day collisions at publication: one event keeps the base slug, the others get `-<hash6>` over instant, place and kind (identical copies `-2`), assigned from the pages already at the candidate slugs so reordering, corrections and re-extraction keep existing slugs. The extractor version is 2. Pinned by `test/chronicle-event-identity.test.ts` (fixture: 6 proposals, 3 collisions before, 0 after).
+- [ ] **P2 — Restore retired events on revert without a model call.**
+  **What:** A to B to A re-extracts A once (at most `chronicle.job_budget_usd`). A durable proposal manifest that survives the 72 h tombstone purge would restore A's events for free. **Effort:** M. **Priority:** P2.
+- [x] **P2 — Deterministic projection for calendar invites.** **Completed: 2026-10-04 (Foundations 2)** — `src/core/chronicle/invite-projection.ts` projects an ended invite into one `Scheduled: <title>` meeting event (`captured_via: life-chronicle:invite`) with no chat call, no daily reservation and zero cost, through the judged path's publication and ledger. Pinned by `test/chronicle-invite-projection.test.ts`.
+- [ ] **P2 — Chronicle occurrence status (occurred / planned / committed).**
+  **What:** an event page does not say whether it happened, is planned or is a commitment; projected invites say `Scheduled:` in the summary only. **Fix:** an occurrence-status field on event pages written by the judge and the invite projection, read by `chronicle_day`/`since`. Sequence after the chronicle date-quality fast-track (future-dated events, vague-date precision), which owns the judge prompt and `extract-events.ts`. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Project ended invites on brains without a chat provider.**
+  **What:** the `chronicle` phase returns `no_chat_provider` before executing any row, so a keyless brain never projects ended invites although they need no model. **Fix:** run invite rows when no judge exists and leave other rows untouched. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Invite-aware eligibility and cost accounting.**
+  **What:** an invite whose body is under 80 characters is skipped `too_short` before projection; backfill estimates every invite as a paid call; once the daily limit is used up, the phase defers invite rows too. **Fix:** make eligibility, the backfill estimate and the daily-limit deferral recognize structured invites. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Carry write decisions across an extractor-version bump on managed brains.**
+  **What:** after a bump, discovery records `no_write_decision` for every managed page, so re-extraction waits for a consented backfill. **Fix:** reuse the previous version's decision (writer, request, trigger) for unchanged content. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — One LLM pass for atoms and events on meeting pages.**
+  **What:** a meeting page pays for atom extraction and event extraction separately. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Judge input beyond 12,000 characters.**
+  **What:** long transcripts are truncated to 12,000 characters before the judge reads them; later events are never seen. **Fix:** chunk and merge, bounded by the per-page cap. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — One doctor surface for derived extraction.**
+  **What:** facts, atoms, conversation facts and events each report health in their own doctor check. **Effort:** M. **Priority:** P3.
+
+## Foundations 1 follow-ups (filed 2026-10-03, follow-up from v0.60.37.0)
+
+- [x] **P1 — Mutation attribution for the writers still unattributed.** **Completed: Foundations 2** — every unmanaged direct writer except three runs in `maintenanceTransaction` (batch writers one bounded transaction per batch); the pinned unattributed inventory went from 90 writer references in 40 files to 7 in 3. Pinned by `test/write-attribution-legacy.test.ts` and the `test/write-attribution-<family>.test.ts` files.
+- [ ] **P2 — Attribute the three link-extraction writers.**
+  **What:** `src/commands/extract.ts`, `src/core/extract-timeline-from-meetings.ts` and `src/core/enrichment-service.ts` still write `NULL` attribution on unmanaged brains (the "unattributed" list in `docs/architecture/system-of-record.md`). They share the link-extraction and mention-linking code that the entity-linking work is reshaping. **Fix:** after that work lands, run their writes in `maintenanceTransaction` (bounded per batch) and move them to the attributed list. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — One write path for unmanaged brains.**
+  **What:** unmanaged brains attribute legacy writes through `maintenanceTransaction`, but those writes skip the coordinator's journal, receipts and effects, so the persistence crash harness (which drives the coordinator) does not exercise them. **Fix:** route unmanaged brains through the coordinator too, retiring the legacy direct writers. Deferred: it changes every unmanaged write path and its failure modes, which needs its own wave. **Effort:** XL. **Priority:** P2.
+- [ ] **P3 — Backfill attribution for pages a `forget` last changed.**
+  **What:** `gbrain repair attribution-backfill` proves page revisions only from page mutations and fenced `remember`; a page whose live revision came from a `forget` withdrawal stays `unrecorded` (3 of 40 pages in the history fixture). **Fix:** accept the committed `forget` request whose withdrawal outcome names that revision as proof. **Effort:** S. **Priority:** P3.
+- [x] **P2 — Classify new content columns for attribution.** **Completed:** the column classification test in `test/write-attribution.test.ts` (`write attribution column classification`) fails on an unclassified column.
+- [x] **P2 — Verify `gbrain repair attribution-backfill` on a real managed brain.** **Completed: Foundations 2** — `test/attribution-backfill-history.test.ts` builds a managed brain through the journaled operations, resets three quarters of the rows to pre-attribution NULLs and runs the repair. At 10,000 pages on Postgres (3,334 edits, 1,429 deletes, 715 restores, 2,000 remembers, 1,000 forgets) it refilled 6,868 of 7,509 reset pages, 5,502 of 5,609 page versions and 1,501 of 1,501 facts to the attribution the coordinator wrote; 641 pages and 107 versions stay `unrecorded` (their revision came from a `forget`), and no content, revision or existing attribution changed.
+- [x] **P2 — `--json` refusals from CLI-only ops print to stderr only.** **Completed (#5991):** `src/cli/cli-error.ts` prints one JSON refusal envelope on stdout under `--json`.
+- [x] **P2 — PGLite `sources refresh` while `gbrain serve` owns the database.** **Completed: Foundations 2** — the refresh runs inside the resident owner through the `writer_refresh` administration operation (`src/commands/sources-refresh-delegate.ts`).
+- [x] **P3 — The consumer's idle probe ignores the refresh effect fence.** **Completed: Foundations 2** — the idle probe applies `refreshFenceClear` to effects like the claims do.
+- [x] **P2 — Drop the JSONB grant authority for legacy tokens.** **Completed: Foundations 2** — the dashboard mints through `mintLegacyToken`, migration v202 converts every legacy grant, the HTTP auth paths read the columns (a later legacy row converts on its first read), and minting no longer writes a JSONB-only grant.
+- [ ] **P2 — Remove the `permissions` grant mirror after its window.**
+  **What:** tokens still write the `permissions` JSONB mirror and enforce drift until `GRANT_MIRROR_WINDOW_ENDS` (2026-11-04, `src/core/grants/model.ts`) so older binaries keep working. **Fix:** after that date stop writing the mirror, drop the drift comparison and `legacy_token_grant_drift`, and keep `migrateLegacyTokens` only for brains that skipped v202. **Effort:** M. **Priority:** P2.
+- [x] **P2 — `--sources none` for OAuth clients.** **Completed: Foundations 2** — `auth rescope --client <id> --sources none` and `--takes-holders a,b|none` (migration v203).
+- [x] **P2 — Seat follow-ups (#4618).** **Completed: Foundations 2** — the OpenClaw context-engine heartbeat reports seat reasons (write failure, conflict, invalid label) with their hints, and a pattern page drops a seat its reflections no longer share. The Codex trust-hash item closed with no code: the Codex SessionEnd command never carries a seat (`buildCodexSessionEndCommand` takes only the gbrain binary; `--seat` prints a note to set `GBRAIN_SEAT` instead), so adding a seat cannot change its trust hash.
+- [x] **P2 — Large-brain ceilings in the scale tier.** **Completed: Foundations 2** — every scale run asserts the F4d ceilings through the real CLI (`scripts/scale/f4d.ts`: progress-aware sync deadline, loud embed budget stop and serve boot window at every tier, the 20,000-file `sources add` at 20k and up), so the 50k tier carries them once `trend.ts` unlocks it; delegated syncs keep the progress-aware deadline.
+- [x] **P2 — MCP search on Postgres slows sharply between 10k and 20k pages.** **Closed (2026-10-15, LHF wave 2 item 11):** no longer reproduces. Nightly scale tier `scale-report-postgres-20000` MCP search p50: 74.1 ms (10-06), 45.8 (10-08), 33.7 (10-10), 36.3 ms on 10-15 (run 38708604843; the same run's 10k: 68.4 ms; PGLite 20k 71.1 ms). The 615 ms figure was v0.60.53.0. `scripts/scale/gates.ts` now applies the interactive ceilings (MCP search 500 ms, `get_health` 1000 ms) at 20k as well as 10k, report-only until `trend.ts` says stable.
+  **What (as filed):** the scale tier's MCP-path search p50 on Postgres is 615 ms at 20k pages (69.5 ms at 10k) and the source-scoped grant search 1,169 ms, while PGLite at 20k answers in 27 and 19 ms. Interactive ceilings are defined only up to 10k, so this is report-only. **Fix:** read the captured plans in the 20k Postgres report (`scale-report-postgres-20000`) for the statement that grows, and add a 20k ceiling once fixed. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — `embed --stale` takes far longer than its time budget to stop.**
+  **What:** with `GBRAIN_EMBED_TIME_BUDGET_MS=1500` the scale tier's budget-stop check exits 11 correctly but after about 61 s on a 20k brain (2.6 s on an empty one), so the budget does not bound wall time. **Fix:** profile what runs before the first batch and after the stop (stale counting, the remaining-count query) and keep it inside the budget. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `findOrphans` recomputes the full orphan set per call.**
+  **What:** `find_orphans` pages its rows in TypeScript after computing every orphan, so each page of a large result costs a full scan (the scale verifier reads `total_orphans` and one maximal page instead of paging). **Fix:** page in SQL with `ORDER BY source_id, slug LIMIT/OFFSET` and a separate count. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Keyword search scoped to one source: 18.2 to 22.1 ms at 10k PGLite pages.**
+  **What:** the five-run ranges overlap (17.4-19.4 vs 18.7-25.0 ms), so this may be noise; the scale tier's calibrated budget will show a trend. **Effort:** S. **Priority:** P3 (Foundations 2).
+- [ ] **P3 — Enforce the scale tier's ceilings and calibrated budgets.**
+  **What:** report-only until `scripts/scale/trend.ts` prints "ceilings stable" over five nightly runs; then set `GBRAIN_SCALE_ENFORCE_CEILINGS=1`. **Effort:** S. **Priority:** P3 (Foundations 2).
+
+## Fix wave 8 follow-ups (filed 2026-10-02, follow-up from v0.60.36.0)
+
+- [ ] **P1 — Verified engine graduation (PGLite to Postgres) that keeps persistence history.**
+  **What:** `gbrain migrate --to` refuses any brain with rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`, which in practice is every brain that saved memory through the write coordinator. **Fix:** a migration that carries request ids, withdrawals, attribution, grants and ownership, verified by a round-trip test. The refusal stays until then (docs/ENGINES.md says so). **Effort:** L. **Priority:** P1 (Foundations 2).
+- [ ] **P2 — Agent-contract conformance suite for every MCP op.**
+  **What:** wave 8's conformance gate (`test/fixtures/write-contract-conformance-cases.ts`) covers only the contracts this wave changed. **Fix:** every op × PGLite/Postgres/PgBouncer × stdio/HTTP, asserting the error-code taxonomy. **Effort:** L. **Priority:** P2 (Foundations 2).
+- [x] **P2 — Restore the `auto_chronicle` trigger (#5876).** **Completed:** #5876 runs automatic extraction from the chronicle cycle phase, on by default; verified by `test/chronicle-auto-phase.test.ts` (see the F15 entry).
+  **What (original):** `auto_chronicle=true` still has no effect; doctor and the advisor say so. #5329's backfill idempotency landed in v0.60.32.0, so re-enabling the trigger no longer means duplicate event pages from repeat runs. **Fix:** call `runChronicleBackstop` from the import path behind the flag, with a cost note. **Effort:** M. **Priority:** P2 (Foundations 2).
+- [x] **P2 — Cycle-side fence for `row_num IS NULL` facts (#5299).** **Completed** — the `extract_facts` phase fences them itself every cycle through the shared core pass (`src/core/facts/unfenced-facts.ts`) and reconciles those pages in the same run.
+  **What:** facts without a fence row number are invisible to the fence reconciler. **Fix:** the cycle fences them after GBRA-35's facts writeback (now on master). **Effort:** M. **Priority:** P2 (Foundations 2).
+- [x] **P2 — One-shot repair for supersession chains broken on managed brains (#5886).** **Completed** — `gbrain repair take-supersession` (preview, then `--apply`) relinks each struck take from journal, stored-pointer or forced fence-structure evidence and reports ambiguous pages with the manual edit.
+  **What:** v0.60.36.0 writes the supersession pointer on the old take row; chains written before it keep `superseded_by` NULL on managed brains. **Fix:** a `gbrain repair` kind that rebuilds the pointers from the fence. **Effort:** S. **Priority:** P2.
+- [x] **P2 — Doctor check for pages still waiting on their revision backfill (#5216).** **Completed** — doctor `revision_backfill` warns with the pending count, the failed rows by page and `gbrain apply-migrations --force-schema`, which resumes the backfill (managed brains included).
+  **What:** the backfill is resumable and reports progress on upgrade, but a brain whose backfill keeps stopping on a failing row has no standing doctor signal. **Effort:** S. **Priority:** P2.
+- [x] **P2 — Scale harness gaps (`bun run test:scale`).** Shipped in v0.60.37.0 (F4c scale tier).
+  **What:** the report-only harness lacks injected query vectors, populated facts and takes, a source-scoped grant query, a cold-process first query, concurrent receipt-bearing writers, the Postgres engine and the 10k/20k/50k CI tiers. At 10k pages the per-page import cost of the last 10% is about 8x the first 10% (gate 1.5). **Effort:** L. **Priority:** P2 (Foundations 1, F4).
+- [ ] **P2 — Same-width embedding migrations into a live HNSW index.**
+  **What:** #5088 defers the ANN build only when the schema transition rebuilds the column; a same-width model swap still re-embeds into the live index. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Managed retype for undeclared page types (#5880).**
+  **What:** `put_page` now warns on a type the active pack does not declare; there is no managed bulk retype. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Quote-presence check for doctor's "not verified" findings (#5432).**
+  **What:** deferred from the #5432 patch: checks that read text could also verify the quoted evidence exists. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Prefilter for Dream conversation-page discovery (#4419).**
+  **What:** discovery scans every live `type: conversation` page each cycle and hashes bodies. **Fix:** a date/updated prefilter in SQL. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — A second unmanaged `patterns` run rewriting the pattern page hits `revision_conflict`.**
+  **What:** found while fixing #5884; pre-existing. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `gbrain init` fails when a component of `GBRAIN_HOME` is a symlink.**
+  **What:** found while testing Windows init; reproduces on POSIX. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `backup-fsync.serial` Linux-guard case fails on native Windows.**
+  **What:** pre-existing; the case asserts a POSIX-only flush. **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — Doctor `foreign_owner_marker` check (#5808).**
+  **What:** after community PR #5796 lands. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Cross-source duplicate slot collapse in search (#4612).**
+  **What:** deferred; adjacent to hybrid search work. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Missing-parameter errors print the parameter's description and an example.**
+  **What:** `Missing required parameter: provenance` names the parameter but not what to pass. **Effort:** S. **Priority:** P3.
+
+## Memory, search and connector fix wave follow-ups (filed 2026-10-02, GBRA-35 wave 2; released in v0.60.32.0, see CHANGELOG)
+
+- [ ] **P2 — Honest `waiting` completeness while loop analysis is pending.**
+  **What:** `gbrain waiting` reports `completeness: "partial"` only for held Gmail threads. Threads still queued for `loops_extract`, still inside the managed 30-day catch-up, or grace-held are not reflected, so a brain mid-backfill can answer "You are clean". **Fix:** a pending-analysis count beside the held-thread note, read from the catch-up cursor, the waiting `loops_extract` depth and `loop_grace_holds`. The message sits beside `rankGroups` (wave 7's area), so coordinate. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Loop freshness field on `open_loops` / `waiting`.**
+  **What:** the result carries source sync ages but not when loop analysis last caught up. **Fix:** `loops_analyzed_through` (the newest thread revision with a recorded `loops_extract` outcome) per source, rendered next to the sync age. Pairs with the completeness entry above. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Answer-quality before/after gate for capture dedup, gather breadth and windowed extraction (V13).**
+  **What:** #5888, #5890 and #5887 were proven by discriminating unit tests, not by answer quality. **Fix:** one gbrain-evals run (recall + think over a seeded conversation corpus) before and after the wave, recorded in the evals repo. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Static guard against raw guarded-table writes and swallowed `managed_writer_guard` refusals (V15).**
+  **What:** #5869 and #5904 were raw `UPDATE facts` / `INSERT INTO timeline_entries` calls refused on managed brains with the error swallowed. **Fix:** a lint over `src/` that flags raw writes to guarded tables outside `withCoordinatedWrite`/coordinator publication and `catch` blocks that drop a `managed_writer_guard` error, with an allow-list file. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — `extract-conversation-facts` dead-letters when `facts.extraction_enabled=false`.**
+  **What:** found by the managed connector job contract harness, which turns facts extraction off outside its facts-lane cases: a queued `extract-conversation-facts` job dead-letters instead of completing as a typed skip. **Fix:** check the switch at handler entry and complete with `skipped: extraction_disabled`; add the case to `test/helpers/managed-connector-job-contract.ts`. **Effort:** S. **Priority:** P2.
+- [x] **P2 — `extract timeline --from-meetings` on managed brains.** **Completed: fix wave 13 PR2 (#6273)** — a managed brain publishes one `managed_maintenance_meeting_timeline` request per entity page, re-gated at the meetings' stored tier; refused or pending writes fail the job and the command.
+  **What:** `extract timeline --source db` now publishes through the coordinator, but the `--from-meetings` pass (`src/core/extract-timeline-from-meetings.ts`) still writes through `engine.addTimelineEntriesBatch` outside the coordinator, which `managed_writer_guard` refuses on a managed brain. **Fix:** route its rows through the same per-page maintenance request (`commands/extract-timeline-db.ts`) and exit non-zero on refusal. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — Stopword-only title probe.**
+  **What:** a page titled only with stopwords ("The Who", "It") cannot be found by the title arm, because `websearch_to_tsquery` drops every term. **Fix:** an exact-title probe on `lower(btrim(title))` when the tsquery is empty. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `projects/` entity boost (eval first).**
+  **What:** project identity pages rank like ordinary notes on a name query. **Fix:** measure a small `projects/` boost against the retrieval evals before changing defaults; ship only on a measured win. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Single write-target resolver for connector sources.**
+  **What:** six resolvers decide whether a writer publishes to a checkout, the database or `connector_database`; #5856 was one of them disagreeing. **Fix:** one exported resolver used by atoms, facts, timeline, synthesis, links and connector sync, with a table test. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — claude-cli provider as a native `LanguageModelV3`.**
+  **What:** the claude-cli model runs through the AI SDK's v2 compatibility path, which emits a warning on every process's first call (now routed to stderr). **Fix:** implement `LanguageModelV3` directly and drop the compat warning. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Explicit, cost-previewed backfill of legacy head-only transcript tails.**
+  **What:** transcripts marked done before windowed extraction keep their tails past the first 8,000 characters unextracted; only turns added after the upgrade are extracted. **Fix:** an opt-in command that lists those files with an estimated window count and cost, and extracts after confirmation under the per-sweep caps. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Escape `[user]` / `[assistant]` role markers inside user text (E27).**
+  **What:** the window splitter treats only the exact `\n\n[user]\n` and `\n\n[assistant]\n` markers as turn boundaries, but a user who types that exact line forges a boundary. **Fix:** escape the markers in `toCorpusText` and unescape in the splitter, with a corpus-version bump. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Measure the upgrade journey (Pass 8).**
+  **What:** the time from the end of `gbrain upgrade` to both new repairs previewed was estimated (target under 5 minutes), not measured. **Fix:** time it once on a seeded PGLite brain with `captured_facts_active` and `loop_facts_drift` present and record it in the upgrade guide. **Effort:** XS. **Priority:** P3.
+- [ ] **P2 — Corrections lost to the cosine 0.95 drop (V1).**
+  **What:** `remember` and `extract_facts` keep the unguarded same-entity cosine ≥ 0.95 drop. Measured with voyage-4, 4 of 20 correction pairs (negation, number or date) and 2 of 10 word-change corrections ("The offsite is in Lisbon" / "... Porto") score ≥ 0.95, so an explicit correction can be dropped as a duplicate. Capture lanes never drop by cosine (shadow-count only), and the `claimsDiverge` negation/number/date guard catches the 4 but not the 2 word-change pairs, so a token guard alone is not enough to re-enable any cosine drop. **Fix:** make the explicit lanes' drop safe for single-word substitutions (or raise the threshold) before relying on it, and only then consider a measured capture threshold, with the V1 pairs in the wave notes as the test table. **Effort:** S. **Priority:** P2.
+- [x] **P3 — JIT off for the remote title arm.** **Done (#6110, from #6039):** the Postgres title, keyword, CJK and vector search statements pass `jitOff: true` to `withScopedReadTransaction`, which runs `SET LOCAL jit = off` (`src/core/postgres-engine/search-settings.ts`); the LHF wave 2 latency audit's statement log shows it before each title statement, and its JIT scan found only the typed-search type check (wave item 1) still compiling.
+  **What (as filed):** on a 40k-page Postgres brain most of the remaining common-term title-arm latency is JIT compilation (for example 17 ms execution, 504 ms JIT): the visibility subplans push the cost estimate past `jit_above_cost`. **Fix:** `SET LOCAL jit = off` around the remote title statement, measured against the same benchmark before shipping. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Move `captured-facts` database-only expiry onto the loop-fact retirement mutation.**
+  **What:** `repair captured-facts` expires database-only rows through its own maintenance request, while `loops_close` and `repair loop-facts` share `persistence/loop-fact-retirement.ts`. **Fix:** one coordinated fact-retirement mutation for all three, so the expiry rules and receipts cannot drift. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Throttle autopilot's per-tick `git fetch` while an upgrade is held.**
+  **What:** on a bun-link install held for an unmet Bun floor, each self-upgrade tick fetches upstream to re-read the floor. **Fix:** back off the floor read while the hold's target is unchanged (for example once per quiet-hours window), resetting when the host's Bun changes. **Effort:** S. **Priority:** P3.
+
+## Secret redaction and Google file modes follow-ups (filed 2026-10-01, follow-up from v0.60.31.0)
+
+- [ ] **P2 — Sanitize text sent to configured providers (reranker, embeddings, synthesis).**
+  **What:** retrieval output is redacted, but the hosted reranker, the embedding provider at ingest and `synthesize`/`think` generation still receive stored text unredacted. **Why:** a stored credential can leave the machine through a provider call even though no retrieval op returns it. **Fix:** run the canonical scanner over provider-bound text at the gateway seam (`src/core/ai/gateway.ts`), with the same echo dictionary, and record a content-free count. **Cons:** redacted embedding input changes vectors for affected chunks; the change needs a measured recall check. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Dispatcher-level default redaction for remote callers.**
+  **What:** every operation now declares `outputRedaction`, and only `'retrieval'` ops are wrapped. An op misclassified as `'no_stored_text'` or `{ exempt }` would return stored text raw to an MCP caller. **Fix:** in the shared dispatch path, run `redactRetrievalOutput` over every remote response unless the op is on the explicit raw-read exempt list (`get_page`, `fetch`, `get_chunks`, `get_raw_data`, `get_versions`, the skill catalog, admin job ops). **Effort:** S. **Priority:** P2.
+- [ ] **P3 — `.netrc` and `curl -u` credential shapes.**
+  **What:** `machine <host> login <user> password <pw>` lines and `curl -u user:pw` / `--user user:pw` arguments are not matched by any `secret-scan.ts` pattern. **Fix:** two keyword-anchored patterns with bounded values and placeholder rejection, perf-pinned in `test/secret-scan-perf.test.ts`. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Should `pass` and `password` count as URL placeholder passwords?**
+  **What:** `url_credentials` skips `<...>`, `${...}`, `$VAR`, all-`*` and all-`x` passwords, but a documentation URL whose password is literally `pass` or `password` now fires (two such literals exist in `src/`). **Decision needed:** treat those two words as placeholders (fewer documentation false positives, misses a real password that happens to be one of them) or keep firing. **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — Evaluate gitleaks-derived vendor rules under the linear-time contract.**
+  **What:** compare the vendor prefixes in the upstream gitleaks rule set with `CORE_PATTERNS` and add the ones with a fixed, low-false-positive shape. **Why:** vendor coverage is the cheapest recall gain. **Cons:** every new rule needs a perf pin and a false-positive budget run (`scripts/secret-scan-fp-budget.ts`). **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Runtime counter for context entries dropped by the sensitivity scan.**
+  **What:** each drop prints one content-free line (`compile-context: omitted <slug> ...`), but there is no running count in doctor or status, so a brain that silently loses many entries looks healthy. **Fix:** a counter (per pattern family, no values) surfaced by `gbrain doctor`. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Per-brain retrieval redaction override.**
+  **What:** a reviewed false positive can be allowlisted for pushes and compiled context (`.gbrain-scan-allow`), but retrieval redaction has no override. **Fix:** a fingerprint allowlist or `redaction.retrieval.disabled_patterns`, local-config only, never settable over MCP. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Per-source Google file-mode override.**
+  **What:** Google pages and cursor state are always written 0600, and a looser chmod is reverted on the next rewrite. A user who shares the directory with a group on purpose has no setting. **Fix:** an opt-in per-source mode (for example `g_file_mode`), validated to never grant world access. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Vault, connector spool and connector credentials adopt `AtomicWriteOpts.mode`.**
+  **What:** `src/core/creds/vault.ts`, `src/core/connectors/spool.ts` and `src/core/connectors/credentials.ts` each set 0600 their own way. Moving them to `atomicWriteFileSync(..., { mode: 0o600 })` reasserts the mode on every write, so a restored or copied loose file tightens. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Exercise the skipped rows of the retrieval redaction sweep.**
+  **What:** `test/retrieval-op-redaction.test.ts` plants a secret and runs every retrieval op through remote MCP dispatch, but skips the code-intel ops, `synthesize`/`think`, `search_by_image` and `get_agent_job` (wrapper coverage comes from the registration test). **Fix:** run each once fixtures exist (a code-index fixture, a keyed or stubbed composition, image embeddings, a submitted agent job). **Effort:** M. **Priority:** P3.
+
+## System One v1 follow-ups (filed 2026-09-30; plan: docs/designs/SYSTEM_ONE_JEV_V1.md)
+
+- [ ] **P2 — Local decide provider (CEO E6).**
+  **What:** a local classifier or cross-encoder provider behind the `decide` provider interface (llama-server or ONNX). **Why:** private brains that keep egress denied run S6-S9 as LLM slots today; a local provider makes them fast and calibratable without a third party. **Cons:** new runtime dependency and model packaging. **Depends on:** System One v1 merged. **Effort:** L. **Priority:** P2.
+- [ ] **P2 — Production candidate depth beyond 100 if the recall experiment wins.**
+  **What:** lift `MAX_SEARCH_LIMIT`-bound per-arm depth for Jev-reranked queries when the v1 recall experiment's deep-pool arm wins. **Why:** 270 of 404 GBRA-4 misses were candidate-generation misses. **Cons:** latency and rate-limit load. **Depends on:** the v1 recall experiment verdict in `docs/eval/system-one/`. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Online calibration labels (CEO E7).**
+  **What:** operator feedback on abstentions, prunes and proposals as calibration labels. **Why:** shadow receipts carry predictions, not labels. **Cons:** needs label UX and local text storage that receipts deliberately avoid. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Jev-scored query-expansion decision (CEO E8, A5).**
+  **What:** a runtime slot deciding when to expand a query. **Why:** the v1 recall experiment measures expansion only as an eval arm. **Depends on:** recall experiment results. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Cross-process decide rate-limit coordination.**
+  **What:** share lane budgets across serve, dream and CLI processes. **Why:** v1 lanes are per process, so separate processes can still contend for the account-wide limit. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Decide knobs in the semantic cache when the cache is re-enabled.**
+  **What:** verify the decide part of `knobsHash` (effective thresholds, `min_keep`, calibration id, resolved model) once `semanticResultCacheAvailable()` returns true again. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Time the System One quickstart on a fresh machine (`/devex-review`).**
+  **What:** measure the documented key-in-hand to first-decision clock against the under-5-minute target. **Effort:** S. **Priority:** P3.
+
+## Fix wave 6 follow-ups (filed 2026-10-01, follow-up from v0.60.30.0)
+
+- [ ] **P2 — Remove the vector legacy guard (#5824 follow-up).**
+  **What:** delete `GBRAIN_VECTOR_LEGACY_GUARD` / `search.vector_legacy_guard` next wave, with a one-time notice when it is still set. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — Write-time freshness for stale vectors (#5824 follow-up).**
+  **What:** null the vector or store an `embedding_current` flag when a chunk's text changes, so stale rows stop taking HNSW candidate slots. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Per-column date spelling for the keyword and CJK arms (#5824 follow-up).**
+  **What:** the vector arm's since/until guard now keeps the index; the keyword and CJK arms still use the shared expression. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Title-FTS expression index (#5803 remainder).** **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `gbrain auth permissions <name> set-source …` for legacy tokens (#5827 follow-up).** **Effort:** S. **Priority:** P3.
+- [ ] **P3 — #5831: atom facts without `entity_slug`.** **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Provenance-based withdrawal of facts already extracted from pastes or self-captures (#5812, #5820 follow-up).**
+  **What:** facts extracted before v0.60.30.0 from pasted blocks or gbrain's own claude-cli sessions stay until forgotten one by one. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `gbrain graph-query` on a thin client should forward `--source`.** **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Managed atom retry ignores the cycle lock's lease signal.**
+  **What:** `src/core/persistence/atom-retry.ts` does not stop when the cycle lock is lost, unlike the drain (#5809). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Heap flag for `bun run typecheck` on 8 GB Macs.**
+  **What:** the macOS runner needed `--max-old-space-size=4096`. **Effort:** S. **Priority:** P3.
+
+## Unlinked facts follow-ups (#5836, filed 2026-10-01)
+
+- [ ] **P3 — Automatic free-tier relink in the dream/autopilot cycle.**
+  **What:** run `gbrain facts relink --no-llm` as a bounded cycle phase so facts link when a new entity page appears. **Why:** the free tiers cost nothing and the write-time fix only covers new facts. **Cons:** a new cycle phase with its own lock and budget. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Admin MCP op for relink on hosted/thin-client brains.**
+  **What:** a localOnly-free admin operation so a hosted operator can run relink remotely. **Why:** thin clients refuse `gbrain facts`. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — `gbrain facts relink --undo <run_id>`.**
+  **What:** move a run's links back (attempt rows carry `run_id`). **Why:** the correction path today is forget + remember per fact. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Conflict candidates for facts with no entity page.**
+  **What:** let the conflict sweep pick neighbours by embedding when a fact's subject has no page. **Why:** relink only links facts whose subject has a page. **Cons:** touches the conflict slot's candidate selection. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Relink fence-owned subjectless conversation facts.**
+  **What:** an entity column for transcript fences so conversation-extractor rows can be linked without leaving their fence. **Why:** relink reports them as `fence_owned` and leaves them. **Effort:** L. **Priority:** P3.
+
+## Fix wave 5 follow-ups (filed 2026-10-01, follow-up from v0.60.28.0)
+
+- [ ] **P3 — Windows: unmanaged sync refuses a repo under an 8.3 short path.**
+  **What:** `resolveSyncRepo` (`src/commands/sync/preflight.ts`) compares `realpathSync(scope)` with the git root git reports. On Windows `realpathSync` keeps an 8.3 component (`RUNNER~1`) while git returns the long form, so the scope-entry guard refuses with "resolves outside git repo". Seen on the windows-latest runner, whose TEMP is a short path; the #5032 test fixture now starts from `realpathSync.native(tmpdir())`. **Fix:** compare `realpathSync.native` on both sides. **Effort:** S. **Priority:** P3.
+- [ ] **P2 — Codex managed block is a singleton shared by `connect --harness codex` and `bootstrap harness` (#5775 follow-up).**
+  **What:** `src/core/bootstrap/codex-toml.ts` keeps exactly one `# gbrain:bootstrap-harness-v1 begin/end` pair per file; `writeCodexHttpServerBlock` strips any existing managed block regardless of its server name and writes its own, and `removeCodexHttpServerBlock(path, name)` removes the block whatever name it holds. Writing `[mcp_servers.gbrain]` (connect) then `[mcp_servers.gbrain-framework]` (bootstrap) leaves only the second; removing `gbrain-framework` while the block holds `gbrain` deletes it. `connect --install` refuses over a bootstrap-written block, but `bootstrap harness` and `bootstrap harness --remove` silently replace or remove a connect-installed block. **Fix:** per-name markers, or an ownership check in the bootstrap lane. **Effort:** S-M. **Priority:** P2.
+- [ ] **P3 — Expired inline-token warning for `connect --status` (#5775 follow-up).**
+  **What:** `gbrain connect --harness <id> --status` could flag an inline token past `expires_at` and print the `renew_command`. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Backup probe: honor a user's SSH command.**
+  **What:** the remote-ref probe replaces `GIT_SSH_COMMAND` with its own `-oBatchMode=yes` command (`src/core/backup/repository.ts`), so deploy-key users who select keys that way stay `unavailable`. **Fix:** merge the user's identity options with BatchMode. Deploy keys work today through `~/.ssh/config`. **Cons:** parsing a user shell command is fragile. **Effort:** S. **Priority:** P3.
+- [ ] **P2 — CI large-brain smoke tier.**
+  **What:** 10k-50k file brains for `sources add`, `claim` and sync beyond the one recorded case in `test/e2e/persistence-large-manifest-50k.test.ts`. **Why:** #5790 (1 MiB manifest bound) and #5401 (2-page projection drain) both reached users before a test saw a large brain. **Cons:** CI time and cost. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Cost estimate for bulk-approved paid legacy jobs.**
+  **What:** `gbrain jobs authorize-legacy --select` previews mark paid-provider job names but do not estimate spend; approving thousands of old synthesize jobs can spend money. **Fix:** a per-handler cost model in the preview. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Remote-op contract test for type-zero optional parameters (#5390 remainder).**
+  **What:** `search`/`query` now treat `types: []`, `""` and whitespace-only strings as no filter on the CLI, but over MCP `types: ""` is still refused by the array type check. **Fix:** one contract test across remote ops asserting how each optional parameter's empty value (`[]`, `""`, `null`) is handled, then align the schema checks. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Key the session-start context pack by a raw-id hash.**
+  **What:** the SessionStart context pack keys its cursor on `sanitizeSessionId(session_id)` (`src/commands/hook.ts`, ambient recall arm), so two raw ids that sanitize to the same string share a cursor. **Fix:** key on a hash of the raw id in both the session-start and compact arms together. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Colon-slug escape mapping for Windows portability (#5032 follow-up).**
+  **What:** colon slugs such as `calendar:abc` are writable again, but on Windows a write whose file name would contain `:` is refused (`colon_slug_windows_write_through`) and sync skips such files. **Fix:** a reversible slug-to-filename escape for `:` so colon-slug brains stay portable to Windows checkouts. **Cons:** a filename mapping every reader and writer must agree on. **Effort:** M. **Priority:** P3.
+- [ ] **P2 — #4951: PGLite `serve --http` wedges on stale planner statistics.** **Status (2026-10-15): mitigated, unverified.** F4b analyzes stale hot tables before the first planner-sensitive read, during import and sync and on the consumer's idle tick, and LHF wave 2 item 6 adds an ANALYZE after every index build plus maintenance-pass statistics for expression indexes that have none; doctor `planner_stats_stale` reports what remains. Not verified against the reporter's `readAdjacencyBoosts` plan. **Close when:** that plan (or `get_links`) stays fast on an upgraded PGLite brain without a manual ANALYZE.
+  **What:** a reporter saw `readAdjacencyBoosts` take about 72 s with nested-loop plans; a full `ANALYZE` on pages, links, sources, timeline_entries and content_chunks dropped it to 21 ms. PGLite has no autovacuum and runs queries on the main thread, so a slow plan looks like a wedge. Cause likely, unverified for `get_links`. **Fix:** run `ANALYZE` on the hot tables after migrations, bulk import or sync and periodically from the owner, plus a doctor check for stale `last_analyze`. **Effort:** S-M. **Priority:** P2.
+- [x] **P3 — #5190: pin `search_path` for the two fact functions.** **Completed: fix wave 9** — every gbrain plpgsql function pins `search_path` (definitions plus the `function_search_path` migration (v211)); the fingerprint SQL functions schema-qualify their built-ins and stay inlinable.
+  **What:** `gbrain_fact_fingerprint` and `gbrain_preserve_fact_withdrawal` (`src/core/facts/withdrawal-schema.ts`) have no pinned `search_path` (Supabase linter warning). `gbrain_fact_fingerprint` backs an index expression and must stay inlinable, so qualify its calls (`pg_catalog.`) instead of `SET search_path`; pin only the trigger function. **Effort:** S. **Priority:** P3.
+- [x] **P2 — #5205: resident `serve` pool-size guidance.** **Completed: v0.60.36.0** — remediation recommends the resident floor of 6 and the boot-deadline line names the stuck phase and pool pressure.
+  **What:** a `serve` boot never completed at `GBRAIN_POOL_SIZE=2`, which our remediation text still recommends (`src/core/pg-access-classify.ts`, `src/commands/db-repair.ts`). The deadlock mechanism is unverified. **Fix:** measure the connection need of a resident `serve` first, then change the guidance (the reporter measured 6 as the minimum at which the projection worker drains) and fail fast with a pool-size message. **Effort:** S once measured. **Priority:** P2.
+- [ ] **P3 — #5250: signal when `GBRAIN_SOURCE` narrows an unqualified stdio read.**
+  **What:** a stdio connection bound with `GBRAIN_SOURCE` (or `__all__`) can return nothing for an unqualified read with no hint why, so agents conclude the brain is empty. **Fix:** a response note naming the binding when it narrowed the read. **Effort:** S. **Priority:** P3.
+- [x] **P3 — #5216: orphan-repair command for PGLite.** **Completed: v0.60.36.0** — `gbrain repair orphan-children` (preview, then `--apply`) with the torn-TOAST probe; migration 150 adds the revision column nullable and backfills in batches.
+  **What:** migration 150's volatile default rewrites `pages` and hits a torn TOAST chunk on a corrupt PGLite brain; doctor's `child_table_orphans` prints raw `DELETE` SQL that PGLite users cannot run. **Fix:** `gbrain repair orphans` running doctor's own cleanup, plus a re-import-from-canonical-file repair for a torn body. Changing migration 150 itself is high risk for a corruption edge case and stays out. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — #5279: abandon an unactivated writer claim.**
+  **What:** a claim that was never activated leaves ownership markers that fence legacy sync, and there is no undo before activation. **Fix:** `gbrain sources writer claim <source> --abandon`, refused once the brain is enabled, that removes only markers stamped with this brain and claim. **Effort:** M. **Priority:** P3.
+- [x] **P3 — #5041: classic write-through for `extract_atoms` and `synthesize_concepts`.** **Completed: fix wave 9 (lane P)** — opt-in keys `cycle.extract_atoms.write_through` / `cycle.synthesize_concepts.write_through` write generated atoms and concepts as markdown files on unmanaged brains (the next run backfills earlier pages; retired atoms lose their files; gitignored and declared `db_only` targets stay database-only), and a concept that already has a file is rewritten in place. Pinned by `test/cycle/derived-write-through.test.ts`.
+- [ ] **P3 — #5061: `getStats`/`getHealth` cost on large Postgres brains.**
+  **What:** both are uncached full aggregates, and `getHealth` runs a per-page links count; they are reachable from the CLI, `/admin/api/full-stats` and the MCP stats and health ops, so a client polling them loads a large brain. The admin dashboard itself does not poll them. **Fix:** a short TTL cache or estimate counts on the HTTP and MCP paths. **Effort:** M. **Priority:** P3.
+
+## Fix wave 4 follow-ups (filed 2026-09-30, follow-up from v0.60.20.0)
+
+- [ ] **P3 — #5751 follow-up: `gbrain repair file-normalization` (wave 5).**
+  **What:** managed working-tree sync now skips unchanged legacy files whose bytes differ from what gbrain reads back (for example non-UTF-8), and the summary tells the user to re-save them. **Fix:** an explicit-only repair kind that rewrites each such file in canonical form through a canonical file publication followed by its Git effect, reported by `gbrain repair`, remediation and the post-upgrade banner as `explicit_kind_required`. **Why deferred:** below the wave 4 cut line. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Convert a bound connector's filesystem worktree to database-only operation (#5673).**
+  **What:** `gbrain sources set-path <id> --clear` refuses a connector source that has a live persistence source binding, because its worktree still owns that checkout; that refusal is the interim exit. **Fix:** a supported conversion that retires the connector's worktree binding and leaves it syncing database-only. **Effort:** M. **Priority:** P3.
+
+## Refactor wave 1 follow-ups (filed 2026-09-30; plan: docs/designs/REFACTOR_WAVE_1.md, review record: docs/designs/refactor-wave-1/)
+
+- [ ] **P2 — Wave 2: decompose the remaining >300-line functions (plan D1).**
+  **What:** every row of `scripts/function-size-baseline.tsv` outside the wave 1 files: `runCycle`, `applyHarness`, `runPhaseSynthesizeInner`, `runImport`, `importFromContent`, `makeSubagentHandler`, `runConfig` and the rest. **Why:** the W5 ratchet only freezes them; they are the same bug-farm class wave 1 split. **Pros:** shrinks the baseline with proven patterns (state object, registry, named stages, handler table). **Cons:** path churn against open PRs. **Depends on:** wave 1 merged plus its 72-hour revert-clean window. **Effort:** L. **Priority:** P2.
+- [ ] **P3 — `src/core/` regroup and `ai/gateway.ts` provider adapters (plan D2).**
+  **What:** group `src/core/` by subsystem and split the gateway into per-provider adapters. **Why:** the next layer of navigability. **Cons:** large path churn; the adapter interface is an open design question. **Depends on:** wave 2 in part. **Effort:** L. **Priority:** P3.
+- [ ] **P2 — Phase-named sync errors (plan T3).**
+  **What:** errors and timeouts raised inside a `SyncRun` phase (`src/commands/sync/`: preflight, deletes, renames, imports, finalize) name the phase. **Why:** the phase breadcrumbs added for the PGLite sync-hang report (see "Mitigation in v0.41.8.0" further down) only log; the error text still does not say which phase failed. **Cons:** changes error text pinned by goldens (an intentional, reviewed change). **Depends on:** wave 1 W4 sync. **Effort:** S. **Priority:** P2 (first follow-up).
+- [ ] **P3 — Timestamp-based schema migration versions.**
+  **What:** replace sequential `v<NNN>` versions with collision-free ones. **Why:** concurrent branches pick the same next number; today `bun run build:schema-migrations` fails loudly on a duplicate and `check:schema-migration-order` rejects an out-of-order landing, but the fix is still a manual renumber. **Cons:** changes `schema_version` semantics and the runner's ordering. **Depends on:** wave 1 W3. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Router-level admin auth for `serve --http`.**
+  **What:** mount `/admin/api/*` on an `express.Router` with `router.use(requireAdmin)` in `src/commands/serve-http-admin-api.ts` instead of attaching `requireAdmin` per route. **Why:** a forgotten per-route guard becomes impossible rather than caught by `test/serve-http-admin-route-guard.test.ts`. **Cons:** changes the middleware order pinned by the route goldens. **Depends on:** wave 1 W4 serve-http. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Wave 1 re-measure at +3 months (run on or after 2026-12-30).**
+  **What:** rerun the outcome baseline (`docs/designs/refactor-wave-1/outcome-baseline.md`, "Re-measure at +3 months") and add four numbers: (1) the share of storage commits (touching either engine path or `src/core/engine-sql/`) that still edit both engine files, against the 74.3% last-90-day baseline; (2) conflicts on target paths per merged PR, via the GitHub API: for each merged PR touching the target paths, the other PRs merged between its creation and merge that touched the same file, computed for 2026-07-01..2026-09-30 and for the re-measure window with one method; (3) remaining baseline rows: `grep -c '^method' scripts/engine-sql-baseline.tsv` and the data rows of `scripts/function-size-baseline.tsv`; (4) median rebase-to-merge time (last head update to merge) for PRs touching target paths. **Why:** criterion (e) and O19. **Effort:** M. **Priority:** P3.
+- [ ] **P2 — Extend RLS scope binding to reads master left unscoped (E-TODO-1).**
+  **What:** move `LegacyUnscopedRead` reads (salience, facts, takes, code-edges and the others in the EO4 inventory, `test/fixtures/goldens/rls-scope-inventory.json`) to `ScopedRead`. **Why:** RLS layer 2 covers only the reads master scoped. **Pros:** defense in depth on hosted Postgres; the brands make it a type edit per method. **Cons:** with `GBRAIN_RLS_SCOPE_BINDING=1` each read gains a transaction and a pool hold (the #1794 class), so it needs a PgBouncer load test. **Depends on:** wave 1 W1. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Collapse per-domain parity tests into executor contract tests (E-TODO-3).**
+  **What:** once every storage domain is migrated to `src/core/engine-sql/`, replace duplicated per-domain PGLite/Postgres parity scenarios with the executor contract tests plus one shared scenario suite per domain. **Why:** the parity files exist because the SQL was written twice. **Cons:** each retirement needs its evidence table (docs/TESTING.md "Retiring a test"). **Depends on:** all domains migrated. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Align PGLite `getEdgesByChunk` with Postgres.**
+  **What:** PGLite keeps its own `getEdgesByChunk` (`src/core/pglite-engine/code-edges.ts`, a `method` row in `scripts/engine-sql-baseline.tsv`) because its SQL is one `UNION ALL` under a single shared `LIMIT`, and for direction `both` its edge-type filter binds only to the `to_chunk_id` arm (operator precedence); Postgres runs two statements with their own limits and a parenthesized filter (`docs/designs/refactor-wave-1/w1-inventory.md`). Move PGLite onto `src/core/engine-sql/code-edges.ts` and drop the row. PGLite also splices `edgeType` into the SQL text instead of binding it. **Why:** one implementation, and the filter precedence looks like a bug. **Cons:** a behavior change for PGLite results (limits and filtering). **Effort:** S. **Priority:** P3.
+
+## Fix wave 3 follow-ups (filed 2026-09-29, follow-up from v0.60.11.0)
+
+### Recovery layer
+
+- [ ] **P1 — Bounded replay window for lifetime request IDs (wave-2 CEO-E7).**
+  **What:** every admitted write keeps a permanent request ID for replay protection, so the principal and brain lifetime-ID limits only move later (`persistence_capacity` warns at 80% and names a `gbrain config set` value). **Fix:** a bounded replay window with a documented horizon and an eviction rule that never replays a committed write twice; size it from the default of 600 admissions a day (about 417 days of headroom at the default limit). **Trigger:** start when the first `persistence_capacity` warning is reported from a real brain. **Effort:** L. **Priority:** P1.
+- [ ] **P1 — Opt-in `min_writer_version` floor.**
+  **What:** the `writer_version` doctor advisory only observes: a binary older than v0.60.5.0 can still delete database-only timeline rows. **Fix:** an opt-in floor enforced at admission and publication by the database (reusing the `writer_protocol_floor` trigger pattern), a binary version declaration older binaries lack, quiescence to enable it, and a floor that cannot be lowered. Eng estimate 1,500-3,000 changed lines against 800-1,500 for the advisory. **Effort:** L. **Priority:** P1.
+- [ ] **P2 — #5226 part 2.** Revisit only after part 1 is confirmed fixed with pacing on. **Priority:** P2.
+- [ ] **P2 — Database remediation run record with a reservation ledger.**
+  **What:** the remediation cap, consent and spend live in the local checkpoint (`~/.gbrain/remediation/<plan hash>.json`), which covers one host. **Fix:** a `remediation_runs` record plus per-attempt reservations that delegated workers enforce, so a cap holds across processes and hosts. This also closes two known gaps: the embedding effects that `timeline` and `visibility` repairs queue are charged at their pre-repair estimate but the persistence consumer does not enforce the cap per provider call, and a resumed safe-chunks embedding pass is scoped by source rather than by the exact re-sealed pages. **Effort:** L. **Priority:** P2.
+- [ ] **P3 — Host-label registry for writer-version warnings.** The advisory names hosts by persistence host UUID because no hostname is recorded (`identity.ts` `host.json`). Record an operator-chosen label per host and show it beside the UUID. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `source-paths` / `source-uris` repair kinds and the metadata-repair intent (dropped from W8).** Revisit when `invalid_source_uri` reports arrive; the manual step in `docs/guides/write-refusals.md` stands until then. **Priority:** P3.
+- [ ] **P3 — Doctor check for unpushed managed commits by age (#5198 thread).** **Priority:** P3.
+- [ ] **P3 — #5392 inert single-writer mode.** Recommended no: resolve through the #5198/#5254 family instead. Recorded so the decision is visible. **Priority:** P3.
+
+### Connectors
+
+- [ ] **P1 — Move the cycle stamps out of `sources.config`.**
+  **What:** `runCycle` writes `last_source_cycle_at` / `last_full_cycle_at` into `sources.config` after every source cycle; that rotating blob was the root cause behind #5686. v0.60.11.0 keys connector identity on parsed settings instead, but nine files still read the stamps from the blob. **Fix:** dedicated columns or a cycle-state row, with a migration; community PR #5695 sketched one. `reconcilePolicyDigest` now excludes `last_source_cycle_at`/`last_full_cycle_at` (v0.60.28.0), so an autopilot cycle no longer stales a `gbrain sources reconcile` preview; moving the stamps out of `sources.config` stays open.
+- [ ] **P2 — Per-source "admit even if unchanged" bypass for the #5470 no-op skip.**
+  **What:** there is no way to force one connector, import or sync source to republish unchanged pages (for example after a renderer fix that keeps content hashes). **Fix:** a source-scoped, one-run flag that disables the kernel skip; `--reset-checkpoint` only re-walks.
+- [ ] **P3 — Configurable connector pending-wait budget, clamped to the run's deadline.**
+  **What:** the managed connector waits at most 30 s in total for accepted writes per run (`CONNECTOR_WAIT_BUDGET_MS`). **Fix:** a config key, clamped so it never exceeds the caller's job timeout.
+- [ ] **P2 — Multi-source connector fan-out deadline (`stopped_on_wait_budget` across sources).**
+  **What:** each connector run bounds its own waits and records `stopped_on_wait_budget`, but no in-process fan-out dispatches many connector sources against one shared deadline, so the plan's 50-source fan-out stop was not built. **Fix:** when such a fan-out exists (for example `sync --all` over connector sources), stop dispatching new sources at the deadline and report the rest.
+- [ ] **P3 — Connector ingest waits on its whole pending set while the owner is delayed.**
+  **What:** under a delayed consumer each run first waits on its recorded pending set and stops on the wait budget, so new upstream items are not admitted until the backlog drains (measured by `test/fix-wave-3-chaos.test.ts`). Nothing is lost; the items wait upstream. **Fix:** if time-to-searchable under sustained arrivals matters, admit new items up to the outstanding limit while the pending set resolves.
+- [ ] **P3 — Hold tuning keys if field reports show the fixed thresholds misfire.**
+  **What:** fix wave 4 (v0.60.20.0) holds a connector item after 3 consecutive failed syncs, with a fixed circuit breaker (5 attempted items; half transient, or 5 and half with one code), a fixed transient backoff (1 h, 6 h, 24 h, then daily for 7 days) and a cap of 100 holds per source. **Fix:** only if field reports show these misfire, add validated `connectors.hold.threshold_runs`, `connectors.hold.breaker_items`, `connectors.hold.backoff` and `connectors.hold.window_days` config keys with today's values as defaults, with tests and the connector guides updated.
+- [ ] **P3 — Row-level ownership for fences in connector renders.**
+  **What:** when the provider's own render carries a facts fence (for example a GitHub issue body), the provider owns the whole fence: upstream corrections win, and rows added on the brain to that fence are not carried. When the provider later drops its fence entirely, the stored fence is carried as brain-added. **Fix:** record which fence rows came from the provider so each side's rows follow its owner.
+- [ ] **P3 — Resume a partially refused embedding without re-embedding its siblings.**
+  **What:** after a #4616 refusal the page signature is cleared so `gbrain embed --stale` finds it; an explicit `retry-effects` then re-embeds the page's other chunks too, and `gbrain embed <slug>` stamps the signature only when it embeds every chunk in one run. **Fix:** judge completion from per-chunk provenance and stamp the page once the stored set is complete.
+- [ ] **P3 — Record #4616 refusals inside embedding scans.**
+  **What:** a withdrawal or source-scan embedding effect that meets a refused chunk moves on to its next page, so the effect can finish `committed` while that page's refused chunk has no vector (the page keeps no signature, so `gbrain embed --stale` still finds it). The generic parking path is built for Git and withdrawal targets: it would share the scan's embedding retry budget across pages, and `retry-effects` would mark a parked embedding scan complete. **Fix:** a scan-local refused-page list that resets the per-page attempt base and that `retry-effects` resolves before completing.
+
+### Maintenance writers
+
+- [ ] **P3 — Release the reservation of other permanent embedding rejections, per provider.**
+  **What:** v0.60.28.0 settles a request-shaped embedding rejection (HTTP 400, 413 or 422) at zero usage only for Google, whose billing FAQ says rejected requests are not charged. OpenAI, Voyage and the other embedding recipes publish no such statement, so their rejections keep the maximum debit against a `gbrain migrate embeddings --max-cost-usd` authorization and a migration can still stop early at the cap. **Fix:** add each provider to the unbilled-rejection list only after its documentation (or a billing-console check) confirms rejected requests are free, with a test at exactly the printed cap. **Effort:** S per provider. **Priority:** P3.
+
+## Test-audit follow-ups (filed 2026-09-29)
+
+Evidence for each item is in `docs/test-audit/2026-09-29/`.
+
+- [ ] **P2 — Reusable test-audit scanners under `scripts/test-audit/`.**
+  **What:** the 2026-09-29 audit inventories (source-read pins, typeof probes, placeholder assertions, near-duplicate files, test-only exports, unreachable modules) came from one-off scanner scripts that were not committed. **Fix:** rewrite them as maintained `scripts/test-audit/*` commands with fixtures, so the next audit re-runs them instead of rebuilding them, and so their output format matches the committed inventories. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — CI mutation-probe job for changed tests.**
+  **What:** the audit found many tests that pass when the behavior they name is broken. Nothing in CI checks that a new or changed test can fail. **Fix:** an opt-in (then required) job that, for each changed test file, applies a small set of targeted mutations to the production code it imports and reports tests that survive every mutation; start advisory and graduate with a budget per PR. **Effort:** L. **Priority:** P2.
+- [ ] **P3 — Per-symbol review of 136 dead-in-prod exported functions.**
+  **What:** `docs/test-audit/2026-09-29/lane-seams/seams.md` §3.4 lists 136 exported functions with no reference outside tests (beyond the test-seam names and dead modules the plan already handles). **Fix:** review each: wire it, make it module-private, or delete it with its tests, one small PR per subsystem. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Extract a testable autopilot tick function, then retire the 8 autopilot wiring greps.** **Downgraded (GBRA-47 D9):** the operator-pause pins now have behavioral owners (in-process worker and spawned daemon); the remaining greps are lower risk.
+  **What:** 8 test files (~75 tests: auto-drain, cycle-failure-classification, fanout-wiring, nightly-probe-wiring, parser-probe-wiring, shutdown-engine-close, supervisor-wiring, self-upgrade) pin the inline autopilot tick body as source text because no callable tick exists. **Fix:** extract the tick into an exported function with injected clock, engine and job submitter, cover each wiring behavior with a real call, then delete the source greps. **Effort:** M. **Priority:** P3. **Coordination (refactor wave 1, E-TODO-2):** the tick now runs as named steps in `src/commands/autopilot-daemon.ts` (`probeDatabaseOrReconnect`, `probeNoWorkerPeer`, `runInlineCycle`, `adaptiveInterval`), `dispatchAutopilotTick` in `autopilot-dispatch.ts` and the probes in `autopilot-probes.ts`, and the greps read them through `test/helpers/source-surface.ts`; extract the injectable tick from `runAutopilotDaemon` in the same change that retires the greps, so they are re-pointed once.
+- [ ] **P3 — Speed passes on `test/helpers/reset-pglite.test.ts` (~15 s) and `test/docs-navigation.test.ts` (~3.5 s).**
+  **What:** the two most expensive files in their audit lanes. `docs-navigation` is the only Markdown link and fragment checker, so it must stay; scope or cache its parsing instead. **Fix:** profile both and cut repeated setup (shared engine or fixture reuse for the reset helper; parse each doc once for the link checker). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — CONTRIBUTING.md "first green test" block.**
+  **What:** a contributor has no single keyless path from clone to one passing test. **Fix:** add a block with a keyless clone, `bun install --frozen-lockfile`, and one small representative test command with its expected output, measured once on a clean checkout. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `gbrain features` dead-links check: remove or justify.**
+  **What:** `scanFeatures` recommends "Fix Dead Links" when `getHealth().dead_links > 0`, but `links.to_page_id` cascades on page delete on both engines, so that count cannot become non-zero and the recommendation never fires. `test/features.test.ts` covers every other check and deliberately does not stub this one. **Fix:** delete the check (and the matching `featuresTeaserForDoctor` clause), or document a third-party engine or schema state that can produce dangling links and test it there. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Supervisor: decide whether a failed reconnect should retry on every later failing tick.**
+  **What:** after the third consecutive health failure the supervisor warns and calls `engine.reconnect()`. A failed reconnect leaves the failure counter at 3 or more, so every later failing health tick warns `db_connection_degraded` and reconnects again (pinned as current behavior in `test/supervisor-health-reconnect.test.ts`). No doc or CHANGELOG entry says whether that per-tick retry is intended. **Fix:** confirm it is intended and document it, or add a backoff between reconnect attempts and update the test. **Effort:** S. **Priority:** P3.
+- [x] **P1 — `auto_chronicle` does nothing since v0.51.0.0.** **Completed (verified 2026-10-04, GBRA-47 F15):** `src/core/chronicle/config.ts` owns the switch, the chronicle cycle phase (`src/core/cycle/chronicle.ts`) reads it, and `backstop.ts` is gone; `test/chronicle-auto-phase.test.ts` writes a meeting, runs the phase and reads the events, and its "opt-out between decision and run" case makes zero model calls (31/31 pass with `test/chronicle-auto-decision.test.ts`).
+  **What (original):** v0.51.0.0 moved the facts backstop onto the effects queue and dropped the chronicle backstop, so `gbrain config set auto_chronicle true` has no reader (`isAutoChronicleEnabled` is only called from the unwired `src/core/chronicle/backstop.ts`), yet the advisor still tells users to enable it. **Fix:** restore the chronicle backstop on the effects queue, or retract the setting and the advisor text. `backstop.ts` is held in the orphan guard's permitted set until then.
+- [x] **P1 — `gbrain onboard --history` always returns nothing.** **Completed (fix wave 10, #6109):** `runRemediation` (`src/core/remediation/run.ts`) opens an impact probe before submitting each job step whose job moves a tracked metric and closes it once the job is terminal (`openStepImpact` / `closeStepImpact` in `src/core/onboard/impact-capture.ts`), reading each metric through the brain's own definition (countStaleChunks, findOrphanPages under the orphan-reporting policy, the coverage checks' query); the orphan guard no longer holds the module. `test/remediation-impact-capture.test.ts` (PGLite) runs real extract steps and reads the rows back through `onboard --history`; `test/e2e/onboard-full-flow.test.ts` checks the row's JSONB details on Postgres.
+  **What (original):** `src/core/onboard/impact-capture.ts` is the only writer of `migration_impact_log`, which `onboard --history` reads, and it has no runtime caller. **Fix:** wire impact capture into the migration path or retract `--history`. Held in the orphan guard's permitted set.
+- [ ] **P2 — archive-crawler `scan_paths` safety fence is documented as enforced but is not.**
+  **What:** `skills/archive-crawler/SKILL.md` says the fence is enforced by `src/core/storage-config.ts`; the enforcing module `src/core/archive-crawler-config.ts` is unwired. **Fix:** wire the check or correct the skill text. Held in the permitted set.
+- [ ] **P2 — Progressive-batch rewire or retire.**
+  **What:** the progressive-batch orchestrator, retrofit-wrap and stage-report modules lost their callers in #1519 while an open item (see the progressive-batch entry below) still plans to rewire them. **Fix:** decide rewire vs abandon; held in the permitted set until then.
+- [ ] **P2 — `gbrain auth rescope-client … --dry-run` and `auth local-writer register … --dry-run` fail with "unknown flag".**
+  **What:** the handlers read `--dry-run`, but the generated flag registry drops it for `auth` (the generator deletes `--dry-run` unless it finds a quoted use in the command's own module). Two guides document these commands and are allowlisted in the docs-CLI truth check. **Fix:** teach the generator about delegated handlers, regenerate, and remove the allowlist entries.
+- [ ] **P3 — `jobs watch` budget-owners panel reads columns only the deleted minions budget tracker wrote.**
+  **What:** the panel now always renders empty. **Fix:** remove the panel or feed it from the live budget meter. Also `RECOVERABLE_CLUSTERS` in `error-classify.ts` has no consumer left.
+- [ ] **P3 — Seven remaining CLI flag mismatches in README and `docs/` outside the truth-check scope** (for example `recall --entity`, `dream --slug`). Listed in the test-reduction wave PR description; extend the truth check to README and `docs/**` and fix them.
+- [x] **P2 — A second signal during the cleanup pass exits before the lock is released.** **Completed: 2026-09-29 (test-reduction wave)** — `runCleanupPass` in `src/core/process-cleanup.ts` now keeps the in-flight pass promise, so a later signal or stdout `EPIPE` waits for that pass (still bounded by its 3s deadline) before exiting; callbacks still run once. Pinned by `test/process-cleanup.test.ts` (SIGTERM, then SIGPIPE, then a stdout `EPIPE` during a held cleanup: no exit until the callback finishes) and `test/e2e/sync-lock-recovery.test.ts` (closing the sync output pipe the moment the lock row appears leaves no lock row). Before the fix, closing the pipe at the lock boundary leaked the `gbrain-sync:default` row 6 of 6 times; after it, 0 of 20. The stdout/stderr `EPIPE` listeners stay: under Bun 1.3, writes through `console.log` surface only as SIGPIPE, but writes through `process.stdout.write` also emit `EPIPE` error events on the stream (measured with a shell pipe, a Bun parent and a Node parent), so the listeners are reachable.
+
+## Skillopt honesty + model provenance wave follow-ups (filed 2026-09-28, #5584 / #5585 fix wave)
+
+- [ ] **P1 — TODO-D: validated Anthropic default-model migration.**
+  **What:** `TIER_DEFAULTS`, `DEFAULT_ALIASES` and the gateway's `DEFAULT_EXPANSION_MODEL` / `DEFAULT_CHAT_MODEL` still pin older Claude ids (`claude-sonnet-4-6`, `claude-opus-4-7`). `gbrain models` now prints an advisory `[newer <family> available]` hint, but no default moves. **Fix:** recipe-metadata recommended defaults (not "newest wins": `fable` and any preview id are never auto-selected), measured cost/latency/quality on a representative cycle + dream run before flipping, and an explicit output-cap policy for thinking models across small-cap callers (judges, classifiers, the cycle budget meter), since Claude 5 thinking needs headroom that explicit caller `maxTokens` does not grant today. Reuse `src/core/ai/anthropic-model-ids.ts` for version parsing. Ship with a CHANGELOG disclosure of the cost change. **Effort:** L. **Priority:** P1.
+- [ ] **P2 — TODO-A: adopt `buildModelsUsed` in eval / dream / cycle receipts.**
+  **What:** only skillopt receipts carry `models_used`; the BudgetTracker ledger (`snapshot().models`) already records every gateway operation for any tracked run. **Fix:** call `buildModelsUsed` from `src/core/budget/models-used.ts` in the eval, dream and cycle receipt writers so every paid run names the models it called (engine-internal expansion/embedding included), additive fields only. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — TODO-B: sweep literal Anthropic fallback pins + guard.**
+  **What:** call sites still hand-roll model literals instead of `TIER_DEFAULTS.<tier>` (e.g. `src/core/facts/extract.ts`, `src/core/brainstorm/orchestrator.ts`, `src/core/page-summary.ts`, `src/core/cross-modal-eval/runner.ts`). **Fix:** route them through the tier table and add a `scripts/check-*` guard with an allowlist (model-config, pricing, recipes, tests) so new literal pins fail CI. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — TODO-C: `claude-opus-5-5` recipe + verified pricing (#5563).**
+  **What:** the anthropic recipe and `src/core/model-pricing.ts` do not list `claude-opus-5-5`. **Fix:** add the recipe entry and canonical price only once the price is verified from the provider's published pricing; coordinate with #5563. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — TODO-E: guard chat consumers that ignore `stopReason === 'length'`.**
+  **What:** skillopt reflect/one-shot/judge/bootstrap now check the length stop; other `gateway.chat()` consumers that parse structured output can still silently parse a truncated reply. **Fix:** a guard script or test that flags chat call sites parsing output without checking `stopReason`, with an opt-out marker for free-text consumers. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — TODO-F: configurable optimizer context size for unregistered long-context models.**
+  **What:** skillopt sizes the skill-body budget from `resolveChatContextTokens(optimizer)`; an unregistered model falls back to 120,000 chars and may truncate a body its real window could hold. **Fix:** a validated override (config key or recipe metadata) for the optimizer's context window, shown on the banner and honored by the context-too-small check. **Effort:** S. **Priority:** P3.
+- [ ] **P1 — TODO-H: enforce the strict model plan at call time for rollout tool arguments.**
+  **What:** strict mode checks the models plan before spend. A rollout's search tool call can name an explicit `embedding_column`, which routes the query embedding through that column's provider without a plan check. **Fix:** carry the validated plan into the rollout tool context and refuse (or re-check) a column whose provider is not in the plan, or enforce provenance per gateway invocation under a strict run. **Effort:** M. **Priority:** P1.
+- [ ] **P2 — TODO-I: whole-run cost cap across resume segments.**
+  **What:** `--max-cost-usd` caps each run segment; a resumed run starts a fresh tracker, so N resumes can spend N x the cap (documented in the guide). **Fix:** seed the resumed tracker and preflight with `max(0, cap - prior_segments_cost_usd)`, and make the budget_exhausted remediation and resume command say "total run cap". Contract change: needs a CHANGELOG callout. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — TODO-J: `--resume` refuses a missing checkpoint and carries the brain.**
+  **What:** `--resume <id>` with a missing, GC'd or corrupt checkpoint silently starts a fresh full run under that id, and the printed resume command omits `--brain`, so pasting it from another directory can resume against a different brain. **Fix:** refuse with a structured `resume_checkpoint_missing` error; persist the resolved brain id in the run spec, validate it on resume and emit it in the command. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — TODO-K: record the provider-reported served model in the spend ledger.**
+  **What:** chat ledger rows record the routed `provider:model` as the served model; the provider's `response.modelId` (already surfaced as `responseModel`) is not kept, so alias/proxy substitutions are invisible in `models_used`. **Fix:** add a separate `servedModelId` field from the response while keeping the routed id for pricing. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — TODO-L: background skillopt jobs coalesce onto an earlier errored run.**
+  **What:** `--background` submits with the fixed idempotency key `cli:skillopt:<skill>`; an `errored` run completes normally and keeps the key, so a retry with a raised cap returns the old job id. **Fix:** include the run parameters in the key (or free it on non-accepted outcomes) and report `coalesced` to the user. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — TODO-G: under-5-minute first skillopt run.**
+  **What:** the first-ever run still takes ~20 minutes (bootstrap, review, strengthen judges). **Fix:** ship a pre-reviewed sample benchmark for one bundled skill and add a validated `split` param to the `run_skillopt` MCP op so agents can run the 15-task starter (`1:1:1`) without the CLI. **Effort:** M. **Priority:** P3.
+
 
 ## Remote MCP over Tailscale follow-ups (filed 2026-09-17, follow-up from v0.51.3.0, `gbrain mcp expose` wave)
 
@@ -50,8 +726,6 @@
   **What:** `sensitivity-scan.ts` bridges the gap by fingerprint dedupe so short bearer tokens still surface as `pii:bearer`; making secret-scan the single owner would let the PII family drop `jwt` / `bearer` entirely. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — Bulk purge for a leaked transcript session.**
   **What:** a long session lands as `-pN` part pages plus raw metadata; after a leak the operator hand-lists slugs for `gbrain delete <slug> --purge`. A `gbrain transcripts purge --session <file>` would purge every part + raw row of one session. **Effort:** S. **Priority:** P3.
-- [ ] **P3 — Widen `scripts/check-pg-url-redaction.sh` to every scheme `db_url_credentials` covers.**
-  **What:** the guard greps `src/` for `postgres(ql)://…@` literals only; comments could still spell a mysql/mongodb/redis URL with userinfo. **Effort:** XS. **Priority:** P3.
 - [ ] **P3 — `gbrain jobs submit shell --follow` (inline execution) reads the shell opt-in from env only.**
   **What:** `jobs work` gained `--allow-shell-jobs` because the cwd-`.env` quarantine can drop `GBRAIN_ALLOW_SHELL_JOBS`; the inline `--follow` path has no flag equivalent. **Effort:** XS. **Priority:** P3.
 - [ ] **P3 — CLI-spawning tests fail on the runtime gate instead of skipping when the host Bun is below `MINIMUM_BUN_VERSION`.**
@@ -90,13 +764,13 @@
 ## Community fix wave follow-ups (filed 2026-09-09)
 
 - [ ] **P3 — new v0.49/v0.50 tests assume `os.tmpdir()` is already a realpath (macOS `/var` vs `/private/var`).**
-  **What:** `test/agent-install.test.ts`, `test/harness-install-ownership.test.ts`, `test/harness-onboarding.test.ts`, `test/init-mcp-only.test.ts`, `test/minions-submission-authority.test.ts`, `test/harness-access.serial.test.ts` and `test/harness-delivery-recovery.serial.test.ts` fail on macOS with "Refusing a symlink in managed path: /var" / "Source file escapes registered root" while the same files pass on Linux CI — the fixtures build paths under `os.tmpdir()` (a symlink on macOS) and the managed-path / registered-root guards compare against realpaths. **Why:** every local and Mac-mini run of the suite now carries 19 red tests that are not defects, which hides real regressions (the v0.50.1.0 ship had to classify them by re-running on a clean master checkout). **Fix:** `realpathSync(os.tmpdir())` in those fixtures (the `upgrade-bun-link-arc` e2e has the same gap). **Effort:** S. **Priority:** P3.
+  **What:** `test/agent-install.test.ts`, `test/harness-install-ownership.test.ts`, `test/harness-onboarding.test.ts`, `test/init-mcp-only.test.ts`, `test/minions-submission-authority.test.ts`, `test/harness-access.test.ts` and `test/harness-delivery-recovery.serial.test.ts` fail on macOS with "Refusing a symlink in managed path: /var" / "Source file escapes registered root" while the same files pass on Linux CI — the fixtures build paths under `os.tmpdir()` (a symlink on macOS) and the managed-path / registered-root guards compare against realpaths. **Why:** every local and Mac-mini run of the suite now carries 19 red tests that are not defects, which hides real regressions (the v0.50.1.0 ship had to classify them by re-running on a clean master checkout). **Fix:** `realpathSync(os.tmpdir())` in those fixtures (the `upgrade-bun-link-arc` e2e has the same gap). **Effort:** S. **Priority:** P3.
 - [ ] **P2 — `delta`: fetch facts oldest-first with an overflow flag instead of a newest-first `limit: 50` window.**
   **What:** `src/core/context/turn-context.ts` fetches delta facts with `listFactsSince(..., { limit: 50 })` ordered `created_at DESC` and never sets `has_more` for facts, so more than 50 new facts since the cursor silently drop the OLDEST ones as the page cursor advances past them. **Why:** the v0.50.1.0 pre-landing review found it while simplifying the delta cursor; the fix is an ascending keyset fetch plus `has_more` when the window is full (an engine-options change, so it was left out of the wave). **Effort:** M. **Priority:** P2.
 - [ ] **P2 — `session_context_state` cursor upsert: GREATEST, not COALESCE.**
   **What:** `src/core/context/session-state.ts` upserts `last_wake_at = COALESCE(EXCLUDED.last_wake_at, …)` (last-writer-wins) while its own doc and `src/mcp/context-pack-handler.ts` assume a monotonic GREATEST, so a `context_pack` push after a `delta` wake can move the shared cursor forward past items the delta never delivered. **Why:** pre-existing, surfaced by the v0.50.1.0 review; fix the SQL to GREATEST and pin it. **Effort:** S. **Priority:** P2.
-- [ ] **P3 — `schema lint --with-db` has no test.**
-  **What:** the v0.50.1.0 wave re-plumbed `gbrain schema lint --with-db` inside `withConnectedEngine` (tier-4 `schema_pack` read + `process.exit(1)` on a missing pack) and nothing in `test/` drives it. **Why:** a regression there would ship green. **Effort:** S. **Priority:** P3.
+- [x] **P3 — `schema lint --with-db` has no test.** **Completed:** v0.60.15.0 (2026-09-30). `test/schema-cli-lint-with-db.test.ts` drives isolated CLI subprocesses for DB-plane pack resolution, flag ordering, missing packs, JSON output, invalid arguments, and plain-lint separation (12 cases).
+  **What (as filed):** the v0.50.1.0 wave re-plumbed `gbrain schema lint --with-db` inside `withConnectedEngine` (tier-4 `schema_pack` read + `process.exit(1)` on a missing pack) and nothing in `test/` drives it. **Why:** a regression there would ship green. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — recompute_emotional_weight: pin `pages_recomputed` semantics and the lock-steal path.**
   **What:** `pages_recomputed` now counts evaluated rows (`details.pages_updated` counts writes) and feeds `totals.pages_emotional_weight_recomputed`; the phase moved under `racedTimePhase` with no lock-steal test, and its Postgres SQL twin runs only in the nightly e2e lane. **Why:** the coverage audit flagged both as unpinned behavior changes. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — minion `put_page` type pin: round-trip fidelity test + delegated-lane wording.**
@@ -615,7 +1289,7 @@ deferred M-effort issues above are NOT repeated here.
   across the cut is lost to both. **Blocked on:** post-wave Cat 35 receipts
   showing transcripts actually chunk (`details.synthesis.jobs` >
   `transcripts_processed`) — don't pay the determinism-test churn
-  (test/e2e/dream-synthesize-chunking byte-stability) before the receipts say
+  (test/dream-synthesize-chunking.serial.test.ts byte-stability) before the receipts say
   it matters. **Where:** src/core/cycle/synthesize.ts splitTranscriptByBudget.
 - [ ] **P3 — E3: borderline-band second-pass triage call (#4152 escalation).**
   **What:** when the scalar score lands in [rescue_floor, threshold) and the
@@ -1801,8 +2475,13 @@ deferred M-effort issues above are NOT repeated here.
   write lock for the build. Fine for typical brains; a busy multi-tenant
   install would want `CONCURRENTLY` (which needs the migration runner to
   support non-transactional steps). **Effort:** M. **Priority:** P3.
-- [ ] **P3 — full 3-way schema-blob parity test.** **What:**
-  `pglite-schema.ts` / `schema-embedded.generated.ts` / `schema.sql` have no general
+- [x] **P3 — full 3-way schema-blob parity test.** **Completed: refactor wave 1 (W2).**
+  Schema text has one hand-edited copy (`src/schema.sql` + its TS fragments);
+  `bun run build:schema` generates the schema.sql fragment regions,
+  `schema-embedded.generated.ts` and the PGLite template `pglite-schema.generated.ts`,
+  `check:schema-fresh` regenerates the whole chain and names the source to edit on drift,
+  and the E4 catalog goldens pin the end state on both engines. Original entry:
+  `pglite-schema.ts` / `schema-embedded.generated.ts` / `schema.sql` had no general
   drift guard; v0.46.25.0 added a private-queue-scoped parity pin
   (test/private-queue-schema-parity.test.ts) — generalize it to the whole
   blob surface (normalized statement diff). **Effort:** M. **Priority:** P3.
@@ -1889,23 +2568,36 @@ deferred M-effort issues above are NOT repeated here.
   (test/scripts/coverage-gate-enforced.test.ts, to be authored in that PR), flips ONLY
   the two PR-lane sites in test.yml (`:481`,`:486`), and leaves e2e.yml's fullCorpus
   occurrence advisory — a separate decision. Criteria stay verbatim; do not loosen.
-- [ ] **P2 — Wave 4a: decompose performSyncInner (own plan).** **What:** the 1,923-line
+  **Decision (GBRA-47 D-8, 2026-10-04):** graduate on the nightly fullCorpus report, not
+  the PR lanes: publish `scripts/coverage-baseline.json`'s fullCorpus section from the first
+  green post-merge nightly (`update-coverage-baseline.ts --corpus fullCorpus --promote`),
+  make a degraded LCOV summary fail while enforcing, keep the PR coverage-report job
+  report-only, and close this entry after one proven coverage drop fails the nightly.
+- [x] **P2 — Wave 4a: decompose performSyncInner (own plan).** **What:** the 1,923-line
   procedure inside src/commands/sync.ts → sync-phase-{deletes,renames,imports} modules.
-  **Why:** the six pure clusters are peeled (sync.ts 5,991→4,121); the remaining bulk is one
-  function. **Blocked by:** re-pointing the two positional source-text guards
-  (test/sync.test.ts #132 prelude scan, test/redos-hardening.test.ts ordering) at the phase
-  modules — needs its own plan. **Effort:** L→M with CC. **Priority:** P2.
-- [ ] **P2 — Wave 4b: hoist buildChecks' ~220 inline checks.push literals into named
-  functions, then finish the doctor split (own plan).** **What:** doctor.ts is 4,177 lines,
-  ~3,240 of them buildChecks. Hoisting the inline literals into named check functions makes
-  them movable into the checks/ bundles. **Why:** completes the assessment's #1 named peel
-  target. **Effort:** L→M with CC. **Priority:** P2.
+  **Completed:** refactor wave 1, W4 sync. `performSyncInner` is a phase orchestrator over a
+  `SyncRun` state object in `src/commands/sync/` (preflight, deletes, renames, imports,
+  finalize; `runSyncInner` flag parsing in `sync/args.ts`; `performFullSync` decomposed);
+  `sync.ts` is the façade. The two positional guards were re-pointed at
+  `src/commands/sync/imports.ts`, plus a cross-file #132 guard with a mutation fixture. See the
+  `src/commands/sync/` entry in docs/architecture/key-files/commands-6.md.
+- [x] **P2 — Wave 4b: hoist buildChecks' ~220 inline checks.push literals into named
+  functions, then finish the doctor split (own plan).** **Completed: refactor wave 1 (W4
+  doctor).** Every `buildChecks` block now lives verbatim in a registry entry under
+  `src/commands/doctor/checks/` and runs through `DOCTOR_CHECK_REGISTRY` in
+  `src/commands/doctor/registry.ts`; `buildChecks` is the flag parse plus the runner call and
+  doctor.ts is 653 lines. Pinned by the W0 registry / early-stop / `--json` goldens,
+  `test/doctor-registry.test.ts` and `test/doctor-mode-matrix.serial.test.ts`.
 - [ ] **P2 — CLI subprocess coverage.** **What:** investigate an in-process CLI-invocation
   harness for a coverage lane (import cli.ts main instead of spawning) and track bun
   child-process coverage support upstream. **Why:** E2E-spawned `bun src/cli.ts` children are
   invisible to bun's coverage (the documented 15.2% cli.ts undercount);
   src/cli.ts sits in the gate exemption list until this closes. **Effort:** M. **Priority:** P2.
-- [ ] **P3 — Migrate-runner extraction (revisit only on evidence).** **What:** the ~668
+- [x] **P3 — Migrate-runner extraction (revisit only on evidence).** **Completed: refactor
+  wave 1 (W3).** Every migration moved to its own file in `src/core/schema-migrations/`
+  (static-import `registry.generated.ts`), so `src/core/migrate.ts` is only the runner
+  (599 lines, ratcheted like any file); the region policy is retired and the slice-window
+  assertions were re-pointed at the files that hold the code. Original entry: the ~668
   region-guarded runner lines in src/core/migrate.ts could move to migrate-runner.ts.
   **Why deferred:** 9 slice-window source-text assertions in test/migrate.test.ts pin
   locality; the region-exempt ratchet already forbids logic growth. Revisit if the region
@@ -2133,7 +2825,9 @@ checklist. The independent follow-ups below remain open.
 - [ ] **P3 — isolation test-gap follow-ups (pre-landing review).** **What:**
   (a) spawned-CLI negative tests for `jobs run-child` bootstrap guards (PGLite
   → exit 13; missing job-id/env → exit 13) and for `jobs work` with
-  isolation on + an unresolvable child CLI (fail-fast exit 1) — both need a
+  isolation on + an unresolvable child CLI (configuration exit 16; the
+  incompatible-child case is already covered by
+  `test/e2e/worker-readiness-cli.test.ts`) — both need a
   real engine bootstrap so they live in the e2e lane; (b) a behavioral (not
   structural) test driving `withRefreshingLock` with a hung injected
   `handle.refresh` (signal aborted at timeout, no overlapping ticks); (c) a
@@ -2219,6 +2913,8 @@ Each was explicitly deferred in the pass's CEO/eng/outside-voice reviews.
   the existing SHARD support (only ci-local uses it). Fold into the Postgres
   template-database entry below in this file (CREATE DATABASE … TEMPLATE, ~50ms).
   **Current status:** selected E2E is on the measured PR critical path. Four isolated weighted CI workers now address it without moving tests between lanes; PGLite-only lane moves remain deferred. **Effort:** M. **Priority:** P2.
+  **Next step tracked in the GBRA-47 section (C9 lane move).**
+  **Status (2026-09-29 test audit):** the audit counted 113 PGLite-only files in `test/e2e` (`docs/test-audit/2026-09-29/lane-e2e/pglite-files.txt`). The test-reduction pilot moved the 20 heaviest into the unit (10), serial (7) and slow (3) lanes (docs/test-audit/2026-09-29/implementation/lane-pilot.md). Matched `ci:ubicloud` runs: the E2E lane dropped from 304 files/2,756 s to 284 files/2,456 s of compute; the moved files cost 330 s in E2E and 340 s in their new lanes, and wall time stayed bounded by the slow-lane long poles (317 s vs 337 s). On GitHub the gain is the sequential selected-E2E workers losing ~506 s of weighted work while every PR now runs these files. Next: move the remaining ~93 PGLite-only files with the same criterion, and add an explicit unit-owned set to `scripts/select-e2e.ts` so sources whose only E2E owner moved stop failing closed to all E2E.
 - [ ] **Second PGLite snapshot keyed by dims/model.** Implemented for BrainBench default-profile CLI children in the CI optimization pass; extending reuse to other deliberately reconfigured tests remains deferred. **What:** ~34 test files
   configure retired-embedding/1280 and always cold-init (the snapshot's shape gate correctly
   refuses the 1536 fixture). Bake a second snapshot per shape; the version-file
@@ -2256,7 +2952,7 @@ Each was explicitly deferred in the pass's CEO/eng/outside-voice reviews.
   `redactConnectionInfo`/`redactPgUrl` before append; optionally add
   `.gbrain-evals/` to the fixture-privacy scan surface. **Effort:** S.
   **Priority:** P2.
-- [ ] **check-image-decoders-embedded.sh into verify CHECKS.** **What:** the guard
+- [x] **check-image-decoders-embedded.sh into verify CHECKS.** **Completed (GBRA-47 F2):** `check:image-decoders` runs in `scripts/run-verify-parallel.sh` and fails with the bun build error plus Why/Fix. **What (original):** the guard
   runs its own `bun build --compile` (~60s) — too heavy per-verify. Revisit if the
   binary-embed bug class recurs; guards-manifest.tsv carries the exemption note,
   and the registration⇒execution coverage test allowlists it explicitly.
@@ -2445,6 +3141,7 @@ review-deferred, not fix-now). Grouped by component.
   hasDatabase/DATABASE_URL gate + header read; lockstep: e2e-test-map rows,
   e2e-unmapped-baseline shrink, classify-tests, seeded weights), a possible
   four-way `coverage-full-e2e` nightly matrix, and unit matrix 10→12.
+  **Status (2026-09-29 test audit):** Phase 5 is superseded by the test-reduction plan's lane-move pilot (the 20 heaviest of 113 PGLite-only `test/e2e` files, same move criterion and lockstep updates, measured on matched runs); the pilot landed (see the PGLite-only lane entry above for the measurement and next step).
   The selected-E2E matrix, timing refresh, `weights:mine` command, and refresh
   cadence are completed by the CI speed pass above. Graduated batch gates:
   5×-green first batch per class, 2×+CI
@@ -2605,7 +3302,7 @@ explicitly scoped OUT with a one-line rationale — none is a bug, all are addit
 - [ ] **P3 — Extract a shared `seedBrain` test helper.** The keyless-PGLite +
   tmp-HOME + shimmed-PATH setup is duplicated between
   `test/autopilot-launchd-lifecycle.serial.test.ts` and
-  `test/agent-scheduler-contract.serial.test.ts` (review-army maintainability
+  `test/agent-scheduler-contract.test.ts` (review-army maintainability
   finding). A third harness-e2e file (the PR-B tier) should force the
   extraction into `test/helpers/`; don't extract before then — two instances
   is a coincidence, three is a pattern.
@@ -2631,12 +3328,12 @@ explicitly scoped OUT with a one-line rationale — none is a bug, all are addit
   (INSTALL_FOR_AGENTS.md Step 7) runs `gbrain dream` unconditionally, and the cycle's
   embed phase hits the same `EmbeddingDisabledError` class that broke the documented
   sync-and-embed chain on keyless brains (fixed in `runEmbed` for the `--stale`
-  spelling; `test/agent-scheduler-contract.serial.test.ts` pins it). Nobody has verified that a
+  spelling; `test/agent-scheduler-contract.test.ts` pins it). Nobody has verified that a
   full keyless dream exits 0 — if any phase surfaces the disabled-embeddings error as a
   phase failure, the documented nightly cron is broken identically for every
   `init --no-embedding` install. **Where to start:** `src/core/cycle.ts` embed phase +
   `src/commands/dream.ts` exit-code handling; test shape mirrors
-  `test/agent-scheduler-contract.serial.test.ts` (keyless PGLite brain, real CLI spawn, exit-code
+  `test/agent-scheduler-contract.test.ts` (keyless PGLite brain, real CLI spawn, exit-code
   assertion). Surfaced by the harness-e2e outside-voice review.
 
 ## BrainBench follow-ups (filed v0.44.0.0, Cathedral 2)
@@ -2900,16 +3597,14 @@ which inverts the intent of the metric.
 Deferred from the #2529/#2477 security-fix wave (plan-eng-review + codex outside
 voice CLEARED). None block the wave.
 
-- [ ] **P2 — Per-OAuth-client `takes_holders` storage (#2529 follow-up).** Legacy
-  bearer tokens honor `access_tokens.permissions.takes_holders` through
-  `verifyAccessToken`; OAuth clients have no equivalent column on `oauth_clients`,
-  so OAuth-minted tokens fail closed to `['world']`. Needs a schema migration
-  (`oauth_clients.takes_holders` JSONB or TEXT[]) + a `register-client` flag +
-  the `verifyAccessToken` JOIN projection. Include surfacing the EFFECTIVE
-  takes-holder scope in `whoami` output as part of this follow-up, so operators
-  can self-diagnose the legacy-vs-OAuth semantic split instead of reading docs.
-  Where: `src/schema.sql`, `src/core/migrate.ts`, `src/core/oauth-provider.ts`,
-  `src/commands/auth.ts`, `src/core/operations.ts` (whoami).
+- [x] **P2 — Per-OAuth-client `takes_holders` storage (#2529 follow-up).**
+  **Completed: Foundations 2** — `oauth_clients.takes_holders` (migration v203),
+  set with `gbrain auth rescope --client <id> --takes-holders a,b|none`, read by
+  `verifyAccessToken` and the publication holder reauthorization.
+- [ ] **P3 — `register-client --takes-holders` and effective holders in `whoami`.**
+  **What:** a client's holders are set after registration with
+  `auth rescope --client`; registration takes no holder flag, and `whoami` does
+  not print the effective takes-holder scope. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — agent-voice Host-header allowlist (DNS-rebinding hardening).** The
   #2477 fix ships default-deny CORS + an Origin gate on `/session`/`/tool`, but
   the gate derives self-origin from the `Host` header, so a DNS-rebound page
@@ -3083,12 +3778,12 @@ Deferred from the Life Chronicle wave (CEO Scope-Expansion + eng review CLEARED,
 3 codex rounds absorbed, PR #2533). Every item was an explicit review decision,
 not an oversight; each names its decision provenance.
 
-- [ ] **P1 — Eval-gated auto-emit default-flip (D5.5 fast-follow).** Auto-emission
-  ships OFF (`auto_chronicle=false`) per spend/consent posture. The headline
-  fast-follow: run `gbrain eval chronicle` + a live-LLM OFF-vs-ON agent arm on a
-  real brain, and if the lift holds, flip the default ON in the next minor with
-  an upgrade notice. Where: `src/core/chronicle/config.ts`, upgrade banner in
-  `src/commands/upgrade.ts`.
+- [ ] **P1 — Measure the auto-emit default (D5.5 fast-follow).** The #5876 wave
+  flipped `auto_chronicle` ON by default under the default-on rule for new
+  features, with an upgrade notice, a durable doctor/advisor notice and the
+  opt-out `gbrain config set auto_chronicle false`. It shipped without a measured
+  quality lift. Remaining: the live-LLM OFF-vs-ON agent arm below; if it shows no
+  lift, revisit the default. Where: `src/eval/chronicle/harness.ts`.
 - [ ] **P2 — Live-LLM OFF-vs-ON eval arm + LongMemEval temporal slice.** The
   shipped `gbrain eval chronicle` is the deterministic CI bar (6 gold tasks).
   The full North-Star proof adds (a) a live agent reconstructing a day with the
@@ -4023,9 +4718,10 @@ infra and reaches into third-party packs that live outside the host skills dir.
 > `list_brain_skillpack` op (NOT folded into `list_skills` — the host catalog is
 > host-global and ignores `ctx.sourceId`, so per-source packs needed their own
 > tenancy-correct surface). `get_skill` gained an optional `source_id` for
-> per-source fetch disambiguation. The `tools:` version-skew lint below is now
-> implemented (`src/core/skillpack/brain-pack-lint.ts`, run by
-> `gbrain skillpack init-brain-pack`). STILL DEFERRED to this PR2: thin-client
+> per-source fetch disambiguation. The `tools:` version-skew lint below was
+> written (`src/core/skillpack/brain-pack-lint.ts`) but never wired into
+> `gbrain skillpack init-brain-pack`, and was deleted in the test-reduction fix
+> wave. STILL DEFERRED to this PR2: thin-client
 > BINARY install (`build_skillpack` download) — a thin client today gets the
 > pack's git scaffold spec and `resolveSource`s it on its own machine. The
 > `include_skillpacks` host-global merge below is intentionally still open
@@ -4323,9 +5019,9 @@ single canonical `src/core/model-pricing.ts` with `canonicalLookup`.
 
 - [x] **`canonicalLookup` is case-sensitive (silent-miss undercount).** **Completed:** #4123 fix wave (2026-08-16). `canonicalLookup` now falls back to a case-insensitive lookup folding BOTH sides (a lazily-built lowercased view of `CANONICAL_PRICING` — some canonical keys carry cased model tails verbatim, so folding only the probe would have created the mirror-image miss). Exact matches stay first; mixed-case tests + a no-case-collision guard pinned in `test/model-pricing.test.ts`.
 
-- [ ] **takes-quality `getPricing` is exact-key only.** `src/core/takes-quality-eval/pricing.ts:getPricing` does a raw `MODEL_PRICING[modelId]` lookup. A user passing a bare/slash/dotted form of an allowlisted model (e.g. `google:gemini-2.0-flash` when the allowlist holds `google:gemini-2-flash`, or `anthropic/claude-opus-4-8`) hits `PricingNotFoundError` even though canonical prices it. Safe direction (fail-closed) but a usability regression. Fix: normalize the lookup key through `canonicalLookup`/`splitProviderModelId` before the allowlist check, keeping fail-closed for genuinely-unsupported models. Priority: P3.
+- [x] **takes-quality `getPricing` is exact-key only.** **Completed (GBRA-47 E10):** the allowlist is gone; `getPricing` resolves registered overrides, then `canonicalLookup`, so every canonically priced form is gateable (`test/eval-takes-quality-pricing.test.ts`). `src/core/takes-quality-eval/pricing.ts:getPricing` does a raw `MODEL_PRICING[modelId]` lookup. A user passing a bare/slash/dotted form of an allowlisted model (e.g. `google:gemini-2.0-flash` when the allowlist holds `google:gemini-2-flash`, or `anthropic/claude-opus-4-8`) hits `PricingNotFoundError` even though canonical prices it. Safe direction (fail-closed) but a usability regression. Fix: normalize the lookup key through `canonicalLookup`/`splitProviderModelId` before the allowlist check, keeping fail-closed for genuinely-unsupported models. Priority: P3.
 
-- [ ] **No negative-path test for the takes-quality module-load throw.** `src/core/takes-quality-eval/pricing.ts` throws at import if a `SUPPORTED_MODELS` id is absent from canonical (good fail-fast), but nothing tests it (awkward to test a module-load-time throw in-process). Add a small harness/fixture test. Priority: P3 (programmer-error guard).
+- [x] **No negative-path test for the takes-quality module-load throw.** **Obsolete (GBRA-47 E10):** the module no longer throws at load; unpriced models warn and run, and refuse under a user cap. `src/core/takes-quality-eval/pricing.ts` throws at import if a `SUPPORTED_MODELS` id is absent from canonical (good fail-fast), but nothing tests it (awkward to test a module-load-time throw in-process). Add a small harness/fixture test. Priority: P3 (programmer-error guard).
 
 - [ ] **Recipe display-layer pricing is stale and unconsolidated.** Each `src/core/ai/recipes/*.ts` carries coarse per-provider `cost_per_1m_input_usd`/`cost_per_1m_output_usd` baselines (e.g. `google.ts` chat = `$0.30/$1.20`, `price_last_verified: 2026-04-20`) read only by `gbrain providers` for display — NOT by any budget gate. They've drifted (google chat baseline predates the Gemini 2.0 Flash `$0.10/$0.40` reconciliation; codex flagged OpenAI baselines too). These are intentionally a separate coarse layer from the per-model `model-pricing.ts` budget tables, so consolidating is non-trivial (one-number-per-provider vs per-model). Options: (a) refresh the `price_last_verified` baselines, or (b) have `gbrain providers` show per-model rates from canonical where available and fall back to the recipe baseline. Flagged by the v0.42.25.0 ship Codex adversarial pass. Priority: P3 (display-only, no budget-gating impact).
 
@@ -4367,7 +5063,12 @@ single canonical `src/core/model-pricing.ts` with `canonicalLookup`.
   documented as additive) and add `atoms_inserted` +
   `concepts_inserted` next to `facts_consolidated`.
 
-- **TODO-V19-C (P3)**: Check-registry refactor for `gbrain doctor`. The
+- **TODO-V19-C (P3)** — **Completed: refactor wave 1 (W4 doctor).** The check registry
+  landed as `DOCTOR_CHECK_REGISTRY` (`src/commands/doctor/registry.ts`): ordered
+  `{ name, emits, run(ctx) }` entries with an explicit `DoctorContext`; categories stay in
+  `src/core/doctor-categories.ts` (no per-entry category field), enforced by
+  `test/doctor-registry.test.ts`. `--scope` gates stay inside the entries; a future scope
+  dimension can filter entries instead of adding inline gates. Original entry: Check-registry refactor for `gbrain doctor`. The
   v0.41.19.0 `--scope=brain` uses explicit early-skip gates inline at
   each call site (~40 LOC across resolver + skill_conformance +
   skill_brain_first + whoknows). If we want to add more scope
@@ -4425,6 +5126,13 @@ single canonical `src/core/model-pricing.ts` with `canonicalLookup`.
   The tier flip still requires a GRADUATED live run committed with its
   predictions JSONL per evals/takes-bootstrap/README.md — needs a chat key,
   ~123 Haiku-class calls.
+  **Status (GBRA-47 D-6, 2026-10-04): first live run NOT graduated.** Haiku 4.5,
+  123 variants, $0.09: 75/123 pass; precision fact 0.714, take 0.894, bet 0.545,
+  hunch 0.750 (recall 0.667); 3 forbid violations attributed press claims to the
+  page holder. The tier stays `manual_only`. Next: complete the archetype labels
+  (valid unlabeled claims count as imprecise), then fix bio-fact recall and
+  press-claim attribution, then rerun. Record:
+  docs/test-audit/2026-10-04/implementation/lane-c.md.
 
 - **TODO-F (P3)**: Web UI surface for `gbrain onboard` recommendations in the
   admin SPA. Linear-style dashboard with one-click apply.
@@ -4873,7 +5581,7 @@ note. Filing it as a TODO would imply it's ready to pull; it isn't.
   CEO D16. Closes the unbounded-growth concern that codex flagged as
   load-bearing pass-3 #5.
 
-- [ ] **v0.41.1: full E5 A/B dispatcher (currently scaffolded as dry-run only).**
+- [x] **v0.41.1: full E5 A/B dispatcher (currently scaffolded as dry-run only).** **Closed in the test-reduction fix wave:** the lease-cap controller never had a runtime caller; it, its tests, `scripts/e5-lease-cap-ab.ts` and the dry-run receipt fixture were deleted.
   `scripts/e5-lease-cap-ab.ts` ships the spec + harness + receipt fixture
   shape but the real-run dispatcher (queue submit + worker spin-up + 15-min
   429 injector + tick loop + cost-tracking) is deferred. v0.41.1 follow-up
@@ -4892,7 +5600,7 @@ note. Filing it as a TODO would imply it's ready to pull; it isn't.
   case, already shipped); one accepts an existing tx (rate-leases +
   maxWaiting use cases). Filed via Eng D9.
 
-- [ ] **v0.42: semantic-aware `prompt_too_long` reduction in E6 self-fix.**
+- [x] **v0.42: semantic-aware `prompt_too_long` reduction in E6 self-fix.** **Closed in the test-reduction fix wave:** `src/core/minions/self-fix.ts` never had a runtime caller and was deleted.
   v0.41 ships truncate-with-leaf-preservation (first 1000 + last 2000 chars).
   Codex pass-1 #11 specified the right strategy: walk the conversation, drop
   tool_result blocks first (largest non-task content), summarize older
@@ -5389,7 +6097,9 @@ at plan time and got carved out:
   with the right shape so these drop in cleanly.
 
 - [ ] **v0.40.7+: T16 — hermetic schema-authoring eval gate.**
-  Extend `src/commands/eval-schema-authoring.ts` into a PGLite harness
+  Rebuild `gbrain eval schema-authoring` as a PGLite harness (the unwired
+  v0.39 scaffold and its `aggregateVerdict` were deleted in the test-reduction fix wave;
+  recover them from git history)
   driving detect → suggest → add-type → sync end-to-end on 3 fixtures.
   Filing-accuracy delta metric (not top-3 hit rate per codex C18). DI
   seam via `suggestFn`. 3 hours CC + placeholder-name fixtures.
@@ -5560,7 +6270,7 @@ contributor traps.
 - [ ] **NEW-1 (P2) — Per-check leaf unit tests for the 20+ exported doctor check functions.** `src/commands/doctor.ts:169-1492` exports whoknowsHealthCheck, takesWeightGridCheck, childTableOrphansCheck, checkRerankerHealth, checkBrainstormHealth, checkSearchMode, checkEvalDrift, checkSyncFreshness, checkAbandonedThreads, checkCalibrationFreshness, checkGradeConfidenceDrift, checkVoiceGateHealth, checkEmbeddingWidthConsistency, checkSourceRoutingHealth, checkOauthConfidentialHealth, checkAutopilotLockScope, skillBrainFirstCheck. v0.40.8.0 covers them via the orchestrator only. Parameterize a single `test/doctor-leaves.test.ts` over the exported functions; each case seeds the minimum DB state and asserts the returned `Check.status`. Catches per-check render bugs the orchestrator snapshot can't see (codex CMT-2 deep fix). Estimated ~4h CC.
 - [ ] **NEW-2 (P2) — Cycle-phase wrappers beyond lint + backlinks.** 7 more phases need result-mapping coverage: sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight. Each adds a describe block to `test/cycle-legacy-phases.test.ts` following the established pattern. ~30min/phase with CC. Mechanical follow-through.
 - [ ] **NEW-3 (P2) — HTTP-level trust-boundary test that proves serve-http.ts honors the filter at runtime.** v0.40.8.0 ships the source-grep guard at `scripts/check-operations-filter-bypass.sh` plus structural assertions in `test/operations-trust-boundary.test.ts`. The codex CMT-3 strongest defense — runtime proof that a register-OAuth-client → attempt-call-every-localOnly-op flow rejects every one — would extend `test/e2e/serve-http-oauth.test.ts`. Real Postgres dep, ~30s wallclock per case. Closes the bypass class with runtime proof in addition to the existing structural defense.
-- [ ] **NEW-4 (P3) — Render function extraction from runDoctor.** v0.40.8.0 uses a subprocess smoke at `test/doctor-cli-smoke.serial.test.ts` to cover the wrapper's render + exit paths. Pulling the human + JSON render code out into pure formatters would let that smoke move back into the parallel fast loop with no subprocess overhead. ~2h CC. Lower priority — the subprocess smoke does its job; this is a wallclock win, not a coverage win.
+- [ ] **NEW-4 (P3) — Render function extraction from runDoctor.** v0.40.8.0 uses a subprocess smoke at `test/doctor-cli-smoke.test.ts` to cover the wrapper's render + exit paths. Pulling the human + JSON render code out into pure formatters would let that smoke move back into the parallel fast loop with no subprocess overhead. ~2h CC. Lower priority — the subprocess smoke does its job; this is a wallclock win, not a coverage win.
 
 ## v0.41+ master flake follow-ups (filed during v0.40.8.0 ship)
 
@@ -5581,7 +6291,7 @@ contributor traps.
 
 ## Pre-existing flake on master (noticed during v0.40.4 ship)
 
-- [x] **`test/search/embedding-column.test.ts:466,489,522` — `isCacheSafe` returns false when run after gateway-state-mutating siblings in shard 2.** DONE: closed by option (c) — the file was renamed to `test/search/embedding-column.serial.test.ts` in `ca68633f` (v0.41.2.0), giving it its own bun process; entry left open pointed at a filename that no longer exists. If the file is ever un-quarantined, add `beforeEach(() => resetGateway())` (NOT `__unconfigureGatewayForTests` — that falls through to the retired provider/1280 defaults; `resetGateway` re-applies the preload's OpenAI/1536 baseline). Original filing: Confirmed pre-existing on master (`git stash` + `SHARD=2/8 bash scripts/run-unit-shard.sh` reproduces 3 fails on a clean working tree). Symptom: `isCacheSafe(default-named-column, empty-cfg)` expects `gwDims=1536` but reads `1280` (the post-v0.37.11.0 retired hosted provider default). Some test in the shard before embedding-column.test.ts initializes the gateway with the PGLite-default retired hosted provider/1280 config and leaves it that way. Either: (a) embedding-column.test.ts grows a `beforeEach` that calls `__setEmbedTransportForTests`-style reset, (b) the offending sibling adds an `afterAll(reset)`, or (c) embedding-column.test.ts becomes `*.serial.test.ts` to quarantine. Three test files in shard 2 touch gateway state via PGLite engine connects: `restart-sweep.test.ts`, `init-mode-picker.test.ts`, `doctor.test.ts`. Tests pass in isolation (50/50); only fail under shard-2 ordering. v0.40.4 ships through this flake — not introduced by the wave.
+- [x] **`test/search/embedding-column.test.ts:466,489,522` — `isCacheSafe` returns false when run after gateway-state-mutating siblings in shard 2.** DONE: closed by option (c) — the file was renamed to `test/search/embedding-column.test.ts` in `ca68633f` (v0.41.2.0), giving it its own bun process; entry left open pointed at a filename that no longer exists. If the file is ever un-quarantined, add `beforeEach(() => resetGateway())` (NOT `__unconfigureGatewayForTests` — that falls through to the retired provider/1280 defaults; `resetGateway` re-applies the preload's OpenAI/1536 baseline). Original filing: Confirmed pre-existing on master (`git stash` + `SHARD=2/8 bash scripts/run-unit-shard.sh` reproduces 3 fails on a clean working tree). Symptom: `isCacheSafe(default-named-column, empty-cfg)` expects `gwDims=1536` but reads `1280` (the post-v0.37.11.0 retired hosted provider default). Some test in the shard before embedding-column.test.ts initializes the gateway with the PGLite-default retired hosted provider/1280 config and leaves it that way. Either: (a) embedding-column.test.ts grows a `beforeEach` that calls `__setEmbedTransportForTests`-style reset, (b) the offending sibling adds an `afterAll(reset)`, or (c) embedding-column.test.ts becomes `*.serial.test.ts` to quarantine. Three test files in shard 2 touch gateway state via PGLite engine connects: `restart-sweep.test.ts`, `init-mode-picker.test.ts`, `doctor.test.ts`. Tests pass in isolation (50/50); only fail under shard-2 ordering. v0.40.4 ships through this flake — not introduced by the wave.
 
 ## v0.40.4 graph signals — deferred follow-ups (v0.41+)
 
@@ -5615,7 +6325,7 @@ contributor traps.
 
 - [ ] **T18 follow-through — DELETE `skills/_brain-filing-rules.{md,json}`.** v0.39.0.0 shipped step (a) of the 4-step deprecation sequence: `gbrain schema show --as-filing-rules` emits the JSON shape the legacy file held. v0.39.1 ships steps (b) + (c) + (d): migrate `filing-audit.ts:79`, `synthesize.ts:619`, `patterns.ts:305`, `check-resolvable.ts:196+:226` to consume `gbrain schema show --as-filing-rules` output; update 5 test files (filing-audit.test.ts, check-resolvable.test.ts, dry-fix.test.ts, resolver.test.ts, cycle-patterns.test.ts); then DELETE the two files. Codex finding #3 from /plan-eng-review made this load-bearing — premature deletion makes protected synthesize/patterns phases fail with NO_ALLOWLIST. Sequencing matters.
 - [ ] **T19 follow-through — per-source pack federation across mounts.** v0.39.0.0 ships the correct REJECTION posture (`SchemaPackTrustGateError` when sources resolve to divergent packs). v0.40 ships the true per-source closure via `buildPerSourceBindings` + `buildSourceClosureCte` (engine already provides; the read-path callers need to thread the per-source pack identity through the SQL generation step). Reference: codex finding #2 from /plan-eng-review.
-- [ ] **T16 follow-through — hermetic eval-schema-authoring CLI harness.** v0.39.0.0 ships the aggregator (`aggregateVerdict`) + scaffold; v0.39.1 wires the in-process PGLite engine + fixture brain replay (3 fixtures: 1 hand-curated `notion-refugee` + 2 synthetic via faker per D6(eng)). Pattern: mirror `src/eval/longmemeval/harness.ts`.
+- [ ] **T16 follow-through — hermetic eval-schema-authoring CLI harness.** v0.39.0.0 shipped the aggregator (`aggregateVerdict`) + scaffold, deleted unwired in the test-reduction fix wave (recover from git history); v0.39.1 wires the in-process PGLite engine + fixture brain replay (3 fixtures: 1 hand-curated `notion-refugee` + 2 synthetic via faker per D6(eng)). Pattern: mirror `src/eval/longmemeval/harness.ts`.
 - [ ] **T1.5 follow-through — wire `whoknows` / `find_experts` / `enrichment-service` / `facts/eligibility` to consume pack-aware type sets.** v0.39.0.0 added the seam (`activePack` parameter threaded through parseMarkdown/import/sync). The runtime sites that compute their type filter still use the v0.38 hardcoded constants. v0.39.1 migrates each call site to read from `loadActivePackForOp(ctx)` + use `expertTypesFromPack` / `extractableTypesFromPack` (helpers already exist in `src/core/schema-pack/`). Per the T19 closure fix, this is now safe to wire (federated_read with divergent packs throws permission_denied at the load step).
 - [ ] **D14 thesis retro — authoring vs derivation framing.** v0.39.0.0 ships the cathedral with 6 verbs marked experimental-tier + T15 schema-events audit + T23 `gbrain schema usage` for measurement. v0.40+ retro reads 60-90 days of usage telemetry and decides which experimental verbs to deprecate per codex's derivation-thesis structural argument. Pass condition: each verb gets >=5% of the cathedral's invocations. Below 5% = deprecation candidate.
 
@@ -5640,9 +6350,9 @@ contributor traps.
 
 - [ ] **Async-batched audit writes.** Sync `appendFileSync` is fine at typical volumes (~5ms × 100 crosses = ~500ms — not noticeable inside a $1 brainstorm run). Profiling trigger criterion: when 100+ crosses on a large brain shows audit-write time dominating wall-clock cost, switch to an async write queue. Fixing prematurely costs complexity for no measurable benefit.
 
-- [ ] **`BudgetLedger` unification with `BudgetTracker`.** `src/core/enrichment/budget.ts` defines a separate `BudgetLedger` primitive for per-day, per-scope/resolverId enrichment caps. Different shape from `BudgetTracker` (daily reset windows + multi-tier scope keys). Unification is possible but requires careful schema design to preserve enrichment's existing report semantics. Deferred because: (a) BudgetTracker covers the per-command case cleanly today, (b) the existing BudgetLedger isn't a customer-facing surface — it backs `gbrain enrich`'s internal accounting, (c) merging them would require a schema migration on the enrichment budget audit JSONL. Revisit when the enrichment surface gets its next major touch.
+- [x] **`BudgetLedger` unification with `BudgetTracker`.** **Closed in the test-reduction fix wave:** `BudgetLedger` never had a runtime caller (the claim below that it backs `gbrain enrich` was wrong; `gbrain enrich` uses `BudgetTracker`), so it was deleted. The `budget_ledger` migration stays. `src/core/enrichment/budget.ts` defines a separate `BudgetLedger` primitive for per-day, per-scope/resolverId enrichment caps. Different shape from `BudgetTracker` (daily reset windows + multi-tier scope keys). Unification is possible but requires careful schema design to preserve enrichment's existing report semantics. Deferred because: (a) BudgetTracker covers the per-command case cleanly today, (b) the existing BudgetLedger isn't a customer-facing surface — it backs `gbrain enrich`'s internal accounting, (c) merging them would require a schema migration on the enrichment budget audit JSONL. Revisit when the enrichment surface gets its next major touch.
 
-- [ ] **judges.ts internal chunking → payload-fitter delegation.** v0.37.x ships `src/core/diarize/payload-fitter.ts` with the batch strategy ready to consume from `src/core/brainstorm/judges.ts`'s `runJudge` chunking path. Today judges.ts keeps its own copy of the chunking loop (~30 lines) — straightforward refactor: replace the inline split with `fit({strategy:'batch', items: ideas, maxTokensPerCall, estimateTokens})` and concatenate results. The cost-guardrails test suite already pins the public contract; the refactor is mechanical. Touch one function; trivial.
+- [x] **judges.ts internal chunking → payload-fitter delegation.** **Closed in the test-reduction fix wave:** payload-fitter never had a runtime caller and was deleted; `judges.ts` keeps its own chunking loop. v0.37.x ships `src/core/diarize/payload-fitter.ts` with the batch strategy ready to consume from `src/core/brainstorm/judges.ts`'s `runJudge` chunking path. Today judges.ts keeps its own copy of the chunking loop (~30 lines) — straightforward refactor: replace the inline split with `fit({strategy:'batch', items: ideas, maxTokensPerCall, estimateTokens})` and concatenate results. The cost-guardrails test suite already pins the public contract; the refactor is mechanical. Touch one function; trivial.
 
 ## v0.37 PGLite fresh-install fix wave — deferred follow-ups (v0.37.x+ / v0.38.x)
 
@@ -5749,7 +6459,7 @@ contributor traps.
 
 ## dreamy-thompson wave follow-ups (v0.36.x)
 
-- [ ] **v0.36.x: runThink full rewrite — drop ThinkLLMClient indirection.** v0.36's fix(think) wave landed a gateway-backed adapter at `src/core/think/index.ts:225-251` so `gbrain config set anthropic_api_key` works over MCP stdio (closed #952). The adapter routes through `gateway.chat()` but `runThink` still carries the `ThinkLLMClient` interface as the test seam — it's the last LLM-using path that doesn't use the canonical `__setChatTransportForTests` seam v0.31.12 established for chat/embed. Cleanup: drop `ThinkLLMClient`, drop the `opts.client` injection point, migrate the 12+ existing tests (`test/think-pipeline.serial.test.ts:144,181,222`, `test/think-gateway-adapter.test.ts`, plus 9+ others that stub the interface) to `__setChatTransportForTests`. Pros: codebase consistency, one fewer test-stub pattern, easier to add provider switching for think once it routes through gateway natively. Cons: 12+ test files need migration. Blocked by: v0.36 wave landing on master (so the adapter exists to lean on while migrating tests). Plan reference: D5 + D7 in `~/.claude/plans/ok-i-spun-up-dreamy-thompson.md`.
+- [ ] **v0.36.x: runThink full rewrite — drop ThinkLLMClient indirection.** v0.36's fix(think) wave landed a gateway-backed adapter at `src/core/think/index.ts:225-251` so `gbrain config set anthropic_api_key` works over MCP stdio (closed #952). The adapter routes through `gateway.chat()` but `runThink` still carries the `ThinkLLMClient` interface as the test seam — it's the last LLM-using path that doesn't use the canonical `__setChatTransportForTests` seam v0.31.12 established for chat/embed. Cleanup: drop `ThinkLLMClient`, drop the `opts.client` injection point, migrate the 12+ existing tests (`test/think-pipeline.test.ts:144,181,222`, `test/think-gateway-adapter.test.ts`, plus 9+ others that stub the interface) to `__setChatTransportForTests`. Pros: codebase consistency, one fewer test-stub pattern, easier to add provider switching for think once it routes through gateway natively. Cons: 12+ test files need migration. Blocked by: v0.36 wave landing on master (so the adapter exists to lean on while migrating tests). Plan reference: D5 + D7 in `~/.claude/plans/ok-i-spun-up-dreamy-thompson.md`.
 
 - [ ] **v0.36.x: Supabase parity test fixture for `applyForwardReferenceBootstrap`.** v0.36 fixed the underlying bug (bootstrap now uses the DDL connection from `initSchema` so probes run inside the advisory-lock scope) per codex P1 from /ship adversarial review. What remains is the TEST FIXTURE that proves it: the new pre-v18/pre-v34/pre-v60 E2E tests run against local Docker Postgres but not against Supabase-shape pooler topology (transaction pooler + statement_timeout). Real Supabase upgrades have failed multiple times on this exact connection-topology divergence (#699, #820 lineage). Fix: a test fixture that exercises the probe path against deriveDirectUrl + transaction pooler + statement_timeout. Cons: requires Supabase fixture infra OR careful mocking of the connection-selection logic in `db.ts`'s `getDDLConnection` path.
 
@@ -6456,7 +7166,7 @@ The repo already has the right helper: `test/helpers/reset-pglite.ts` exports `r
 
 Two flakes already known and quarantined as `*.serial.test.ts` (run after parallel pass at `--max-concurrency=1`):
 - `test/brain-registry.serial.test.ts` (was `brain-registry.test.ts`)
-- `test/reconcile-links.serial.test.ts` (was `reconcile-links.test.ts`)
+- `test/reconcile-links.test.ts` (was `reconcile-links.test.ts`)
 
 After the sweep, both should be fixable and renameable back to plain `*.test.ts`.
 
@@ -6520,7 +7230,7 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 - `test/e2e/cycle.test.ts` (live cycle + chunks + lock cleanup).
 - `test/e2e/doctor.test.ts` (gbrain doctor exits 0 on healthy DB) — possibly related to v0.26.2 schema changes since CHANGELOG mentions extension of doctor checks.
 - `test/brain-registry.test.ts` (empty/null/undefined id routes to host) — unrelated to OAuth surface.
-- `test/e2e/claw-test.test.ts` (fresh-install scripted scenario) — needs investigation; took 3.9s and reported "produces zero error/blocker friction" failure.
+- `test/claw-test.slow.test.ts` (fresh-install scripted scenario) — needs investigation; took 3.9s and reported "produces zero error/blocker friction" failure.
 
 **Why:** These failures pre-date v0.26.2 (CHANGELOG already documents "18 pre-existing master timeouts" from v0.26.0 merge). v0.26.2 brings the count to 22, suggesting a 4-test drift on master between v0.26.0 ship and now. Fixing inside v0.26.2 would balloon scope from a 6-file OAuth fix-wave to a 30+ file test-infra repair. The fix-wave deserves its own PR with focused triage.
 
@@ -6776,7 +7486,9 @@ purpose; needs baseline-governance care per the BrainBench gate rules.
 ### Non-tier-1 e2e files run in no required CI lane
 **Priority:** P2
 
-**What:** Unit shards exclude `test/e2e/*` (`scripts/test-shard.sh`), and `.github/workflows/e2e.yml` runs only explicitly named files (a handful across its jobs — e.g. `test/e2e/mechanical.test.ts`, `test/e2e/mcp.test.ts`, the jsonb-parity pair); there is no glob. Every other `test/e2e/*.test.ts` — including PGLite-only files that need no `DATABASE_URL`, like `init-fresh-pglite.test.ts` — executes only when someone runs `bun run test:e2e` by hand. Decide per file: wire into a required workflow, re-home PGLite-only files to the serial lane (the pattern `test/init-picker-pty.serial.test.ts` uses), or explicitly document them as manual-only.
+**What:** Unit shards exclude `test/e2e/*` (`scripts/test-shard.sh`), and `.github/workflows/e2e.yml` runs only explicitly named files (a handful across its jobs — e.g. `test/e2e/mechanical.test.ts`, `test/e2e/mcp.test.ts`, the jsonb-parity pair); there is no glob. Every other `test/e2e/*.test.ts` — including PGLite-only files that need no `DATABASE_URL`, like `init-fresh-pglite.test.ts` — executes only when someone runs `bun run test:e2e` by hand. Decide per file: wire into a required workflow, re-home PGLite-only files to the serial lane (the pattern `test/init-picker-pty.test.ts` uses), or explicitly document them as manual-only.
+
+**Status (2026-09-29 test audit):** partly stale. Every `test/e2e` file now runs in the nightly `coverage-full-e2e` glob, and PRs run the diff-selected set (`scripts/select-e2e.ts`, falling back to all files on unmapped changes). What remains is re-homing PGLite-only files so they run on every PR regardless of the diff; that is the test-reduction plan's lane-move pilot (see the PGLite-only lane entry above).
 
 **Why:** Tests that never run in required CI are silent coverage loss — they rot without failing. Surfaced by the TTY-harness cleanup review when the new PTY picker test almost landed in the same dead lane.
 
@@ -6787,7 +7499,7 @@ purpose; needs baseline-governance care per the BrainBench gate rules.
 ### Ctrl-D during `gbrain init` stalls 60s at the next prompt (readLineSafe does not latch EOF)
 **Priority:** P2
 
-**What:** Pressing Ctrl-D at the interactive provider picker is detected immediately (keyless fallback in ~200ms), but Bun's stdin never yields another line after EOF while `isTTY` stays true — so the SUBSEQUENT search-mode picker sits its full 60s `readLineSafe` fallback before init completes (probed under a real PTY: keyless notice at 0.2s, mode prompt rendered at 1.2s, exit at 61.1s). Fix: `readLineSafe` (src/commands/init.ts) should latch EOF — once stdin has ended, later calls return their default immediately instead of waiting out the timer. Regression test: extend the EOF case in `test/init-picker-pty.serial.test.ts` to run init to completion and assert exit well under the fallback window (the case currently closes early on purpose to keep the 60s stall out of required CI — see the comment there).
+**What:** Pressing Ctrl-D at the interactive provider picker is detected immediately (keyless fallback in ~200ms), but Bun's stdin never yields another line after EOF while `isTTY` stays true — so the SUBSEQUENT search-mode picker sits its full 60s `readLineSafe` fallback before init completes (probed under a real PTY: keyless notice at 0.2s, mode prompt rendered at 1.2s, exit at 61.1s). Fix: `readLineSafe` (src/commands/init.ts) should latch EOF — once stdin has ended, later calls return their default immediately instead of waiting out the timer. Regression test: extend the EOF case in `test/init-picker-pty.test.ts` to run init to completion and assert exit well under the fallback window (the case currently closes early on purpose to keep the 60s stall out of required CI — see the comment there).
 
 **Why:** A user who hits Ctrl-D at the first prompt stares at a frozen screen for a full minute before init finishes. Cross-model adversarial review finding (Codex), confirmed by a real-PTY probe.
 
@@ -7446,7 +8158,7 @@ iteration's residuals.
 3. `eval_capture_failures.reason` enum: `'scrubber_exception'` is dead telemetry — no realistic path emits it (the scrubber is regex-only and never throws). Either remove the value from the schema CHECK + enum, OR wrap `scrubPii` in a try-catch inside `buildEvalCandidateInput` so the value is actually reachable.
 4. `id DESC` tiebreaker docs: CLAUDE.md says "stable id-desc tiebreaker so `--since` windows never dupe/miss rows". This is true within a single call but doesn't prevent dupe/miss across overlapping windows when LIMIT < total. Either add a real `id`-cursor (`WHERE id < $cursor`) for export, or scope the doc claim to "within a single export call".
 5. Public-exports canaries: 6 of 17 subpaths (`gbrain` root, `/minions`, `/engine-factory`, `/transcription`, `/backoff`, `/extract`) have `canary: []` — the test only checks the import resolves, so a barrel module accidentally losing its named exports would still pass. Pin one stable canary symbol per subpath.
-6. `EXPECTED_COUNT` duplication: `scripts/check-exports-count.sh` and `test/public-exports.test.ts` both hardcode `17`. Drift risk. Make one read the other (or both compute from `package.json`).
+6. (Resolved by GBRA-47: the duplicate guard was deleted; `test/public-exports.test.ts` matches `EXPECTED_EXPORTS` exactly.) `EXPECTED_COUNT` duplication: the deleted exports-count guard and `test/public-exports.test.ts` both hardcoded `17`. Drift risk. Make one read the other (or both compute from `package.json`).
 
 **Why:** All 6 are real (some informational, some footgun-class) but each is small and surgical. Bundling into one v0.25.1 follow-up PR keeps the v0.25.0 ship clean and lets the fixes land with their own dedicated tests + CHANGELOG entry.
 
@@ -8332,7 +9044,7 @@ respective shapes. Small, mechanical; pinned by `test/init-embed-check.test.ts`
   hoist pglite out of gbrain's node_modules on upgrade and the eager
   repo-relative imports crashed every command at module load; tier 2 derives
   the dist dir via module resolution (pinned by
-  `test/pglite-hoisted-install.serial.test.ts`). Guarded by `scripts/check-pglite-embedded.sh`
+  `test/pglite-hoisted-install.test.ts`). Guarded by `scripts/check-pglite-embedded.sh`
   (compiles a smoketest and asserts a real PGLite query round-trips), wired into
   `bun run verify` + `check:all` + `check:pglite-embedded`. The real-agent e2e
   harness (`test/helpers/agent-harness.ts`) now resolves to the fast compiled

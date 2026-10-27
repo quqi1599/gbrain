@@ -1,7 +1,7 @@
 import type { BrainEngine } from '../engine.ts';
 import { sqlQueryForEngine, type SqlQuery } from '../sql-query.ts';
 import { GrantError, grantFromRow, normalizeGrantBrain, validateClientGrant, type ClientGrant, type GrantPatch, type GrantValidationContext } from './model.ts';
-import { grantCatalog } from './profiles.ts';
+import { catalogProvenance, grantCatalog, type CatalogProvenance } from './profiles.ts';
 
 export type GrantDatabase = BrainEngine | SqlQuery;
 const query = (db: GrantDatabase): SqlQuery => typeof db === 'function' ? db : sqlQueryForEngine(db);
@@ -27,7 +27,7 @@ export interface GrantMutationOptions {
   servingBrainId?: string;
 }
 export interface GrantMutationResult { before: ClientGrant; after: ClientGrant; revision: number; dryRun: boolean }
-const PATCH_FIELDS = new Set<keyof GrantPatch>(['scopes', 'sourceId', 'federatedRead', 'boundSlugPrefixes', 'allowedOperations', 'boundTools', 'boundSourceId', 'boundBrainId', 'delegatedSlugPrefixes', 'delegatedNamespace', 'boundMaxConcurrent', 'budgetUsdPerDay', 'surface', 'surfaceSetBy', 'tokenTtlSeconds', 'profile', 'repairReasons']);
+const PATCH_FIELDS = new Set<keyof GrantPatch>(['scopes', 'sourceId', 'federatedRead', 'sourcesNone', 'takesHolders', 'boundSlugPrefixes', 'allowedOperations', 'boundTools', 'boundSourceId', 'boundBrainId', 'delegatedSlugPrefixes', 'delegatedNamespace', 'boundMaxConcurrent', 'budgetUsdPerDay', 'surface', 'surfaceSetBy', 'tokenTtlSeconds', 'profile', 'repairReasons']);
 export function assertGrantPatch(patch: GrantPatch): void {
   for (const key of Object.keys(patch)) {
     if (!PATCH_FIELDS.has(key as keyof GrantPatch)) throw new GrantError('invalid_grant', `Unknown grant field: ${key}`);
@@ -40,6 +40,39 @@ export interface GrantClientMetadata {
   grantTypes: string[];
   authMethod: string;
   issuedAt: number;
+}
+
+const operationSet = (ops: readonly string[]): string => JSON.stringify([...new Set(ops)].sort());
+
+/**
+ * The audit document for a grant write. A write that sets a new operation
+ * snapshot records the catalog it was written against (`catalogProvenance`);
+ * every other write leaves provenance with the audit row that wrote the snapshot.
+ */
+function auditDocument(after: ClientGrant, before: ClientGrant | null): string {
+  const snapshotWritten = after.allowedOperations !== null
+    && (before?.allowedOperations == null || operationSet(before.allowedOperations) !== operationSet(after.allowedOperations));
+  return JSON.stringify(snapshotWritten ? { ...after, catalogProvenance: catalogProvenance() } : after);
+}
+
+/**
+ * The catalog provenance of a client's CURRENT operation snapshot: the newest
+ * audit row that recorded provenance, only while its snapshot is still the
+ * grant's snapshot. Null for grants written before provenance existed, for a
+ * snapshot changed without it, and when the audit table cannot be read.
+ */
+export async function readClientCatalogProvenance(db: GrantDatabase, clientId: string, snapshot: readonly string[]): Promise<CatalogProvenance | null> {
+  try {
+    const rows = await query(db)`SELECT after_grant FROM oauth_grant_audit
+      WHERE client_id = ${clientId} AND after_grant->'catalogProvenance' IS NOT NULL ORDER BY id DESC LIMIT 1`;
+    const raw = rows[0]?.after_grant;
+    const doc = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { allowedOperations?: unknown; catalogProvenance?: CatalogProvenance } | null;
+    const provenance = doc?.catalogProvenance;
+    if (!Array.isArray(doc?.allowedOperations) || provenance?.version !== 1 || !Array.isArray(provenance.operations)) return null;
+    return operationSet(doc.allowedOperations as string[]) === operationSet(snapshot) ? provenance : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Called after validation. Never exposes the credential in the audit document. */
@@ -66,7 +99,7 @@ export async function insertClientGrant(sql: SqlQuery, grant: ClientGrant, metad
         ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(grant.repairReasons)}::text::jsonb)))
       RETURNING client_id
     ) INSERT INTO oauth_grant_audit (client_id, actor, action, revision, before_grant, after_grant)
-      SELECT client_id, ${actor}, 'register', ${grant.revision}, NULL, ${JSON.stringify(grant)}::text::jsonb FROM created
+      SELECT client_id, ${actor}, 'register', ${grant.revision}, NULL, ${auditDocument(grant, null)}::text::jsonb FROM created
   `;
 }
 
@@ -80,7 +113,7 @@ export async function rescopeClientGrantInTransaction(db: GrantDatabase, clientI
   const sql = query(db);
   const rows = await sql`SELECT * FROM oauth_clients WHERE client_id = ${clientId} FOR UPDATE`;
   if (!rows.length) throw new GrantError('client_not_found', `No OAuth client found with id "${clientId}"`);
-  if (!('grant_revision' in rows[0])) throw new GrantError('grant_schema_required', 'Run gbrain apply-migrations --yes before changing client grants');
+  if (!('grant_revision' in rows[0]) || !('takes_holders' in rows[0])) throw new GrantError('grant_schema_required', 'Run gbrain apply-migrations --yes before changing client grants');
   const before = grantFromRow(rows[0]);
   if (opts.expectedRevision !== undefined && before.revision !== opts.expectedRevision) {
     throw new GrantError('grant_conflict', `Grant changed (expected revision ${opts.expectedRevision}, current ${before.revision}); review a fresh preview`);
@@ -101,6 +134,7 @@ export async function rescopeClientGrantInTransaction(db: GrantDatabase, clientI
     changes.scopes = [...new Set([...before.scopes, 'agent'])];
   }
   const after: ClientGrant = { ...before, ...changes, revision: before.revision + 1, repairReasons: [] };
+  if (changes.sourceId != null && changes.sourcesNone === undefined) after.sourcesNone = false;
   after.boundBrainId = normalizeGrantBrain(after.boundBrainId);
   validateClientGrant(after, await grantValidationContext(db, opts.servingBrainId));
   if (JSON.stringify({ ...after, revision: before.revision }) === JSON.stringify(before)) {
@@ -111,6 +145,48 @@ export async function rescopeClientGrantInTransaction(db: GrantDatabase, clientI
   return { before, after, revision: after.revision, dryRun: false };
 }
 
+/**
+ * #6202: whether a client already holds a code or token. A first consent is
+ * offered and recorded only while it holds neither, so a client approved by a
+ * server that predates the consent transition (revision still 0) never has its
+ * source moved under tokens it already holds.
+ */
+export async function clientHoldsAuthorization(db: GrantDatabase, clientId: string): Promise<boolean> {
+  const [row] = await query(db)`SELECT EXISTS (SELECT 1 FROM oauth_tokens WHERE client_id = ${clientId})
+    OR EXISTS (SELECT 1 FROM oauth_codes WHERE client_id = ${clientId}) AS held`;
+  return row?.held === true;
+}
+
+/**
+ * #6202: the first owner consent of a self-registered client, run in the
+ * caller's transaction beside the authorization-code insert. Always persists:
+ * the revision moves 0 → 1 with an `action='consent'` audit row even when the
+ * source is unchanged, so the client is never offered the choice again and a
+ * second pending request fails its policy check. A new `sourceId` lands in
+ * `source_id` + `federated_read`; nothing else in the grant changes. The
+ * final grant is validated on every first consent, and its source is
+ * share-locked and must be active, changed or not.
+ */
+export async function recordFirstConsentInTransaction(db: GrantDatabase, clientId: string, sourceId: string | undefined, actor: string): Promise<GrantMutationResult> {
+  const sql = query(db);
+  const rows = await sql`SELECT * FROM oauth_clients WHERE client_id = ${clientId} FOR UPDATE`;
+  if (!rows.length) throw new GrantError('client_not_found', `No OAuth client found with id "${clientId}"`);
+  if (!('grant_revision' in rows[0]) || !('takes_holders' in rows[0])) throw new GrantError('grant_schema_required', 'Run gbrain apply-migrations --yes before changing client grants');
+  const before = grantFromRow(rows[0]);
+  if (before.revision !== 0) throw new GrantError('grant_conflict', `Grant changed (expected revision 0, current ${before.revision}); review a fresh request`);
+  if (await clientHoldsAuthorization(sql, clientId)) throw new GrantError('grant_conflict', 'The client already holds an authorization; review a fresh request');
+  const after: ClientGrant = { ...before, revision: 1 };
+  if (sourceId !== undefined && sourceId !== before.sourceId) Object.assign(after, { sourceId, federatedRead: [sourceId], sourcesNone: false });
+  // Share-lock the final source through commit, so it cannot be archived between this check and the code insert.
+  if (after.sourceId != null) {
+    const [source] = await sql`SELECT archived FROM sources WHERE id = ${after.sourceId} FOR SHARE`;
+    if (!source || source.archived === true) throw new GrantError('invalid_grant', `Source "${after.sourceId}" is not active; review a fresh request`);
+  }
+  validateClientGrant(after, await grantValidationContext(db));
+  await persistGrant(sql, before, after, actor, 'consent');
+  return { before, after, revision: 1, dryRun: false };
+}
+
 /** One UPDATE+audit statement: SQL-only provider callers get atomicity too. */
 export async function persistGrant(sql: SqlQuery, before: ClientGrant, after: ClientGrant, actor: string, action: string): Promise<void> {
   const result = await sql`
@@ -118,6 +194,8 @@ export async function persistGrant(sql: SqlQuery, before: ClientGrant, after: Cl
       UPDATE oauth_clients SET
         scope = ${after.scopes.join(' ')}, source_id = ${after.sourceId},
         federated_read = ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.federatedRead)}::text::jsonb)),
+        source_grant = ${after.sourcesNone === true ? 'none' : null},
+        takes_holders = CASE WHEN ${after.takesHolders == null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.takesHolders ?? [])}::text::jsonb)) END,
         bound_slug_prefixes = CASE WHEN ${after.boundSlugPrefixes === null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.boundSlugPrefixes ?? [])}::text::jsonb)) END,
         allowed_operations = CASE WHEN ${after.allowedOperations === null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.allowedOperations ?? [])}::text::jsonb)) END,
         bound_tools = CASE WHEN ${after.boundTools === null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.boundTools ?? [])}::text::jsonb)) END,
@@ -148,7 +226,7 @@ export async function persistGrant(sql: SqlQuery, before: ClientGrant, after: Cl
       RETURNING j.id
     ), audited AS (
       INSERT INTO oauth_grant_audit (client_id, actor, action, revision, before_grant, after_grant)
-      SELECT client_id, ${actor}, ${action}, ${after.revision}, ${JSON.stringify(before)}::text::jsonb, ${JSON.stringify(after)}::text::jsonb FROM updated
+      SELECT client_id, ${actor}, ${action}, ${after.revision}, ${JSON.stringify(before)}::text::jsonb, ${auditDocument(after, before)}::text::jsonb FROM updated
       RETURNING client_id
     ) SELECT client_id FROM audited
   `;
@@ -157,4 +235,5 @@ export async function persistGrant(sql: SqlQuery, before: ClientGrant, after: Cl
 
 export { GrantError, grantFromRow, validateClientGrant, delegationReasons, intersectGrantedScopes } from './model.ts';
 export type { ClientGrant, GrantPatch, GrantProfileId, GrantValidationContext } from './model.ts';
-export { resolveGrantProfile, grantCatalog, RENEWABLE_GRANT_TTL_SECONDS, STATIC_GRANT_TTL_SECONDS } from './profiles.ts';
+export { resolveGrantProfile, grantCatalog, catalogProvenance, RENEWABLE_GRANT_TTL_SECONDS, STATIC_GRANT_TTL_SECONDS } from './profiles.ts';
+export type { CatalogProvenance } from './profiles.ts';

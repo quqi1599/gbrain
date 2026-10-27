@@ -16,6 +16,7 @@ tools:
   - list_pages
   - get_timeline
 mutating: false
+when_to_use: "Use when the user asks: \"morning prep\", \"prepare for today\", \"what's on my plate\", \"day prep\"."
 ---
 
 # Daily Task Prep
@@ -53,6 +54,13 @@ Prep: {what to know before this meeting}
 ## Tasks (P0-P1)
 - {task with priority}
 ```
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain waiting` refuses on stale data: run (or ask the user to run) the sync it names, then retry; do not prep from stale mail.
+- Meeting-context searches return nothing with a degraded notice: say the brain is searching keywords only right now, instead of "no prior context".
 
 ## Anti-Patterns
 

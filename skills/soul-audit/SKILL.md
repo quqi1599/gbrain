@@ -62,7 +62,10 @@ gbrain bootstrap render --only SOUL.md --force
 ```
 
 Render targets: `SOUL.md`, `USER.md`, `ACCESS_POLICY.md`, `HEARTBEAT.md`,
-`AGENTS.md` (re-render whichever files the changed keys feed).
+`AGENTS.md` (re-render whichever files the changed keys feed). In an OpenClaw
+workspace the `HEARTBEAT.md` target writes `SCHEDULES.md`, because OpenClaw
+2026.10.6+ removes a workspace `HEARTBEAT.md`; render detects the workspace,
+or pass `--host openclaw`.
 
 ## Phases (each independent, each re-runnable)
 
@@ -100,7 +103,8 @@ ACCESS_POLICY.md.
 ### Phase 6: Operational Cadence
 Ask: "How often should the agent check in? Morning briefing? End of day summary?
 What recurring jobs do you want?"
-Keys: `HEARTBEAT_CADENCE`, `QUIET_HOURS`. Renders: HEARTBEAT.md. Jobs ship
+Keys: `HEARTBEAT_CADENCE`, `QUIET_HOURS`. Renders: HEARTBEAT.md (SCHEDULES.md on
+OpenClaw). Jobs ship
 disabled — enable one at a time after a manual dry run (the ritual is in the
 rendered file).
 
@@ -113,6 +117,13 @@ Report exactly what changed: which keys were updated, which files re-rendered,
 and where the backups landed. Example: "Soul audit: updated VOICE_REGISTER +
 SOUL_WINCE, re-rendered SOUL.md (backup in .gbrain-bootstrap-backups/...).
 Re-run any phase anytime."
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain bootstrap interview --confirm <hash>` fails: the hash must come from a read-back the user actually saw. Re-run `gbrain bootstrap interview --status`, read the answers back, and confirm only with the user's agreement.
+- Rendering refuses because required answers are missing: ask the user for them; never fill identity answers yourself.
 
 ## Anti-Patterns
 

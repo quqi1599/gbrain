@@ -3,7 +3,8 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { healOversizedPageChunks } from '../src/core/embed-oversize-heal.ts';
 import { installPageEmbeddings, installPageProjection, PageProjectionConflictError,
-  readProjectionSnapshot, rebuildPendingPageProjections } from '../src/core/page-state/projections.ts';
+  readProjectionSnapshot, rebuildPendingPageProjections, retryProjectionConflict } from '../src/core/page-state/projections.ts';
+import { renderCliError } from '../src/core/agent-output.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -51,9 +52,9 @@ async function seed(engine: BrainEngine, slug: string, seal = true) {
 async function embedCurrent(engine: BrainEngine, slug: string) {
   const prepared = (await readProjectionSnapshot(engine, slug, sourceId))!;
   const vector = new Float32Array(1536); vector[0] = 0.75;
-  expect(await installPageEmbeddings(engine, prepared, prepared.chunks.map(c => ({
+  expect((await installPageEmbeddings(engine, prepared, prepared.chunks.map(c => ({
     chunk_index: c.chunk_index, chunk_source: c.chunk_source, chunk_text: c.chunk_text, embedding: vector,
-  })))).toBe(true);
+  })))).complete).toBe(true);
   return engine.getChunks(slug, { sourceId, includeEmbedding: true });
 }
 
@@ -208,7 +209,7 @@ test('a column switch after context validation cannot redirect vectors into the 
         });
         const vector = new Float32Array(1536); vector[0] = 0.75;
         if (installation === 'embeddings') {
-          expect(await installPageEmbeddings(raced, origin, [{ ...chunk(body), embedding: vector }])).toBe(true);
+          expect((await installPageEmbeddings(raced, origin, [{ ...chunk(body), embedding: vector }])).complete).toBe(true);
         } else {
           await installPageProjection(raced, origin, [{ ...chunk(body), embedding: vector }], { seal: true });
         }
@@ -316,7 +317,7 @@ test('queued Markdown rebuild retains ordered fenced code metadata and canonical
   }
 });
 
-test('queued Markdown rebuild honors embed-skip and quarantine without retaining stale chunks', async () => {
+test('queued Markdown rebuild honors embed-skip and quarantine without retaining stale chunks (#6722: embed_skip keeps keyword chunks)', async () => {
   for (const engine of engines) {
     for (const marker of ['embed_skip', 'quarantine']) {
       const slug = `disposition-${marker}`;
@@ -327,7 +328,13 @@ test('queued Markdown rebuild honors embed-skip and quarantine without retaining
       await engine.upsertChunks(slug, [chunk('stale-projection-sentinel')], { sourceId });
       const before = (await engine.readPageSnapshot(slug, { sourceId }))!;
       expect((await rebuildPendingPageProjections(engine, 100)).rebuilt).toBeGreaterThan(0);
-      expect(await engine.getChunks(slug, { sourceId, includeUnsealed: true })).toEqual([]);
+      const rebuilt = await engine.getChunks(slug, { sourceId, includeUnsealed: true });
+      if (marker === 'quarantine') expect(rebuilt).toEqual([]);
+      else {
+        expect(rebuilt.map(c => c.chunk_text).join('\n')).toContain('Prose.');
+        expect(rebuilt.some(c => c.chunk_text.includes('stale-projection-sentinel'))).toBe(false);
+        expect(rebuilt.every(c => c.embedding == null)).toBe(true);
+      }
       const after = (await engine.readPageSnapshot(slug, { sourceId }))!;
       expect(after.revision).toBe(before.revision);
       expect(after.page.compiled_truth).toBe(before.page.compiled_truth);
@@ -377,5 +384,88 @@ def protected_example():
     expect(after.page.compiled_truth).toBe(before.page.compiled_truth);
     expect(after.page.timeline).toBe(before.page.timeline);
     expect(after.withdrawals).toEqual(before.withdrawals);
+  }
+});
+
+// Master red (pack-relation-direction-engine): a test's fixture install read the page, the live persistence
+// owner's resident rebuild sealed the same revision, and the install threw at an unchanged revision.
+test('the resident rebuild sealing between a read and an install is a named projection conflict; the fixture re-reads and wins', async () => {
+  for (const engine of engines) {
+    const slug = 'resident-race';
+    await seed(engine, slug, false);
+    const read = (await readProjectionSnapshot(engine, slug, sourceId, { allowUnsealed: true }))!;
+    expect((await rebuildPendingPageProjections(engine, 100, { pages: { sourceId, slugs: [slug] } })).rebuilt).toBe(1);
+    const conflict = await installPageProjection(engine, read, [chunk('fixture text')], { seal: true }).catch(e => e);
+    expect(conflict).toBeInstanceOf(PageProjectionConflictError);
+    expect(conflict.expectedRevision).toBe(conflict.currentRevision);
+    expect(conflict.changed).toEqual(['text_projection_revision', 'chunk_digest', 'indexing_context']);
+    expect(conflict.message).toContain(`The search projection of ${slug} (source ${sourceId}) changed during preparation (text_projection_revision, chunk_digest, indexing_context)`);
+    let reads = 0;
+    const raced = afterCapture(engine, async () => { await rebuildPendingPageProjections(engine, 100, { pages: { sourceId, slugs: [slug] } }); });
+    await engine.executeRaw('UPDATE pages SET text_projection_revision=NULL WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
+    await engine.executeRaw(`INSERT INTO page_projection_jobs(source_incarnation,slug,revision,reason) SELECT s.incarnation,p.slug,p.knowledge_revision,'canonical_change'
+      FROM pages p JOIN sources s ON s.id=p.source_id WHERE p.source_id=$1 AND p.slug=$2 ON CONFLICT(source_incarnation,slug) DO NOTHING`, [sourceId, slug]);
+    await retryProjectionConflict(async () => {
+      const prepared = (await readProjectionSnapshot(reads++ === 0 ? raced : engine, slug, sourceId, { allowUnsealed: true }))!;
+      await installPageProjection(engine, prepared, [chunk('fixture text')], { seal: true });
+    });
+    expect(reads).toBe(2);
+    expect((await engine.getChunks(slug, { sourceId })).map(c => c.chunk_text)).toEqual(['fixture text']);
+  }
+});
+
+test('two writers reinstalling one page 10 times each make progress: every lost attempt is matched by the other writer\'s install', async () => {
+  for (const engine of engines) {
+    const slug = 'two-writers';
+    await seed(engine, slug);
+    const installs = { a: 0, b: 0 };
+    const conflicts = { a: 0, b: 0 };
+    const writer = async (name: 'a' | 'b') => {
+      for (let round = 0; round < 10; round++) {
+        await retryProjectionConflict(async () => {
+          const prepared = (await readProjectionSnapshot(engine, slug, sourceId, { allowUnsealed: true }))!;
+          try { await installPageProjection(engine, prepared, [chunk(`${name} ${round} ${body}`)], { seal: true }); }
+          catch (error) { if (error instanceof PageProjectionConflictError) conflicts[name]++; throw error; }
+          installs[name]++;
+        }).catch(error => { expect(error).toBeInstanceOf(PageProjectionConflictError); });
+      }
+    };
+    await Promise.all([writer('a'), writer('b')]);
+    // A writer has one attempt in flight, so each of its conflicts needs a distinct install by the other writer.
+    expect(conflicts.a).toBeLessThanOrEqual(installs.b);
+    expect(conflicts.b).toBeLessThanOrEqual(installs.a);
+    expect(installs.a + installs.b).toBeGreaterThanOrEqual(10);
+    const [installed] = await engine.getChunks(slug, { sourceId });
+    expect(installed.chunk_text).toMatch(/^[ab] \d /);
+    expect((await engine.readPageSnapshot(slug, { sourceId }))!.page.text_projection_revision).toBe((await engine.readPageSnapshot(slug, { sourceId }))!.revision);
+  }
+});
+
+test('an exhausted projection retry reports page_projection_conflict with the changed field and the next step', async () => {
+  for (const engine of engines) {
+    const slug = 'exhausted-retry';
+    await seed(engine, slug);
+    let attempts = 0;
+    const error = await retryProjectionConflict(async () => {
+      attempts++;
+      const prepared = (await readProjectionSnapshot(engine, slug, sourceId, { allowUnsealed: true }))!;
+      await installFixtureChunks(engine, slug, [chunk(`competing install ${attempts}`)], { sourceId });
+      await installPageProjection(engine, prepared, [chunk(body)], { seal: true });
+    }, () => 0).catch(e => e);
+    expect(attempts).toBe(4);
+    expect(error).toBeInstanceOf(PageProjectionConflictError);
+    expect(error.changed).toEqual(['chunk_digest']);
+    const json = JSON.parse(renderCliError(error, { json: true, command: 'reindex-code', tty: false }).stdout!);
+    expect(json).toMatchObject({
+      code: 'page_projection_conflict', error: 'page_projection_conflict', class: 'retryable', retryable: true,
+      message: `The search projection of ${slug} (source ${sourceId}) changed during preparation (chunk_digest) at the same page revision; nothing was installed. Re-read its current snapshot before retrying.`,
+      detail: 'changed: chunk_digest',
+      suggestion: `Re-run gbrain reindex-code; it re-reads the current projection. If it conflicts again, another worker is still installing: wait for it to finish, then re-run. Next: gbrain get --source ${sourceId} -- ${slug}`,
+      fix: { argv: ['gbrain', 'get', '--source', sourceId, '--', slug], command: `gbrain get --source ${sourceId} -- ${slug}`, actor: 'agent' },
+    });
+    expect(json.why).toContain(`installed a newer search projection of ${slug}`);
+    const text = renderCliError(error, { json: false, command: 'reindex-code', tty: false });
+    expect(text.stderr).toBe(`Error [page_projection_conflict]: ${json.message}\nFix: gbrain get --source ${sourceId} -- ${slug}\nWhy: ${json.why}\nDocs: ${json.docs}\n`);
+    expect(json.docs).toContain('docs/guides/repair.md#page-projection-conflict');
   }
 });

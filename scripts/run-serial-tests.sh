@@ -64,14 +64,31 @@ if [ -n "$SERIAL_SHARD" ]; then
 fi
 cd "$(dirname "$0")/.."
 
+# --dry-run-list prints the selection; --dry-run-list-exclusive prints only
+# the machine-exclusive entries. Positional FILE arguments replace discovery
+# (scripts/ci-ubicloud.ts dispatches explicit batches through this wrapper).
+DRY_RUN_MODE=""
+case "${1:-}" in
+  --dry-run-list|--dry-run-list-exclusive) DRY_RUN_MODE="$1"; shift ;;
+esac
+
 . scripts/lib/test-env.sh
+receipts_init serial
+RECEIPT_SHARD=""
+RECEIPT_OF=""
+RECEIPT_TAG="all"
+if [ -n "$SERIAL_SHARD" ]; then
+  RECEIPT_SHARD="$shard_n"
+  RECEIPT_OF="$shard_m"
+  RECEIPT_TAG="s${shard_n}of${shard_m}"
+fi
 
 # ──────────────────────────────────────────────────────────────────────────
 # EXCLUSIVE_FILES: files that must never run concurrently with anything else
 # (machine-global state or contention-critical timing). They run sequentially
 # AFTER the pool drains, without the wall-clock kill (a SIGKILL
 # mid-registration could strand a real scheduled job). Growth guard:
-# test/scripts/serial-files.test.ts fails when this list grows past 3
+# test/scripts/serial-files.test.ts fails when this list grows past 4
 # entries — every addition needs a justification comment like the entries
 # below.
 # ──────────────────────────────────────────────────────────────────────────
@@ -93,6 +110,12 @@ EXCLUSIVE_FILES=(
   # restores master-era timing until the probe learns to retry ref-lock
   # contention.
   "test/brain-repo-durability.serial.test.ts"
+  # Pins a REAL serve's answer inside the hook's 1 s IPC client timeout (Pin 3
+  # and Pin 3b need an `ok` round trip). The serve answers in ~10 ms on an
+  # idle machine; pooled beside three heavy files its main thread is starved
+  # (160-1,200 ms with the file pinned to one core beside three CPU hogs), and
+  # Pin 3b timed out at 1,008 ms in #7409's full gate.
+  "test/bootstrap-hook-under-serve.serial.test.ts"
 )
 
 is_exclusive() {
@@ -105,9 +128,13 @@ is_exclusive() {
 
 # Use while-read for portability to macOS bash 3.2 (no mapfile).
 files=()
-while IFS= read -r f; do
-  files+=("$f")
-done < <(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' | sort)
+if [ "$#" -gt 0 ]; then
+  files=("$@")
+else
+  while IFS= read -r f; do
+    files+=("$f")
+  done < <(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' | sort)
+fi
 
 # Partition into pooled vs exclusive (exclusive entries missing from the
 # discovered set are simply ignored — the list names repo files, and a
@@ -135,12 +162,20 @@ fi
 ordered_files=()
 if [ "${#pool_files[@]}" -gt 0 ]; then ordered_files+=("${pool_files[@]}"); fi
 if [ "${#exclusive_present[@]}" -gt 0 ]; then ordered_files+=("${exclusive_present[@]}"); fi
-if [ "${1:-}" = "--dry-run-list" ]; then
+if [ "$DRY_RUN_MODE" = "--dry-run-list" ]; then
   if [ "${#ordered_files[@]}" -gt 0 ]; then printf '%s\n' "${ordered_files[@]}" | sort; fi
   exit 0
 fi
+if [ "$DRY_RUN_MODE" = "--dry-run-list-exclusive" ]; then
+  if [ "${#exclusive_present[@]}" -gt 0 ]; then printf '%s\n' "${exclusive_present[@]}"; fi
+  exit 0
+fi
 
-if [ "${#ordered_files[@]}" -gt 0 ]; then ensure_pglite_snapshot "serial-tests"; fi
+if [ "${#ordered_files[@]}" -gt 0 ]; then
+  ensure_pglite_snapshot "serial-tests"
+else
+  receipt_empty "$RECEIPT_TAG" "$RECEIPT_SHARD" "$RECEIPT_OF"
+fi
 
 # ──────────────────────────────────────────────────────────────────────────
 # Pool sizing: min(detect_cpus, 4) — each pooled bun process can hold a
@@ -277,8 +312,9 @@ echo "[serial-tests] ${#ordered_files[@]} file(s): pool=$POOL (${#exclusive_pres
 # against in v0.40.10. The literal `bun test --max-concurrency=1` below is
 # contract-pinned by test/scripts/serial-files.test.ts.
 run_one_file() {
-  # $1 file, $2 log path, $3 exit-sentinel path, $4 wrap ("wrap"|"nowrap")
-  local f="$1" log="$2" exitf="$3" wrap="$4" rc=0
+  # $1 file, $2 log path, $3 exit-sentinel path, $4 wrap ("wrap"|"nowrap"),
+  # $5 receipt kind (primary|rescue; default primary)
+  local f="$1" log="$2" exitf="$3" wrap="$4" kind="${5:-primary}" rc=0
   local key="${log%.log}" started finished
   printf '%s\n' "$f" > "$key.file"
   started=$(now_ms)
@@ -293,12 +329,14 @@ run_one_file() {
     cov_key=$(basename "$log" .log)
     cov_args=(--coverage --coverage-reporter=lcov --coverage-dir="$COVERAGE_DIR/serial-$cov_key")
   fi
+  receipt_begin "$kind" "$RECEIPT_TAG-$(basename "$log" .log)" "$RECEIPT_SHARD" "$RECEIPT_OF" "" "$f"
   if [ "$wrap" = "wrap" ] && [ -n "$TIMEOUT_BIN" ]; then
     "$TIMEOUT_BIN" -k 15 "$PER_FILE_TIMEOUT" \
-      bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} "$f" > "$log" 2>&1 || rc=$?
+      bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$f" > "$log" 2>&1 || rc=$?
   else
-    bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} "$f" > "$log" 2>&1 || rc=$?
+    bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$f" > "$log" 2>&1 || rc=$?
   fi
+  receipt_end "$rc"
   echo "$rc" > "$exitf"
   finished=$(now_ms)
   echo "$((finished - started))" > "$key.duration-ms"
@@ -404,7 +442,7 @@ if [ "${#rescue_files[@]}" -gt 0 ]; then
     is_exclusive "$f" && wrap_mode="nowrap"
     s=$(date +%s)
     [ "$wrap_mode" != "nowrap" ] || running_exclusive=1
-    run_one_file "$f" "$LOG_DIR/$i.log" "$LOG_DIR/$i.exit" "$wrap_mode" &
+    run_one_file "$f" "$LOG_DIR/$i.log" "$LOG_DIR/$i.exit" "$wrap_mode" rescue &
     wait "$!"
     running_exclusive=0
     e=$(date +%s)

@@ -34,13 +34,14 @@
  * (gateway.toolLoop primarily) use doGenerate.
  */
 import { randomUUIDv7 } from 'bun';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from '../../spawn.ts';
 import { mkdirSync } from 'node:fs';
 import {
   claudeCliConfigDir,
   claudeCliCwdDir,
   sweepDeadClaudeCliScratchDirs,
 } from './claude-cli-scratch.ts';
+import { continuationUnprovenMetadata, resolveClaudeCliAnswer } from './claude-cli-continuation.ts';
 import type {
   LanguageModelV2,
   LanguageModelV2CallOptions,
@@ -49,6 +50,7 @@ import type {
   LanguageModelV2Prompt,
   LanguageModelV2Message,
   LanguageModelV2ProviderDefinedTool,
+  SharedV2ProviderMetadata,
 } from '@ai-sdk/provider';
 
 function claudeBin(): string {
@@ -142,18 +144,20 @@ export class ClaudeCliProcessError extends Error {
   }
 }
 
+/** The result envelope plus the session's event array when stdout carried one (`--verbose`, #6791). */
+type ClaudeRun = ClaudeJsonResult & { events: readonly unknown[] | null };
+
 type EnvelopeParse =
-  | { ok: true; envelope: ClaudeJsonResult }
+  | { ok: true; envelope: ClaudeRun }
   | { ok: false; reason: 'not-json'; error: unknown }
   | { ok: false; reason: 'no-result-event' };
 
 /**
- * Unwrap `--output-format json` stdout into the result envelope. Tolerates both
- * output shapes: the bare result object, and the verbose-mode event ARRAY —
- * with `"verbose": true` in ~/.claude/settings.json the CLI emits
- * [{type:"system",subtype:"init",...}, ..., {type:"result",...}] instead of the
- * bare object, and there is no CLI flag to force it off (no --no-verbose;
- * --settings '{}' merges, does not replace). Verified on CLI 2.1.145.
+ * Unwrap `--output-format json` stdout into the result envelope and the event
+ * array it came in. `runClaude` passes `--verbose` (#6791), so the CLI emits
+ * [{type:"system",subtype:"init",...}, ..., {type:"result",...}]; the bare
+ * result object (events null) is still accepted. The array shape was verified on
+ * CLI 2.1.145; that it carries every assistant message, in the 2.1.296 bundle.
  */
 function parseResultEnvelope(stdout: string): EnvelopeParse {
   let parsed: unknown;
@@ -162,6 +166,7 @@ function parseResultEnvelope(stdout: string): EnvelopeParse {
   } catch (error) {
     return { ok: false, reason: 'not-json', error };
   }
+  const events = Array.isArray(parsed) ? parsed : null;
   if (Array.isArray(parsed)) {
     const resultEvent = parsed.find(
       (ev): ev is ClaudeJsonResult =>
@@ -178,7 +183,7 @@ function parseResultEnvelope(stdout: string): EnvelopeParse {
   if (!parsed || typeof parsed !== 'object') {
     return { ok: false, reason: 'not-json', error: new Error('top-level JSON value is not an object') };
   }
-  return { ok: true, envelope: parsed as ClaudeJsonResult };
+  return { ok: true, envelope: { ...(parsed as ClaudeJsonResult), events } };
 }
 
 /**
@@ -186,6 +191,36 @@ function parseResultEnvelope(stdout: string): EnvelopeParse {
  * surfacing `api_error_status` + the human-readable `result` message instead of
  * an opaque blob.
  */
+/**
+ * #6523: Claude Code reports a response that hit CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ * (the cap #6424 forwards, or the CLI's own default) as an error envelope,
+ * not as a success with `stop_reason: 'max_tokens'`:
+ *   "API Error: Claude's response exceeded the 2048 output token maximum. To
+ *    configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ *    environment variable."
+ * Rejecting on it hid the cap from every caller that escalates on `length`
+ * (loops_extract 2048 → 8192, facts/extract 1× → 2×), so the minion queue
+ * retried the same capped call and the job died. The match is the anchored
+ * prefix only: the trailing advice has already changed wording once, the
+ * reported cap may be the default rather than the forwarded one, and the exit
+ * code varies by CLI version. A quoted prefix mid-answer, a success envelope,
+ * a non-string result or an envelope carrying an API status never match.
+ */
+const OUTPUT_CAP_RE = /^API Error: Claude's response exceeded the \d+ output token maximum\b/;
+
+function isOutputCapEnvelope(envelope: ClaudeJsonResult): boolean {
+  return envelope.type === 'result'
+    && envelope.is_error === true
+    && envelope.api_error_status === undefined
+    && typeof envelope.result === 'string'
+    && OUTPUT_CAP_RE.test(envelope.result);
+}
+
+/** The cap envelope as the success the API would have returned: no text, `max_tokens`, usage as reported. */
+function outputCapAsLength<T extends ClaudeJsonResult>(envelope: T): T {
+  return { ...envelope, is_error: false, result: '', stop_reason: 'max_tokens' };
+}
+
 function envelopeError(envelope: ClaudeJsonResult, exitCode: number | undefined): ClaudeCliProcessError {
   const status = typeof envelope.api_error_status === 'number' ? envelope.api_error_status : undefined;
   const detail = envelope.result || envelope.subtype;
@@ -278,7 +313,8 @@ function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; user
           if (p.type === 'text') return p.text;
           if (p.type === 'reasoning') return ''; // dropped on replay
           if (p.type === 'tool-call') {
-            return `[tool_use ${p.toolName}(${p.input})]`;
+            // #6236: the V2 prompt's input is an object; a template literal rendered it as [object Object].
+            return `[tool_use ${p.toolName}(${typeof p.input === 'string' ? p.input : JSON.stringify(p.input)})]`;
           }
           if (p.type === 'tool-result') {
             const out = typeof p.output === 'string' ? p.output : JSON.stringify(p.output);
@@ -306,6 +342,38 @@ function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; user
   return { systemText: systemParts.join('\n'), userPrompt: convo.join('\n\n') };
 }
 
+/** Oldest claude CLI that accepts every flag `runClaude` passes (probed:
+ * 2.0.59 rejects `--disable-slash-commands`, 2.0.60 accepts the full argv). */
+export const MIN_CLAUDE_CLI_VERSION = '2.0.60';
+
+/** The CLI's argument parser rejected a flag (`error: unknown option '--x'`). */
+export function isUnknownOptionError(stderr: string): boolean {
+  return /\bunknown option\b/i.test(stderr);
+}
+
+export function oldClaudeCliMessage(version: string | null): string {
+  return `claude CLI ${MIN_CLAUDE_CLI_VERSION} or newer required (found ${version ?? 'an unknown version'}); upgrade Claude Code`;
+}
+
+/** `claude --version`'s version number, or null. Only called after a failed
+ * run, so the extra spawn never sits on the success path. */
+function claudeCliVersion(env: NodeJS.ProcessEnv): string | null {
+  const r = spawnSync(claudeBin(), ['--version'], { encoding: 'utf8', timeout: 5_000, env });
+  return /\d+\.\d+\.\d+/.exec(typeof r.stdout === 'string' ? r.stdout : '')?.[0] ?? null;
+}
+
+/**
+ * #6918: Claude Code thinks by default on Claude 5 models, and the API needs
+ * thinking.budget_tokens of at least 1024 and below max_tokens, so a call
+ * capped at 1024 output tokens or fewer runs with thinking off.
+ */
+export const CLAUDE_THINKING_BUDGET_FLOOR = 1024;
+
+export function thinkingDisabledBelowFloor(maxOutputTokens: number | undefined): boolean {
+  return typeof maxOutputTokens === 'number' && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0
+    && maxOutputTokens <= CLAUDE_THINKING_BUDGET_FLOOR;
+}
+
 /**
  * Spawn `claude --print` with the contamination-suppression flags and return
  * the parsed `--output-format json` envelope. Aborts propagate to SIGTERM on
@@ -316,11 +384,24 @@ function runClaude(
   userPrompt: string,
   model: string,
   signal?: AbortSignal,
-): Promise<ClaudeJsonResult> {
+  maxOutputTokens?: number,
+): Promise<ClaudeRun> {
   return new Promise((resolve, reject) => {
+    // #6424: forward the call's output cap. The inline --settings env sits
+    // above the user's settings.json env block, so both carry it.
+    const outputCap = typeof maxOutputTokens === 'number' && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0
+      ? String(maxOutputTokens)
+      : undefined;
+    const thinkingOff = thinkingDisabledBelowFloor(maxOutputTokens);
+    const settings = outputCap
+      ? JSON.stringify({ disableAllHooks: true, env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: outputCap, ...(thinkingOff ? { MAX_THINKING_TOKENS: '0' } : {}) } })
+      : '{"disableAllHooks":true}';
     const args = [
       '--print',
-      '--output-format', 'json',
+      // #6791: --verbose turns the json output into the session's event
+      // array, the only record of the segments before an automatic
+      // continuation (the envelope's result holds the last one).
+      '--output-format', 'json', '--verbose',
       '--model', model,
       '--disable-slash-commands',
       // Agent isolation: this subprocess must behave like a raw LLM, not a
@@ -331,6 +412,12 @@ function runClaude(
       // contention). Verified against claude CLI 2.1.145 --help.
       '--tools', '',
       '--strict-mcp-config',
+      // #5820: the child must not run the user's Claude Code hooks — gbrain's
+      // own Stop hook would bank this call's prompt as a "conversation" and
+      // extracting it spawns another call. Unlike --bare this keeps the
+      // subscription login (credentials are not settings). Accepted by every
+      // CLI that accepts the flags above.
+      '--settings', settings,
     ];
     if (systemPrompt) {
       args.push('--system-prompt', systemPrompt);
@@ -363,6 +450,8 @@ function runClaude(
     // see resolveHermeticConfigDir for the auth caveat that makes it opt-in.
     const hermeticConfigDir = resolveHermeticConfigDir();
     if (hermeticConfigDir) env.CLAUDE_CONFIG_DIR = hermeticConfigDir;
+    if (outputCap) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = outputCap;
+    if (thinkingOff) env.MAX_THINKING_TOKENS = '0';
     const child = spawn(claudeBin(), args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: ensureCleanCwd(),
@@ -403,6 +492,10 @@ function runClaude(
         // reason lives in stderr, so it falls through to the blob fallback
         // (as does any stdout without a parseable envelope).
         const attempt = parseResultEnvelope(stdout);
+        if (attempt.ok && isOutputCapEnvelope(attempt.envelope)) {
+          resolve(outputCapAsLength(attempt.envelope));
+          return;
+        }
         if (attempt.ok && attempt.envelope.type === 'result' && attempt.envelope.is_error === true) {
           reject(envelopeError(attempt.envelope, code ?? undefined));
           return;
@@ -411,8 +504,11 @@ function runClaude(
         // model/page-derived text, and classifyGlobalLlmError's phrase
         // regexes only scan text before the marker (an auth-looking essay in
         // stdout must never read as a whole-run auth outage).
+        const headline = isUnknownOptionError(stderr)
+          ? oldClaudeCliMessage(claudeCliVersion(env))
+          : `claude-cli exited ${code}`;
         reject(new ClaudeCliProcessError(
-          `claude-cli exited ${code}\n--- raw ---\n${stderr.trim() || stdout.trim()}`,
+          `${headline}\n--- raw ---\n${stderr.trim() || stdout.trim()}`,
           { exitCode: code ?? undefined },
         ));
         return;
@@ -428,6 +524,10 @@ function runClaude(
         return;
       }
       const envelope = attempt.envelope;
+      if (isOutputCapEnvelope(envelope)) {
+        resolve(outputCapAsLength(envelope));
+        return;
+      }
       if (envelope.is_error) {
         reject(envelopeError(envelope, 0));
         return;
@@ -593,6 +693,19 @@ function normalizeModel(model: string): string {
   return idx >= 0 ? model.slice(idx + 1) : model;
 }
 
+/**
+ * #6260: the CLI's own `stop_reason` decides the finish reason, so a response
+ * cut off at the output cap reads as `length` and a refusal as
+ * `content-filter`; callers that refuse to commit a clipped answer can only
+ * see it this way. Tool calls parsed from the text finish as `tool-calls`
+ * unless the answer was cut off. A missing or unknown reason stays `stop`.
+ */
+export function claudeCliFinishReason(stopReason: string | null | undefined, hasToolCalls: boolean): 'stop' | 'length' | 'content-filter' | 'tool-calls' {
+  if (stopReason === 'max_tokens') return 'length';
+  if (stopReason === 'refusal') return 'content-filter';
+  return hasToolCalls ? 'tool-calls' : 'stop';
+}
+
 export class ClaudeCliLanguageModel implements LanguageModelV2 {
   readonly specificationVersion = 'v2' as const;
   readonly provider = 'claude-cli';
@@ -612,14 +725,47 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
       totalTokens: number | undefined;
       cachedInputTokens: number | undefined;
     };
+    providerMetadata?: SharedV2ProviderMetadata;
     warnings: never[];
   }> {
     const { systemText, userPrompt } = renderPrompt(options.prompt);
     const toolInstructions = buildToolUseInstructions(options.tools);
     const systemPrompt = [systemText, toolInstructions].filter(s => s.length > 0).join('\n');
 
-    const result = await runClaude(systemPrompt, userPrompt, this.modelId, options.abortSignal);
-    const { toolCalls, beforeText, afterText } = extractToolCalls(result.result);
+    const result = await runClaude(systemPrompt, userPrompt, this.modelId, options.abortSignal, options.maxOutputTokens);
+    // The CLI reports Anthropic's separate buckets; LanguageModelV2Usage wants
+    // the TOTAL input with the cache read as a subset (what every SDK provider
+    // reports), so the gateway prices cache tokens once. Cache creation has no
+    // V2 field: it stays inside the total at the input rate.
+    const cachedInputTokens =
+      result.usage?.cache_read_input_tokens !== undefined
+        ? Number(result.usage.cache_read_input_tokens)
+        : undefined;
+    const inputTokens = result.usage?.input_tokens === undefined ? undefined
+      : result.usage.input_tokens + (cachedInputTokens ?? 0) + Number(result.usage.cache_creation_input_tokens ?? 0);
+    const outputTokens = result.usage?.output_tokens;
+    const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
+    const usage = {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens !== undefined && outputTokens !== undefined ? totalTokens : undefined,
+      cachedInputTokens,
+    };
+
+    // #6791: a continued answer is rebuilt from its segments, or refused
+    // before any tool block in its tail can be parsed and dispatched.
+    const thinking = thinkingDisabledBelowFloor(options.maxOutputTokens) ? { thinking: 'disabled_below_floor' } : null;
+    const answer = resolveClaudeCliAnswer(result, options.maxOutputTokens);
+    if (answer.kind === 'unproven') {
+      return {
+        content: [{ type: 'text', text: '' }],
+        finishReason: 'length',
+        usage,
+        providerMetadata: { 'claude-cli': { ...continuationUnprovenMetadata(answer.reason)['claude-cli'], ...thinking } },
+        warnings: [],
+      };
+    }
+    const { toolCalls, beforeText, afterText } = extractToolCalls(answer.text);
 
     const content: LanguageModelV2Content[] = [];
     if (beforeText) content.push({ type: 'text', text: beforeText });
@@ -634,31 +780,14 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
     if (afterText) content.push({ type: 'text', text: afterText });
     if (content.length === 0) {
       // Empty response — still hand the caller a well-formed content array.
-      content.push({ type: 'text', text: result.result ?? '' });
+      content.push({ type: 'text', text: answer.text ?? '' });
     }
-
-    const finishReason = toolCalls.length > 0 ? 'tool-calls' as const : 'stop' as const;
-    const inputTokens = result.usage?.input_tokens;
-    const outputTokens = result.usage?.output_tokens;
-    const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
-    // `cache_creation_input_tokens` is deliberately NOT surfaced here — the AI
-    // SDK's LanguageModelV2Usage has no corresponding field, and folding it in
-    // would need a claude-cli-specific branch in the gateway's usage assembly
-    // (src/core/ai/gateway.ts). Out of scope for this fix.
-    const cachedInputTokens =
-      result.usage?.cache_read_input_tokens !== undefined
-        ? Number(result.usage.cache_read_input_tokens)
-        : undefined;
 
     return {
       content,
-      finishReason,
-      usage: {
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens !== undefined && outputTokens !== undefined ? totalTokens : undefined,
-        cachedInputTokens,
-      },
+      finishReason: claudeCliFinishReason(result.stop_reason, toolCalls.length > 0),
+      usage,
+      ...(thinking ? { providerMetadata: { 'claude-cli': thinking } } : {}),
       warnings: [],
     };
   }

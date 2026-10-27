@@ -5,17 +5,17 @@
  * embed-skip-driven part splitting with overlap.
  */
 import { describe, test, expect } from 'bun:test';
-import { safeLoad } from 'js-yaml';
+import { load } from 'js-yaml';
 
 import {
   escapeAnchorLines,
   MESSAGE_ANCHOR_RE,
-  MESSAGE_CHAR_CAP,
   OVERLAP_MESSAGES,
   PART_TARGET_BYTES,
   redactSession,
   renderSessionParts,
 } from '../src/core/transcripts/render.ts';
+import { DEFAULT_BYTES_WARN } from '../src/core/content-sanity.ts';
 import { parseConversation } from '../src/core/conversation-parser/parse.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, stripFactsFence } from '../src/core/facts-fence.ts';
 import { TAKES_FENCE_BEGIN, parseTakesFence } from '../src/core/takes-fence.ts';
@@ -40,7 +40,7 @@ function splitBody(content: string): string {
 
 function frontmatter(content: string): Record<string, any> {
   const end = content.indexOf('---', 4);
-  return safeLoad(content.slice(4, end)) as Record<string, any>;
+  return load(content.slice(4, end)) as Record<string, any>;
 }
 
 const BASIC = session([
@@ -250,7 +250,7 @@ describe('redaction [fail-closed page lane]', () => {
 
 describe('part splitting [embed-skip is the binding limit]', () => {
   test('long sessions split at message boundaries with overlap; ids unique; base slug stable', () => {
-    const chunk = 'x'.repeat(MESSAGE_CHAR_CAP - 100);
+    const chunk = 'x'.repeat(3_900);
     const many = Array.from({ length: 150 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
       timestamp: `2026-08-02T09:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
@@ -265,9 +265,13 @@ describe('part splitting [embed-skip is the binding limit]', () => {
     const ids = new Set(r.parts.map((p) => p.frontmatterId));
     expect(ids.size).toBe(r.parts.length);
     // Every part body stays under the embed-skip threshold with margin.
+    // Wave B: the part count stays out of hashed content (no `of`, no "of N" in the title).
     for (const p of r.parts) {
       expect(Buffer.byteLength(splitBody(p.content), 'utf8')).toBeLessThan(PART_TARGET_BYTES + 64 * 1024);
-      expect(frontmatter(p.content).transcript_import.of).toBe(r.parts.length);
+      const fm = frontmatter(p.content);
+      expect(fm.transcript_import.of).toBeUndefined();
+      expect(fm.transcript_import).toMatchObject({ part: p.part, part_bytes: PART_TARGET_BYTES });
+      expect(fm.title.endsWith(` (part ${p.part})`)).toBe(true);
     }
     // Overlap: part 2 starts with the tail messages of part 1.
     const p1Body = splitBody(r.parts[0].content);
@@ -275,6 +279,48 @@ describe('part splitting [embed-skip is the binding limit]', () => {
     const p1LastAnchor = p1Body.trimEnd().split('\n\n').at(-OVERLAP_MESSAGES)?.split('\n')[0];
     expect(p1LastAnchor).toBeTruthy();
     expect(p2Body.startsWith(p1LastAnchor as string)).toBe(true);
+  });
+
+  // #5427: PART_TARGET_BYTES must stay under the content-sanity WARN line.
+  // The prior `min(300KB, floor(BLOCK * 0.6))` shape landed at 300KB — six
+  // times DEFAULT_BYTES_WARN (50KB) — so every transcript part between 50KB
+  // and 300KB took the warn branch (`oversize_warn` audit row + stderr
+  // noise pointing at the very splitter that produced the page) on every
+  // re-ingest. The block tier stays untouched (the no-zero-chunk invariant).
+  test('PART_TARGET_BYTES stays under the content-sanity warn line (#5427)', () => {
+    expect(PART_TARGET_BYTES).toBeLessThan(DEFAULT_BYTES_WARN);
+  });
+
+  test('a session split at the new target produces no oversize_warn part (#5427)', async () => {
+    // Each message is ~1KB; 80 messages (~80KB) used to fit one 80KB part
+    // — well under the old 300KB target, but the part then triggered the
+    // 50KB WARN branch on every re-ingest. With the new ~45KB target the
+    // session now splits into ≥2 parts and each part stays below WARN.
+    const chunk = 'x'.repeat(900);
+    const msgs = Array.from({ length: 80 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      timestamp: `2026-08-02T09:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
+      text: `m${i} ${chunk}`,
+    }));
+    const r = renderSessionParts(redactSession(session(msgs), { userPatternsPath: '/nonexistent' }));
+    expect(r.parts.length).toBeGreaterThan(1);
+    for (const p of r.parts) {
+      expect(Buffer.byteLength(splitBody(p.content), 'utf8')).toBeLessThan(DEFAULT_BYTES_WARN);
+    }
+  });
+
+  test('partTargetBytes overrides the part target and defaults to PART_TARGET_BYTES', () => {
+    const msgs = Array.from({ length: 40 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      timestamp: `2026-08-02T09:00:${String(i).padStart(2, '0')}.000Z`,
+      text: `m${i} ${'y'.repeat(900)}`,
+    }));
+    const red = redactSession(session(msgs), { userPatternsPath: '/nonexistent' });
+    expect(renderSessionParts(red).parts.length).toBe(1);
+    expect(renderSessionParts(red, { sourcePath: '', partTargetBytes: PART_TARGET_BYTES }).parts.length).toBe(1);
+    const small = renderSessionParts(red, { sourcePath: '', partTargetBytes: 10_000 });
+    expect(small.parts.length).toBeGreaterThan(3);
+    for (const p of small.parts) expect(Buffer.byteLength(p.body, 'utf8')).toBeLessThan(10_000 + 2_000);
   });
 
   test('sessions with zero timestamps are refused (never fabricate provenance)', () => {

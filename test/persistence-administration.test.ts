@@ -16,6 +16,7 @@ import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
 import { parsePersistenceAdminArgs } from '../src/commands/persistence-admin.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { reviewedWriterIntent } from './helpers/writer-admin-intent.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 let engine: PGLiteEngine;
 let brainId: string;
@@ -24,6 +25,33 @@ beforeAll(async () => {
   [ { brain_id: brainId } ] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
 }, 60_000);
 afterAll(async () => { await disposePersistenceConsumer(engine); await engine.disconnect(); });
+
+/**
+ * #5332: a spawned CLI that never exits (or whose pipes a grandchild holds
+ * open) must FAIL this file with its teardown run, never park it. The whole
+ * drain races one timer; on expiry the child is SIGKILLed and the await
+ * rejects with the argv, so the caller's finally still closes the IPC server
+ * and releases the lock.
+ */
+async function spawnCliBounded(args: string[], cwd: string, wallMs: number) {
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), ...args], {
+    cwd, env: { ...process.env, GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0' }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try { child.kill(9); } catch { /* already exited */ }
+      reject(new Error(`gbrain ${args.join(' ')} did not exit within ${wallMs}ms (#5332)`));
+    }, wallMs);
+  });
+  try {
+    const [stdout, stderr, code] = await Promise.race([
+      Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]),
+      expiry,
+    ]);
+    return { stdout, stderr, code };
+  } finally { clearTimeout(timer); }
+}
 
 async function isolated<T>(run: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'gbrain-admin-test-'));
@@ -145,10 +173,7 @@ describe('local writer administration', () => {
         ['auth', 'local-writer', 'list', '--json'],
         ['sources', 'writer', 'claim', 'default', '--path', dir, '--dry-run', '--json'],
       ]) {
-        const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), ...args], {
-          cwd: dir, env: { ...process.env, GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0' }, stdout: 'pipe', stderr: 'pipe',
-        });
-        const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+        const { stdout, stderr, code } = await spawnCliBounded(args, dir, 60_000);
         expect({ code, stderr }).toMatchObject({ code: 0 });
         const result = JSON.parse(stdout);
         if (args.includes('--probe')) expect(result.native_lock).toMatchObject({ acquired: true, released: true });
@@ -156,6 +181,15 @@ describe('local writer administration', () => {
         else expect(result).toHaveProperty('writers');
       }
     } finally { const closed = once(binding.server, 'close'); binding.close(); await closed; await releaseLock(lock); }
+  }));
+
+  test('the spawned-CLI bound fails with teardown instead of parking (forced 1 ms probe, #5332)', () => isolated(async dir => {
+    const config = { engine: 'pglite' as const, database_path: join(dir, 'db') };
+    mkdirSync(config.database_path);
+    const lock = await acquireLock(config.database_path);
+    try {
+      await expect(spawnCliBounded(['sources', 'writer', 'status', '--json'], dir, 1)).rejects.toThrow(/did not exit within 1ms \(#5332\)/);
+    } finally { await releaseLock(lock); }
   }));
 
   test('CLI parser preserves exact grant/epoch intent and rejects malformed flag combinations', () => {
@@ -168,5 +202,52 @@ describe('local writer administration', () => {
     expect(() => parsePersistenceAdminArgs('writer', ['claim', 'default', '--source', 'other'])).toThrow('Specify the source once');
     expect(() => parsePersistenceAdminArgs('writer', ['status', '--probe=false'])).toThrow('does not accept a value');
     expect(() => parsePersistenceAdminArgs('writer', ['transfer', 'steal', 'default'])).toThrow('prepare or accept');
+  });
+});
+
+describe('administration refusals name their own next step', () => {
+  test('every invalid() and uuid() call site carries a site-specific suggestion', () => {
+    expectFunnelSuggestions('src/core/persistence/administration.ts', 'invalid', 15);
+    expectFunnelSuggestions('src/core/persistence/administration.ts', 'uuid', 4);
+    expectFunnelSuggestions('src/commands/persistence-admin.ts', 'invalid', 8);
+  });
+
+  test('a grant naming an inactive source names it and reads the source list', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_register', { lane: 'stdio', source_ids: ['missing-source'] })));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'list', '--json'], next: 'run' } });
+    expect(env.suggestion).toContain('missing-source');
+  }));
+
+  test('a grant outside its scope names the operations to remove', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_register', { lane: 'stdio', allowed_operations: ['writer_status'] })));
+    expect(env.code).toBe('invalid_params');
+    expect(env.suggestion).toContain('Remove writer_status from --allowed-operations');
+  }));
+
+  test('activation without --confirm-quiesced points at the reviewed status', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'writer_activate', {})));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--json'], next: 'run' } });
+    expect(env.suggestion).toContain('--admin-intent writer_activate');
+  }));
+
+  test('deactivate with a source previews the brain-wide change instead', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'writer_deactivate', { source_id: 'default' })));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'writer', 'deactivate', '--dry-run', '--json'], next: 'run' } });
+  }));
+
+  test('revoke with a malformed id reads the writer list; a non-boolean flag names its CLI form', () => isolated(async () => {
+    const revoke = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_revoke', { id: 'nope' })));
+    expect(revoke).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'], next: 'run' } });
+    const dryRun = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_revoke', { id: 'nope', dry_run: 'yes' })));
+    expect(dryRun.suggestion).toContain('--dry-run');
+  }));
+
+  test('CLI usage refusals name the exact usage and offer the group help', async () => {
+    const duplicate = envelopeFor(await caught(() => parsePersistenceAdminArgs('writer', ['claim', 'default', '--source', 'other'])));
+    expect(duplicate).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'writer', '--help'], next: 'run' } });
+    expect(duplicate.suggestion).toContain('default and other');
+    const unknown = envelopeFor(await caught(() => parsePersistenceAdminArgs('local-writer', ['list', '--force'])));
+    expect(unknown).toMatchObject({ fix: { argv: ['gbrain', 'auth', 'local-writer', '--help'] } });
+    expect(unknown.suggestion).toContain('Remove --force');
   });
 });

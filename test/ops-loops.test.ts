@@ -21,7 +21,9 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { loopsOperations } from '../src/core/ops/loops.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
+import { toAgentError } from '../src/core/agent-output.ts';
 import {
+  closeOpenLoop,
   listOpenLoops,
   loadSuppressions,
   upsertOpenLoop,
@@ -164,6 +166,25 @@ describe('open_loops grouped', () => {
     );
   });
 
+  test('N7-5: as_of pins the ranking clock, so the same rows give the same order at any wall-clock time', async () => {
+    const T = Date.parse('2026-10-01T12:00:00Z');
+    const D = 86_400_000;
+    await upsertOpenLoop(engine, loop({ dedupKey: 'a', loopType: 'commitment_owed_by_me', counterpartyEmail: 'a@example.org', detector: 'llm_extract', dueAt: new Date(T + 8 * D).toISOString() }));
+    await upsertOpenLoop(engine, loop({ dedupKey: 'b', loopType: 'commitment_owed_to_me', counterpartyEmail: 'b@example.org', detector: 'llm_extract' }));
+    await engine.executeRaw(
+      `UPDATE open_loops SET opened_at = CASE dedup_key WHEN 'a' THEN $1::timestamptz ELSE $2::timestamptz END`,
+      [new Date(T).toISOString(), new Date(T - 10 * D).toISOString()],
+    );
+    const order = async (asOf: string) =>
+      ((await openLoopsOp.handler(ctx({ remote: true }), { as_of: asOf })) as GroupsResult & { as_of: string });
+    const atT = await order(new Date(T).toISOString());
+    const later = await order(new Date(T + 2 * D).toISOString());
+    expect(atT.groups.map((g) => g.counterparty)).not.toEqual(later.groups.map((g) => g.counterparty));
+    expect((await order(new Date(T).toISOString())).groups.map((g) => g.counterparty)).toEqual(atT.groups.map((g) => g.counterparty));
+    expect(atT.as_of).toBe(new Date(T).toISOString());
+    await expect(openLoopsOp.handler(ctx(), { as_of: 'yesterday' })).rejects.toThrow('as_of');
+  });
+
   test('limit caps GROUPS (default 3) while count reports total loops', async () => {
     await seedRanked();
     // A fourth counterparty that ranks last.
@@ -252,7 +273,7 @@ describe('open_loops grouped', () => {
 });
 
 describe('open_loops deep links + context (trusted local)', () => {
-  const EMAIL_SLUG = 'emails/2026/08/2026-08-20-plan-review-abcd1234.md';
+  const EMAIL_SLUG = 'emails/2026/08/2026-08-20-plan-review-abcd1234';
 
   test('deep_link regenerates from the page account + hex message-id evidence', async () => {
     // The thread page carries the account in frontmatter; the loop points at
@@ -594,6 +615,155 @@ describe('open_loops per-call scope (source_id / all_sources)', () => {
   });
 });
 
+describe('open_loops single-loop lookup by id (#5870)', () => {
+  interface LookupFlat {
+    loops: Array<{ id: number; status: string; quote?: string; deep_link?: string }>;
+    count: number;
+    redacted: boolean;
+  }
+
+  /**
+   * g1: one aged loop (2019) behind 510 newer fillers, so it sits past the
+   * op's 500-row internal fetch, plus one loop closed as `stale`.
+   * g3: a second google source with one loop the g1-scoped callers must not see.
+   */
+  async function seedLookup(): Promise<{ aged: number; closed: number; foreign: number }> {
+    const googleConfig = { kind: 'google' };
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, last_sync_at) VALUES ($1, $1, $2::jsonb, now()) ON CONFLICT (id) DO NOTHING`,
+      ['g3', googleConfig],
+    );
+    const { id: aged } = await upsertOpenLoop(engine, loop({ threadId: 'cccc000000000001', counterpartyEmail: 'carol@example.com' }));
+    await engine.executeRaw(`UPDATE open_loops SET last_activity_at = '2019-06-01T00:00:00Z' WHERE id = $1`, [aged]);
+    await engine.executeRaw(
+      `INSERT INTO open_loops (source_id, detector, loop_type, dedup_key, summary, counterparty_email, last_activity_at)
+       SELECT 'g1', 'deterministic_thread', 'unanswered_inbound', 'thread:filler-' || n || ':unanswered_inbound',
+              'Filler loop ' || n, 'filler' || n || '@example.com',
+              now() - (n || ' minutes')::interval
+       FROM generate_series(1, 510) AS n`,
+    );
+    const { id: closed } = await upsertOpenLoop(engine, loop({ threadId: 'cccc000000000002', counterpartyEmail: 'frank@example.com' }));
+    await closeOpenLoop(engine, 'g1', closed, 'stale', 'staleness');
+    const { id: foreign } = await upsertOpenLoop(engine, loop({ sourceId: 'g3', threadId: 'dddd000000000003', counterpartyEmail: 'dave@example.com' }));
+    return { aged, closed, foreign };
+  }
+
+  const federated = (allowedSources: string[]) =>
+    ctx({ remote: true, sourceId: undefined, auth: { token: 't', clientId: 'c', scopes: ['read'], allowedSources } });
+  const flat = async (caller: OperationContext, params: Record<string, unknown>) =>
+    (await openLoopsOp.handler(caller, { group_by: 'none', ...params })) as LookupFlat;
+
+  test('trusted: a loop past the 500-row fetch comes back alone, with its quote', async () => {
+    const { aged } = await seedLookup();
+    const res = await flat(ctx(), { id: aged });
+    expect(res.loops.map((l) => l.id)).toEqual([aged]);
+    expect(res.count).toBe(1);
+    expect(res.loops[0].status).toBe('open');
+    expect(res.loops[0].quote).toBe('Can you review the plan?');
+  });
+
+  test('trusted: a closed (stale) loop is found with no status given', async () => {
+    const { closed } = await seedLookup();
+    const res = await flat(ctx(), { id: closed });
+    expect(res.loops.map((l) => [l.id, l.status])).toEqual([[closed, 'stale']]);
+  });
+
+  test('explicit filters still narrow: status, loop_type and counterparty mismatches return nothing', async () => {
+    const { closed, aged } = await seedLookup();
+    expect((await flat(ctx(), { id: closed, status: 'open' })).count).toBe(0);
+    expect((await flat(ctx(), { id: closed, status: 'stale' })).count).toBe(1);
+    expect((await flat(ctx(), { id: aged, loop_type: 'commitment_owed_by_me' })).count).toBe(0);
+    expect((await flat(ctx(), { id: aged, counterparty: 'someone-else@example.com' })).count).toBe(0);
+    expect((await flat(ctx(), { id: aged, counterparty: 'carol@example.com' })).count).toBe(1);
+  });
+
+  test('trusted source_id still bounds the lookup: the g3 loop is not visible from g1', async () => {
+    const { foreign } = await seedLookup();
+    expect((await flat(ctx(), { id: foreign })).count).toBe(0);
+    expect((await flat(ctx(), { id: foreign, source_id: 'g3' })).count).toBe(1);
+  });
+
+  test('deny: a foreign id reads exactly like a missing id for scalar and federated remote callers', async () => {
+    const { foreign } = await seedLookup();
+    const asOf = '2026-04-03T09:00:00.000Z';
+    for (const caller of [ctx({ remote: true, sourceId: 'g1' }), federated(['g1'])]) {
+      for (const group_by of ['none', 'counterparty'] as const) {
+        const foreignRes = await openLoopsOp.handler(caller, { group_by, id: foreign, as_of: asOf });
+        const missingRes = await openLoopsOp.handler(caller, { group_by, id: foreign + 900_000, as_of: asOf });
+        expect(foreignRes).toEqual(missingRes);
+        expect((foreignRes as { count: number }).count).toBe(0);
+      }
+    }
+  });
+
+  test('deny: a narrowed grant cannot reach the id through an out-of-grant source_id', async () => {
+    const { foreign } = await seedLookup();
+    await expect(flat(federated(['g1']), { id: foreign, source_id: 'g3' })).rejects.toMatchObject({ code: 'permission_denied' });
+    await expect(flat(ctx({ remote: true, sourceId: 'g1' }), { id: foreign, source_id: 'g3' })).rejects.toMatchObject({ code: 'permission_denied' });
+  });
+
+  test('deny: an unscoped remote id lookup fails closed', async () => {
+    const { aged } = await seedLookup();
+    await expect(flat(ctx({ remote: true, sourceId: undefined }), { id: aged })).rejects.toMatchObject({ code: 'permission_denied' });
+  });
+
+  test('allow: a grant covering the source finds the loop redacted (no quote, no deep link)', async () => {
+    const { foreign } = await seedLookup();
+    const res = await flat(federated(['g3']), { id: foreign });
+    expect(res.loops.map((l) => l.id)).toEqual([foreign]);
+    expect(res.redacted).toBe(true);
+    expect(JSON.stringify(res)).not.toContain('"quote"');
+    expect(JSON.stringify(res)).not.toContain('"deep_link"');
+  });
+
+  test.each([
+    ['zero', 0],
+    ['negative', -4],
+    ['fractional', 3.25],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['past the safe-integer range', 2 ** 53],
+    ['a numeric string', '12'],
+    ['a boolean', true],
+    ['an object', { id: 1 }],
+  ])('invalid id (%s) is refused with invalid_params before any read', async (_label, bad) => {
+    await expect(openLoopsOp.handler(ctx(), { id: bad })).rejects.toMatchObject({ code: 'invalid_params' });
+  });
+
+  test('the refusal renders the agent contract and does not echo the rejected value', async () => {
+    const thrown = await openLoopsOp.handler(ctx({ remote: true }), { id: 31337.5 }).catch((e: unknown) => e);
+    const env = toAgentError(thrown, { transport: 'stdio', op: 'open_loops', render: {
+      transport: 'stdio', surface: 'full', isCallable: () => true, preapproved: () => false, routing: { brain: 'host', source: 'g1' },
+    } });
+    expect(env).toMatchObject({ code: 'invalid_params', class: 'caller', contract_version: 1 });
+    expect(env.message).toBe('open_loops: id must be a whole number of 1 or more.');
+    expect(env.suggestion).toContain('open_loops {"id": 42}');
+    expect(JSON.stringify(env)).not.toContain('31337');
+  });
+
+  test('negative control: id absent or null keeps the list read and its open default', async () => {
+    const { closed } = await seedLookup();
+    for (const extra of [{}, { id: null }]) {
+      const res = await flat(ctx(), { limit: 500, ...extra });
+      expect(res.loops.length).toBe(500);
+      expect(res.loops.some((l) => l.id === closed)).toBe(false);
+      expect(res.loops.every((l) => l.status === 'open')).toBe(true);
+    }
+  });
+
+  test('grouped: a lookup carries no text digest, while the trusted list keeps it', async () => {
+    const { closed } = await seedLookup();
+    const lookup = (await openLoopsOp.handler(ctx(), { id: closed })) as GroupsResult;
+    expect(lookup.groups.flatMap((g) => g.loops.map((l) => l.id))).toEqual([closed]);
+    expect(lookup.text).toBeUndefined();
+    const missing = (await openLoopsOp.handler(ctx(), { id: closed + 900_000 })) as GroupsResult;
+    expect(missing.count).toBe(0);
+    expect(missing.text).toBeUndefined();
+    const list = (await openLoopsOp.handler(ctx(), {})) as GroupsResult;
+    expect(typeof list.text).toBe('string');
+  });
+});
+
 describe('loops_close', () => {
   test('closes an open loop; the second close reports not_found_or_already_closed', async () => {
     const { id } = await upsertOpenLoop(engine, loop());
@@ -645,7 +815,80 @@ describe('loops_close', () => {
     expect(expired[0].expired_at).not.toBeNull();
   });
 
-  test('remote ctx without a single-source scope → throws permission_denied, loop untouched', async () => {
+  test('remote write-bound caller closes a loop in its write source even under a multi-source read grant (#5446)', async () => {
+    const { id } = await upsertOpenLoop(engine, loop()); // lives in g1 = ctx.sourceId
+    const res = (await loopsCloseOp.handler(
+      ctx({
+        remote: true,
+        auth: {
+          token: 't',
+          clientId: 'c',
+          scopes: ['write'],
+          allowedSources: ['g1', 'g2'], // read federation — write stays g1
+        },
+      }),
+      { id, status: 'done' },
+    )) as { closed: boolean; status: string };
+    expect(res.closed).toBe(true);
+    expect(res.status).toBe('done');
+  });
+
+  test('remote caller cannot close a loop in a read-granted sibling source — identical answer to a missing id (#5446)', async () => {
+    // Write source g1, read grant covers g1+g2, loop lives in g2: the
+    // federated READ grant must never authorize the close+fact-expiry write.
+    // The op does NOT cross-source SELECT — the close runs scoped to the
+    // write source, so a foreign-source loop is indistinguishable from a
+    // missing id and neither its existence nor its source name leaks.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('g2', 'g2', '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+    );
+    const { id } = await upsertOpenLoop(engine, loop({ sourceId: 'g2' }));
+    const boundCtx = ctx({
+      remote: true,
+      auth: {
+        token: 't',
+        clientId: 'c',
+        scopes: ['write'],
+        allowedSources: ['g1', 'g2'], // read covers g2 — write does not
+      },
+    });
+    const foreign = (await loopsCloseOp.handler(boundCtx, { id, status: 'done' })) as {
+      closed: boolean; reason?: string;
+    };
+    const missing = (await loopsCloseOp.handler(boundCtx, { id: 999999, status: 'done' })) as {
+      closed: boolean; reason?: string;
+    };
+    expect(foreign).toEqual(missing); // identical envelope — no existence/source disclosure
+    expect(foreign.closed).toBe(false);
+    expect(JSON.stringify(foreign)).not.toContain('g2');
+    const rows = await listOpenLoops(engine, { sourceIds: ['g2'], status: 'open' });
+    expect(rows).toHaveLength(1); // untouched
+  });
+
+  test('remote source_id param: equal to the write source → closes; anything else → permission_denied (#5446)', async () => {
+    const { id } = await upsertOpenLoop(engine, loop());
+    const boundCtx = ctx({
+      remote: true,
+      auth: { token: 't', clientId: 'c', scopes: ['write'], allowedSources: ['g1', 'g2'] },
+    });
+    const res = (await loopsCloseOp.handler(boundCtx, {
+      id,
+      status: 'done',
+      source_id: 'g1',
+    })) as { closed: boolean };
+    expect(res.closed).toBe(true);
+
+    const { id: id2 } = await upsertOpenLoop(
+      engine,
+      loop({ threadId: '18c2f4a9b3d21e99', dedupKey: 'thread:18c2f4a9b3d21e99:unanswered_inbound' }),
+    );
+    // 'g2' is inside the READ grant — still not the write source.
+    await expect(
+      loopsCloseOp.handler(boundCtx, { id: id2, status: 'done', source_id: 'g2' }),
+    ).rejects.toThrow(/permission_denied|outside the caller's write scope/);
+  });
+
+  test('remote ctx without any scope still throws permission_denied, loop untouched', async () => {
     const { id } = await upsertOpenLoop(engine, loop());
     // Denials are thrown OperationErrors (enumerated error envelope via
     // dispatch), never success-shaped { closed: false } payloads.
@@ -653,16 +896,11 @@ describe('loops_close', () => {
       loopsCloseOp.handler(
         ctx({
           remote: true,
-          auth: {
-            token: 't',
-            clientId: 'c',
-            scopes: ['write'],
-            allowedSources: ['g1', 'g2'], // multi-source grant → no single scope
-          },
+          sourceId: undefined,
         }),
         { id, status: 'done' },
       ),
-    ).rejects.toThrow(/permission_denied|single-source scope/);
+    ).rejects.toThrow(/permission_denied|bound write source/);
     const rows = await listOpenLoops(engine, { sourceIds: ['g1'], status: 'open' });
     expect(rows).toHaveLength(1);
   });
@@ -720,18 +958,23 @@ describe('loops_mute', () => {
     expect(set.senders.size).toBe(0);
   });
 
-  test('remote caller cannot mute outside its granted scope (throws)', async () => {
+  test('federated read grant does not confer write authority: write source mutes, read-only source refuses (#5446)', async () => {
+    // Write-bound to g1, read-federated over other-src: the other-source
+    // mute is a write the read grant cannot authorize, even though the
+    // caller can read that source.
+    const boundCtx = ctx({
+      remote: true,
+      auth: { token: 't', clientId: 'c', scopes: ['write'], allowedSources: ['other-src'] },
+    });
     await expect(
-      loopsMuteOp.handler(
-        ctx({
-          remote: true,
-          auth: { token: 't', clientId: 'c', scopes: ['write'], allowedSources: ['other-src'] },
-        }),
-        { kind: 'sender', value: 'bob@example.com' },
-      ),
-    ).rejects.toThrow(/permission_denied|outside the caller's scope/);
-    const set = await loadSuppressions(engine, 'g1');
-    expect(set.senders.size).toBe(0);
+      loopsMuteOp.handler(boundCtx, { kind: 'sender', value: 'bob@example.com', source_id: 'other-src' }),
+    ).rejects.toThrow(/permission_denied|outside the caller's write scope/);
+    const own = (await loopsMuteOp.handler(boundCtx, {
+      kind: 'sender',
+      value: 'bob@example.com',
+    })) as { muted: boolean };
+    expect(own.muted).toBe(true);
+    expect((await loadSuppressions(engine, 'g1')).senders.has('bob@example.com')).toBe(true);
   });
 
   test('REGRESSION: scalar-scoped remote caller cannot mute a DIFFERENT source via p.source_id', async () => {
@@ -744,7 +987,7 @@ describe('loops_mute', () => {
         ctx({ remote: true, sourceId: 'g1' }),
         { kind: 'sender', value: 'bob@example.com', source_id: 'g2' },
       ),
-    ).rejects.toThrow(/permission_denied|outside the caller's scope/);
+    ).rejects.toThrow(/permission_denied|outside the caller's write scope/);
     const set = await loadSuppressions(engine, 'g2');
     expect(set.senders.size).toBe(0);
     // Within its own scalar scope, the mute still works.
@@ -753,6 +996,36 @@ describe('loops_mute', () => {
       { kind: 'sender', value: 'bob@example.com' },
     )) as { muted: boolean };
     expect(ok.muted).toBe(true);
+  });
+
+  test('omitted source_id on a non-google source → invalid_params, no dead suppression (#5446)', async () => {
+    // The reporter's 4 dead mutes: a remote caller bound to 'workspace'
+    // (no Google content) planted suppression rows the detector could
+    // never consult.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('workspace', 'workspace', '{"kind":"files"}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await expect(
+      loopsMuteOp.handler(
+        ctx({ remote: true, sourceId: 'workspace' }),
+        { kind: 'sender', value: 'bob@example.com' },
+      ),
+    ).rejects.toThrow(/no Google content|invalid_params/);
+    expect((await loadSuppressions(engine, 'workspace')).senders.size).toBe(0);
+  });
+
+  test('explicit source_id naming a non-google source is honored (deliberate scope)', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('workspace', 'workspace', '{"kind":"files"}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    const res = (await loopsMuteOp.handler(
+      ctx({ remote: true, sourceId: 'workspace' }),
+      { kind: 'sender', value: 'bob@example.com', source_id: 'workspace' },
+    )) as { muted: boolean };
+    expect(res.muted).toBe(true);
+    expect((await loadSuppressions(engine, 'workspace')).senders.has('bob@example.com')).toBe(true);
   });
 });
 
@@ -800,18 +1073,23 @@ describe('loops_unmute', () => {
     expect(set.threads.has('shared-value')).toBe(true);
   });
 
-  test('remote caller cannot unmute outside its granted scope (throws)', async () => {
+  test('federated read grant does not confer write authority on unmute either (#5446)', async () => {
+    // Write-bound to g1, read-federated over other-src: lifting g1's mute is
+    // the caller's own write domain; lifting a read-only source's is not.
     await loopsMuteOp.handler(ctx(), { kind: 'sender', value: 'bob@example.com' });
+    const boundCtx = ctx({
+      remote: true,
+      auth: { token: 't', clientId: 'c', scopes: ['write'], allowedSources: ['other-src'] },
+    });
     await expect(
-      loopsUnmuteOp.handler(
-        ctx({
-          remote: true,
-          auth: { token: 't', clientId: 'c', scopes: ['write'], allowedSources: ['other-src'] },
-        }),
-        { kind: 'sender', value: 'bob@example.com' },
-      ),
-    ).rejects.toThrow(/permission_denied|outside the caller's scope/);
-    expect((await loadSuppressions(engine, 'g1')).senders.has('bob@example.com')).toBe(true);
+      loopsUnmuteOp.handler(boundCtx, { kind: 'sender', value: 'bob@example.com', source_id: 'other-src' }),
+    ).rejects.toThrow(/permission_denied|outside the caller's write scope/);
+    const res = (await loopsUnmuteOp.handler(boundCtx, {
+      kind: 'sender',
+      value: 'bob@example.com',
+    })) as { removed: boolean };
+    expect(res.removed).toBe(true);
+    expect((await loadSuppressions(engine, 'g1')).senders.has('bob@example.com')).toBe(false);
   });
 
   test('REGRESSION: scalar-scoped remote caller cannot unmute a DIFFERENT source via p.source_id', async () => {
@@ -829,7 +1107,79 @@ describe('loops_unmute', () => {
         ctx({ remote: true, sourceId: 'g1' }),
         { kind: 'sender', value: 'bob@example.com', source_id: 'g2' },
       ),
-    ).rejects.toThrow(/permission_denied|outside the caller's scope/);
+    ).rejects.toThrow(/permission_denied|outside the caller's write scope/);
     expect((await loadSuppressions(engine, 'g2')).senders.has('bob@example.com')).toBe(true);
+  });
+
+  test('omitted source_id on a non-google source → invalid_params (#5446)', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('workspace', 'workspace', '{"kind":"files"}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await expect(
+      loopsUnmuteOp.handler(
+        ctx({ remote: true, sourceId: 'workspace' }),
+        { kind: 'sender', value: 'bob@example.com' },
+      ),
+    ).rejects.toThrow(/no Google content|invalid_params/);
+  });
+});
+
+// #5871: loops with no counterparty (decision_pending and the like) are not a
+// person. They used to group under 'unknown' and rank first by sheer count.
+describe('open_loops no-counterparty loops and the per-group cap (#5871)', () => {
+  interface CappedResult extends GroupsResult {
+    groups: Array<GroupsResult['groups'][number] & { loops_omitted: number }>;
+    no_counterparty: { loop_count: number; by_type: Record<string, number>; loops: Array<Record<string, unknown>>; loops_omitted: number } | null;
+  }
+  async function seedPile(): Promise<void> {
+    for (let i = 0; i < 9; i++) {
+      await upsertOpenLoop(engine, loop({ dedupKey: `decision:${i}`, loopType: 'decision_pending', counterpartyEmail: null,
+        threadId: null, summary: `Decide on vendor option ${i}`, detector: 'llm_extract' }));
+    }
+    for (let i = 0; i < 8; i++) {
+      await upsertOpenLoop(engine, loop({ threadId: `18c2f4a9b3d21f${String(i).padStart(2, '0')}`, counterpartyEmail: 'bob@example.com',
+        summary: `Reply owed to bob@example.com: thread ${i}` }));
+    }
+    await upsertOpenLoop(engine, loop({ threadId: '18c2f4a9b3d21e99', counterpartyEmail: 'alice@example.com', summary: 'Reply owed to alice@example.com' }));
+  }
+
+  for (const remote of [false, true]) {
+    test(`${remote ? 'remote' : 'trusted'}: no-counterparty loops sit beside the people, never ranked, and each group shows at most 5`, async () => {
+      await seedPile();
+      const r = (await openLoopsOp.handler(ctx({ remote }), {})) as CappedResult;
+      expect(r.groups.map((g) => g.counterparty)).toEqual(['bob@example.com', 'alice@example.com']);
+      expect(r.groups[0]).toMatchObject({ loop_count: 8, loops_omitted: 3 });
+      expect(r.groups[0].loops).toHaveLength(5);
+      expect(r.no_counterparty).toMatchObject({ loop_count: 9, by_type: { decision_pending: 9 }, loops_omitted: 4 });
+      expect(r.no_counterparty!.loops).toHaveLength(5);
+      expect(r.count).toBe(18);
+      if (!remote) {
+        expect(r.text).toContain('2 people are waiting on you');
+        expect(r.text).not.toContain('## unknown');
+        expect(r.text).toContain('+3 more');
+        expect(r.text).toContain('## No counterparty (9 open: decision_pending 9)');
+      }
+    });
+  }
+
+  test('the group cap shows the due-soonest loop first', async () => {
+    for (let i = 0; i < 6; i++) {
+      await upsertOpenLoop(engine, loop({ threadId: `18c2f4a9b3d21a${String(i).padStart(2, '0')}`, summary: `Reply ${i}`,
+        ...(i === 5 ? { dueAt: new Date(Date.now() + 86_400_000).toISOString() } : {}) }));
+    }
+    const r = (await openLoopsOp.handler(ctx({ remote: true }), {})) as CappedResult;
+    expect(r.groups[0].loops[0].summary).toBe('Reply 5');
+    expect(r.groups[0].loops_omitted).toBe(1);
+  });
+
+  test('only no-counterparty loops: no person is waiting, and the digest never says you are clean', async () => {
+    await upsertOpenLoop(engine, loop({ dedupKey: 'decision:solo', loopType: 'decision_pending', counterpartyEmail: null, threadId: null,
+      summary: 'Decide on the offsite venue', detector: 'llm_extract' }));
+    const r = (await openLoopsOp.handler(ctx(), {})) as CappedResult;
+    expect(r.groups).toEqual([]);
+    expect(r.no_counterparty).toMatchObject({ loop_count: 1, loops_omitted: 0 });
+    expect(r.text).not.toContain('You are clean');
+    expect(r.text).toContain('## No counterparty (1 open: decision_pending 1)');
   });
 });

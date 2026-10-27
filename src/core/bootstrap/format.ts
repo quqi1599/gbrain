@@ -247,6 +247,12 @@ export interface HarnessTarget {
   entry?: string;
   /** Hook marker value (hooks targets). */
   marker?: string;
+  /** Absolute gbrain launcher rendered into the hook commands (hooks targets;
+   * absent on receipts written before it was recorded). */
+  launcher?: string;
+  /** Seat label rendered into the hook commands, '' for none (hooks targets;
+   * absent on older receipts). */
+  seat?: string;
   /** Write mechanism note, e.g. 'toml-block' vs 'claude-cli'. */
   mechanism?: string;
   /** One-line failure reason when state === 'failed'. */
@@ -295,6 +301,9 @@ export interface HarnessReceipt {
     previous_ids?: string[];
   };
   targets: HarnessTarget[];
+  /** #6661: a --token run on PGLite wired every target while no serve answered, so nothing verified the
+   * wiring yet. Cleared by the next run whose smoke passes (each run writes a fresh receipt). */
+  verify_pending?: { since: string; reason: 'serve_unreachable' };
 }
 
 export function harnessReceiptPath(gbrainHomeDir: string): string {

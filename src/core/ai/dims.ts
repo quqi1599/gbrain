@@ -21,7 +21,7 @@ import { AIConfigError } from './errors.ts';
  * module's tables and comparisons is already lowercase, making the fold
  * total. Error messages keep the ORIGINAL id so they stay paste-ready.
  */
-function modelMatchKey(id: string): string {
+export function modelMatchKey(id: string): string {
   return id.trim().toLowerCase();
 }
 
@@ -119,6 +119,8 @@ export function isValidPerplexityDim(modelId: string, dims: number): boolean {
 const NVIDIA_EMBEDDING_DIMS: Record<string, number> = {
   'nvidia/nv-embedqa-e5-v5': 1024,
   'nvidia/llama-nemotron-embed-1b-v2': 2048,
+  // PR #5921: 4096 native; 2048/1024 are client-side prefixes (recipe `matryoshka`), never a `dimensions` override.
+  'nvidia/nemotron-3-embed-8b': 4096,
   'nvidia/nv-embed-v1': 4096,
   'nvidia/nv-embedcode-7b-v1': 4096,
 };
@@ -179,8 +181,8 @@ export function dimsProviderOptions(
           const max = maxOpenAITextEmbedding3Dim(modelId)!;
           throw new AIConfigError(
             `OpenAI model "${modelId}" supports embedding_dimensions in 1..${max}, got ${dims}.`,
-            `Set \`embedding_dimensions\` to a value between 1 and ${max} ` +
-            `(\`gbrain config set embedding_dimensions ${Math.min(1024, max)}\` is a common default).`,
+            `Use a width between 1 and ${max} (${Math.min(1024, max)} is a common default). On an existing brain a width change re-embeds; ` +
+            `preview it with \`gbrain migrate embeddings --to openai:${modelId} --dim ${Math.min(1024, max)} --dry-run\` (pages and facts are kept).`,
           );
         }
         return { openai: { dimensions: dims } };
@@ -267,8 +269,8 @@ export function dimsProviderOptions(
           const max = maxOpenAITextEmbedding3Dim(bareModelId)!;
           throw new AIConfigError(
             `OpenAI model "${modelId}" supports embedding_dimensions in 1..${max}, got ${dims}.`,
-            `Set \`embedding_dimensions\` to a value between 1 and ${max} ` +
-            `(\`gbrain config set embedding_dimensions ${Math.min(1024, max)}\` is a common default).`,
+            `Use a width between 1 and ${max} (${Math.min(1024, max)} is a common default). On an existing brain a width change re-embeds; ` +
+            `preview it with \`gbrain migrate embeddings --to <provider>:${modelId} --dim ${Math.min(1024, max)} --dry-run\` (pages and facts are kept).`,
           );
         }
         return { openaiCompatible: { dimensions: dims } };

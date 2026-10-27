@@ -30,8 +30,10 @@ import {
   completeEmbeddingMigration,
   migrationSignature,
   MIGRATION_STATE_KEY,
+  verifySearchRoundTrip,
 } from '../../src/core/embedding-migration.ts';
 import { runSchemaTransition } from '../../src/core/embedding-migration.ts';
+import { annIndexValidity, buildDeferredAnnIndexes } from '../../src/core/embedding-ann-build.ts';
 import type { ChunkInput } from '../../src/core/types.ts';
 
 const RUN = hasDatabase();
@@ -104,7 +106,8 @@ d('embedding migration (live Postgres + pgvector)', () => {
     resetGateway();
     // Restore the shared test DB's column width for subsequent e2e files.
     if (engine && originalDims && (await columnDims()) !== originalDims) {
-      await runSchemaTransition(engine, originalDims);
+      let pending = await runSchemaTransition(engine, originalDims);
+      await buildDeferredAnnIndexes(engine, { targetDims: originalDims, readPending: async () => pending, writePending: async next => { pending = next; }, log: () => {} });
     }
     await teardownDB();
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -202,11 +205,14 @@ d('embedding migration (live Postgres + pgvector)', () => {
     expect(await engine.getConfig('embedding_model')).toBe(toModel);
     expect(await engine.getConfig(MIGRATION_STATE_KEY)).toBeTruthy();
 
-    // HNSW index rebuilt inside the same transaction.
+    // #5088: the HNSW index is NOT rebuilt inside the transition; the marker
+    // records it and the build phase runs after the re-embed.
     const idx = await engine.executeRaw<{ indexname: string }>(
       `SELECT indexname FROM pg_indexes WHERE tablename = 'content_chunks' AND indexname = 'idx_chunks_embedding'`,
     );
-    expect(idx.length).toBe(1);
+    expect(idx.length).toBe(0);
+    expect(JSON.parse((await engine.getConfig(MIGRATION_STATE_KEY))!).deferred_ann_indexes.map((i: { name: string }) => i.name).sort())
+      .toEqual(['idx_chunks_embedding', 'idx_facts_embedding_hnsw', 'idx_query_cache_embedding_hnsw', 'idx_takes_embedding_hnsw']);
 
     // Re-embed through the real pipeline at the new width. NOTE: no
     // resetGateway() here — it would clear the installed fake transport.
@@ -242,7 +248,43 @@ d('embedding migration (live Postgres + pgvector)', () => {
     );
     expect(rows.length).toBe(3);
 
+    let pending = JSON.parse((await engine.getConfig(MIGRATION_STATE_KEY))!).deferred_ann_indexes;
+    const built = await buildDeferredAnnIndexes(engine, { targetDims, readPending: async () => pending, writePending: async next => { pending = next; }, log: () => {} });
+    expect(built.built.sort()).toEqual(['idx_chunks_embedding', 'idx_facts_embedding_hnsw', 'idx_query_cache_embedding_hnsw', 'idx_takes_embedding_hnsw']);
+    for (const name of built.built) expect(await annIndexValidity(engine, name)).toBe(true);
+
     await completeEmbeddingMigration(engine, plan);
     expect(await engine.getConfig(MIGRATION_STATE_KEY)).toBeFalsy();
   }, 120000);
+
+  test('#5334: smoke samples are distinct pages with a bounded title-prefixed query', async () => {
+    const dims = await columnDims();
+    const model = (await engine.getConfig('embedding_model'))!;
+    const vector = `[${new Array(dims).fill(0).map((_, i) => Math.cos(i) * 0.01 + 0.002).join(',')}]`;
+    const queries: string[] = [];
+    __setEmbedTransportForTests(async ({ values }: { values: string[] }) => {
+      queries.push(...values);
+      return { embeddings: values.map(() => new Array(dims).fill(0).map((_, i) => Math.cos(i) * 0.01 + 0.002)), usage: { tokens: values.length * 4 } } as never;
+    });
+    const slugs = ['smoke/page-a', 'smoke/page-b', 'smoke/page-c'];
+    for (const [page, slug] of slugs.entries()) {
+      await engine.putPage(slug, { type: 'note', title: `${slug} ${'title '.repeat(100)}`, compiled_truth: 'Migration smoke evidence.' });
+      const order = page === 2 ? [2, 1, 0, 0, 0, 0] : [0, 1, 2];
+      await installFixtureChunks(engine, slug, order.map((c, chunk_index) => ({ chunk_index, chunk_source: 'compiled_truth', token_count: 200,
+        chunk_text: `${slug} representative ${c} ${'Useful migration evidence. '.repeat((c + 1) * 20)}` })));
+      await engine.setPageEmbeddingSignature(slug, { signature: migrationSignature(model, dims) });
+      await engine.executeRaw(`UPDATE content_chunks SET embedding = $1::vector, model = $2, embedded_at = now(), embedded_text_hash = md5(chunk_text)
+        WHERE page_id = (SELECT id FROM pages WHERE slug = $3 AND source_id = 'default')`, [vector, model, slug]);
+    }
+    const ids = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug LIKE 'smoke/%' ORDER BY slug DESC`);
+    const result = await verifySearchRoundTrip(engine, { samples: 3 });
+    expect(result.samples.map(s => s.page_id)).toEqual(ids.map(r => Number(r.id)));
+    expect(queries).toHaveLength(3);
+    expect(queries.every(q => q.length <= 160 + 1 + 512)).toBe(true);
+    expect(queries.every(q => q.includes('representative 2'))).toBe(true);
+    for (const slug of slugs) expect(queries.some(q => q.startsWith(slug))).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('representative');
+
+    await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'smoke/%'`);
+  }, 60000);
 });

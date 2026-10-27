@@ -27,12 +27,19 @@
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult, PageType, RelationalFanoutRow, PageReadPolicy } from '../types.ts';
 import { createAuditWriter } from '../audit/audit-writer.ts';
-import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
+import { listSources } from '../sources-ops.ts';
+import { ALL_SOURCES } from '../source-id.ts';
+import { resolveEntitySlugWithSource, retiredPageSql } from '../entities/resolve.ts';
 import { buildVisibilityClause } from './sql-ranking.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
-import { sanitizeRemoteBody } from '../remote-body.ts';
+import { boundedProjectedPrefix } from '../page-window/document.ts';
+import { boundedBodyPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
 import { parseRelationalQuery, type RelationalQuery, type RelationVocab } from './relational-intent.ts';
+import { edgeValidityEnabled, type EdgeTemporalOpts } from '../link-validity.ts';
 import { stampEvidence, type EvidenceOpts } from './evidence.ts';
+import { parseRelationalPlan } from './relational-plan.ts';
+import { LINK_SIGNATURES, presentEdgeContext, resolveChainAnchors, runRelationalChain, type ChainAnchor, type ChainDiagnostics, type ChainStatus, type RelationalChainRow } from './relational-chain.ts';
+import { requiresSafeChunks } from './safe-chunks.ts';
 
 export interface RelationalArmOpts extends PageReadPolicy {
   sourceId?: string;
@@ -47,16 +54,33 @@ export interface RelationalArmOpts extends PageReadPolicy {
    * without it a remote relational query leaked private titles + snippets.
    */
   excludePrivate?: boolean;
+  /** Multi-relation questions walk typed hop chains (search.relational_planner). */
+  planner?: boolean;
+  /** Typed one-hop walks also read edges written on the other page (search.relational_orient_onehop). */
+  orientOneHop?: boolean;
   onMeta?: (meta: RelationalArmMeta) => void;
 }
 
 export interface RelationalArmMeta {
   fired: boolean;
-  kind: RelationalQuery['kind'] | null;
+  kind: RelationalQuery['kind'] | 'chain' | null;
   seeds_resolved: number;
   candidates: number;
   errored: boolean;
   duration_ms: number;
+  /** Multi-relation plan outcome, when the planner ran on a 2-3 relation question. */
+  plan?: RelationalPlanMeta;
+}
+
+export interface RelationalPlanMeta {
+  status: ChainStatus | 'unsupported';
+  reason?: string;
+  anchor?: string;
+  anchor_slugs?: string[];
+  hops?: Array<{ link_types: string[]; toward: 'object' | 'subject'; frontier: number; edges: number }>;
+  answers?: number;
+  cap_hit?: ChainDiagnostics['cap_hit'];
+  empty_hop?: number;
 }
 
 interface RelationalFailureEvent {
@@ -80,27 +104,56 @@ function truncate(msg: string, max = 200): string {
   return msg.length <= max ? msg : msg.slice(0, max - 1) + '…';
 }
 
-/** Sources to resolve a seed against. Federated → the set; scalar → [id];
- *  unscoped/__all__ → ['default'] (single-source brains; multi-source
- *  enumeration under __all__ is a v1 limitation). */
-function scopeSources(opts: RelationalArmOpts): string[] {
+/** Sources to resolve a seed against. Federated → the set; scalar → [id].
+ *
+ *  Unscoped (trusted local; the `query` op resolves `__all__` to unscoped for
+ *  local callers) → every non-archived source. The prior `['default']`
+ *  fallback made `--source-id __all__` a shipped-contract bug on multi-source
+ *  brains: the keyword and vector arms spanned every source while this arm
+ *  answered from `default` alone. Cost: one resolver chain per non-archived
+ *  source. Traversal is still WITHIN each seed's source (E2=A) — only seed
+ *  RESOLUTION widens here, never the walk.
+ *
+ *  A literal `__all__` that reaches this arm comes from a caller whose scope
+ *  was NOT resolved by a trusted-local path, so it must stay fail-closed:
+ *  resolve no seeds (the arm no-ops) rather than widen to every source. */
+async function scopeSources(engine: BrainEngine, opts: RelationalArmOpts): Promise<string[]> {
   if (opts.sourceIds && opts.sourceIds.length > 0) return opts.sourceIds;
-  if (opts.sourceId && opts.sourceId !== '__all__') return [opts.sourceId];
-  return ['default'];
+  if (opts.sourceId === ALL_SOURCES) return [];
+  if (opts.sourceId) return [opts.sourceId];
+  const sources = await listSources(engine);
+  return sources.map(s => s.id);
+}
+
+/** Page types a relation's seed may be besides an entity. The entity resolver
+ *  never returns a meeting, so "Who attended <meeting title>?" needs its own
+ *  exact-title tier. */
+function titleSeedTypes(parsed: RelationalQuery): string[] {
+  return parsed.direction === 'in' && parsed.linkTypes?.includes('attended') ? ['meeting', 'event'] : [];
 }
 
 /** Resolve a seed phrase to all in-scope (source_id, slug) pairs that
- *  resolve to a REAL page (confidence gate D3 tier-1: drop fallback_slugify). */
+ *  resolve to a REAL page (confidence gate D3 tier-1: drop fallback_slugify).
+ *  When the entity resolver only slugifies, a live page of one of
+ *  `titleTypes` whose title is exactly the phrase (case-insensitive, unique in
+ *  the source) is the seed. */
 async function resolveSeedScoped(
   engine: BrainEngine,
   sources: string[],
   phrase: string,
   policy: PageReadPolicy,
+  titleTypes: string[] = [],
 ): Promise<Array<{ source_id: string; slug: string }>> {
   const out: Array<{ source_id: string; slug: string }> = [];
   const seen = new Set<string>();
   for (const sid of sources) {
-    const r = await resolveEntitySlugWithSource(engine, sid, phrase);
+    let r = await resolveEntitySlugWithSource(engine, sid, phrase);
+    if (r?.source === 'fallback_slugify' && titleTypes.length) {
+      const titled = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])
+           AND lower(title) = lower($3) AND NOT ${retiredPageSql('pages')} LIMIT 2`, [sid, titleTypes, phrase.trim()]);
+      if (titled.length === 1) r = { slug: titled[0].slug, source: 'exact_page' };
+    }
     if (!r || r.source === 'fallback_slugify') continue;
     const key = `${sid}:${r.slug}`;
     if (seen.has(key)) continue;
@@ -137,7 +190,7 @@ async function hydrate(
     page_id: number; slug: string; source_id: string; title: string; type: string; synopsis: string | null;
   }>(
     `SELECT p.id AS page_id, p.slug, p.source_id, p.title, p.type,
-            p.compiled_truth AS synopsis
+            ${boundedBodyPrefixSql('p')} AS synopsis
      FROM pages p
      JOIN sources s ON s.id = p.source_id
      JOIN unnest($1::text[], $2::text[]) AS refs(source_id, slug)
@@ -145,8 +198,10 @@ async function hydrate(
      WHERE ${filter} ${buildVisibilityClause('p', 's', { excludePrivate: policy.excludePrivate, requireSafeChunks: false })}`,
     params,
   );
+  // Large pages: a bounded, withdrawal-overlaid prefix per row is sanitized, never the whole body.
+  const leads = await overlaidBoundedRows(engine, pageRows.map(pr => ({ slug: pr.slug, source_id: pr.source_id, compiled_truth: pr.synopsis })));
   const byKey = new Map<string, typeof pageRows[number]>();
-  for (const pr of pageRows) byKey.set(`${pr.source_id}:${pr.slug}`, pr);
+  pageRows.forEach((pr, i) => byKey.set(`${pr.source_id}:${pr.slug}`, { ...pr, synopsis: leads[i].compiled_truth }));
 
   const out: SearchResult[] = [];
   for (const r of rows) {
@@ -157,7 +212,7 @@ async function hydrate(
       page_id: pr.page_id,
       title: pr.title,
       type: pr.type as PageType,
-      chunk_text: sanitizeRemoteBody(pr.synopsis ?? r.slug).slice(0, 240),
+      chunk_text: boundedProjectedPrefix(pr.synopsis ?? r.slug).slice(0, 240),
       chunk_source: 'compiled_truth',
       // E1: reinforce the page's REAL canonical chunk; F3: chunkless entity
       // pages key page-level (chunk_id 0 → rrfKey `source:slug:0`, stable and
@@ -171,9 +226,19 @@ async function hydrate(
       relational_seed: seedSlug,
       relational_hop: r.hop,
       relational_path: r.path,
+      relational_path_edges: r.path_edges,
     });
   }
   return out;
+}
+
+/**
+ * Rows that may claim a relational guarantee (pin, page-1 slot): one-hop rows
+ * and chain answers. A chain's intermediate or origin page is evidence, not an
+ * answer, so it never satisfies a guarantee meant for the answer.
+ */
+export function answerRows(list: readonly SearchResult[]): SearchResult[] {
+  return list.filter(r => r.relational === undefined || r.relational.role === 'answer');
 }
 
 /**
@@ -182,7 +247,9 @@ async function hydrate(
  * consumers can audit why a low-fused-score row appears on the first page.
  */
 export interface RelationalEvidenceSlotDecision {
-  action: 'promoted' | 'injected';
+  action: 'promoted' | 'injected' | 'chain_pinned';
+  /** chain_pinned only: how many chain rows were placed at the top of page 1. */
+  count?: number;
   slug: string;
   source_id: string;
   /** promoted only: the 0-based fused rank the row was lifted from. */
@@ -216,7 +283,13 @@ export function ensureRelationalEvidenceSlot(
   limit: number,
   offset: number,
   evidenceOpts?: EvidenceOpts,
+  chainSlots = 0,
 ): { pool: SearchResult[]; decision?: RelationalEvidenceSlotDecision } {
+  if (chainSlots > 0 && offset === 0) {
+    const pinned = pinChainRows(pool, relationalList, Math.min(chainSlots, limit), evidenceOpts);
+    if (pinned) return pinned;
+  }
+  relationalList = answerRows(relationalList);
   if (offset > 0 || limit <= 0 || relationalList.length === 0) return { pool };
   const pageKey = (r: SearchResult) => `${r.source_id ?? 'default'}:${r.slug}`;
   const relKeys = new Set(relationalList.map(pageKey));
@@ -262,6 +335,41 @@ export function ensureRelationalEvidenceSlot(
 }
 
 /**
+ * Chain slots: when a multi-hop chain fired, its rows (answers first, then the
+ * evidence pages of their paths, in arm order) take the top of page 1, up to
+ * `slots`. A chain answer is exact typed evidence for the question while the
+ * lexical rows of a relationship question mostly match names, so the chain
+ * leads; the rest of the pool follows in its own order. Returns null when no
+ * chain fired (the single evidence slot then applies).
+ */
+function pinChainRows(
+  pool: SearchResult[],
+  relationalList: SearchResult[],
+  slots: number,
+  evidenceOpts?: EvidenceOpts,
+): { pool: SearchResult[]; decision: RelationalEvidenceSlotDecision } | null {
+  const chain = relationalList.filter(r => r.relational !== undefined).slice(0, slots);
+  if (chain.length === 0) return null;
+  const pageKey = (r: SearchResult) => `${r.source_id ?? 'default'}:${r.slug}`;
+  const inPool = new Map<string, SearchResult>();
+  for (const r of pool) if (!inPool.has(pageKey(r))) inPool.set(pageKey(r), r);
+  const keys = new Set(chain.map(pageKey));
+  const top = chain.map(r => {
+    const fused = inPool.get(pageKey(r));
+    if (fused) return { ...fused, relational: fused.relational ?? r.relational };
+    const raw = { ...r };
+    stampEvidence([raw], evidenceOpts);
+    return raw;
+  });
+  const lead = pool[0]?.score ?? 0;
+  const ordered = top.map((r, i) => ({ ...r, score: Math.max(r.score, lead) + (top.length - i) * 1e-6 }));
+  return {
+    pool: [...ordered, ...pool.filter(r => !keys.has(pageKey(r)))],
+    decision: { action: 'chain_pinned', slug: chain[0].slug, source_id: chain[0].source_id ?? 'default', count: chain.length },
+  };
+}
+
+/**
  * Build the relational recall arm. Returns an empty list (pure no-op) when the
  * query isn't relational or no seed resolves. Never throws.
  */
@@ -281,18 +389,28 @@ export async function buildRelationalArm(
     return list;
   };
 
+  if (opts.planner) {
+    const planned = await planChain(engine, query, opts, meta);
+    if (planned === 'unsupported') return finish([]);
+    if (planned) return finish(planned);
+  }
+
   const parsed = parseRelationalQuery(query, opts.vocab);
   if (!parsed) return finish([]);
   meta.kind = parsed.kind;
 
   try {
-    const sources = scopeSources(opts);
+    const sources = await scopeSources(engine, opts);
+    const temporal = await edgeValidityEnabled(engine) ? { status: parsed.edgeStatus } : undefined;
     const fanoutOpts = {
+      temporal,
       sourceId: opts.sourceId,
       sourceIds: opts.sourceIds,
       excludePrivate: opts.excludePrivate,
       requireSafeChunks: opts.requireSafeChunks,
       takesHoldersAllowList: opts.takesHoldersAllowList,
+      minTrust: opts.minTrust,
+      suppressFlagged: opts.suppressFlagged,
       linkTypes: parsed.linkTypes,
       direction: parsed.direction,
       depth: opts.depth,
@@ -325,14 +443,18 @@ export async function buildRelationalArm(
     }
 
     // who_rel / who_at / intro: single logical seed (may resolve in N sources).
-    const resolved = await resolveSeedScoped(engine, sources, parsed.seeds[0], opts);
+    const resolved = await resolveSeedScoped(engine, sources, parsed.seeds[0], opts, titleSeedTypes(parsed));
     if (resolved.length === 0) return finish([]);
     meta.seeds_resolved = resolved.length;
     const slugs = Array.from(new Set(resolved.map(r => r.slug)));
-    const rows = await engine.relationalFanout(slugs, {
+    let rows = await engine.relationalFanout(slugs, {
       ...fanoutOpts,
       seedRefs: resolved,
     });
+    if (opts.orientOneHop && parsed.kind === 'who_rel' && parsed.direction !== 'both'
+        && parsed.linkTypes?.length && parsed.linkTypes.every(lt => LINK_SIGNATURES[lt])) {
+      rows = await withOrientedOneHop(engine, rows, resolved, parsed, temporal ? { ...opts, temporal } : opts);
+    }
     const list = await hydrate(engine, rows, resolved[0].slug, opts);
     meta.fired = list.length > 0;
     return finish(list);
@@ -342,4 +464,111 @@ export async function buildRelationalArm(
     meta.errored = true;
     return finish([]);
   }
+}
+
+/**
+ * Multi-relation questions: plan, resolve the anchor, walk the chain, hydrate.
+ * Returns the arm list when the chain found answers; `null` when the planner
+ * does not apply or the chain found nothing (the one-hop path then runs as
+ * before, so a plan can never remove a one-hop answer); `'unsupported'` when
+ * the question chains relations in a way the planner refuses (coordination,
+ * negation, time): no relational arm then, never a one-hop guess.
+ */
+async function planChain(
+  engine: BrainEngine,
+  query: string,
+  opts: RelationalArmOpts,
+  meta: RelationalArmMeta,
+): Promise<SearchResult[] | null | 'unsupported'> {
+  const result = parseRelationalPlan(query);
+  if (result.kind === 'not_applicable') return null;
+  meta.kind = 'chain';
+  if (result.kind === 'unsupported') {
+    meta.plan = { status: 'unsupported', reason: result.reason };
+    return 'unsupported';
+  }
+  const { plan } = result;
+  try {
+    const sources = await scopeSources(engine, opts);
+    const refs = await resolveSeedScoped(engine, sources, plan.anchor, opts);
+    const anchors: ChainAnchor[] = [];
+    for (const ref of refs) anchors.push(...await resolveChainAnchors(engine, ref.slug, { ...opts, sourceIds: undefined, sourceId: ref.source_id }));
+    meta.seeds_resolved = anchors.length;
+    // Live relationships by default; a tense marker on one relation ("formerly advised") sets that hop's status.
+    const temporal = await edgeValidityEnabled(engine) ? { status: 'live' as const } : undefined;
+    const { rows, diagnostics } = await runRelationalChain(engine, anchors, { hops: plan.hops, excludeAnchor: plan.excludeAnchor }, temporal ? { ...opts, temporal } : opts);
+    meta.plan = {
+      status: diagnostics.status, anchor: plan.anchor, anchor_slugs: anchors.map(a => a.slug),
+      hops: diagnostics.per_hop, answers: rows.filter(r => r.role === 'answer').length,
+      ...(diagnostics.cap_hit ? { cap_hit: diagnostics.cap_hit } : {}),
+      ...(diagnostics.empty_hop ? { empty_hop: diagnostics.empty_hop } : {}),
+    };
+    if (rows.length === 0) return null;
+    const list = await hydrateChain(engine, rows, anchors, opts);
+    meta.fired = list.length > 0;
+    return list.length > 0 ? list : null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    failureWriter.log({ error_summary: truncate(msg), query_kind: 'chain' });
+    meta.errored = true;
+    return null;
+  }
+}
+
+/** Answers first (up to the arm limit), then the evidence pages on their retained paths while room remains. */
+async function hydrateChain(
+  engine: BrainEngine,
+  rows: RelationalChainRow[],
+  anchors: ChainAnchor[],
+  opts: RelationalArmOpts,
+): Promise<SearchResult[]> {
+  const limit = Math.max(1, opts.limit ?? 50);
+  const picked = rows.slice(0, limit);
+  const fanoutShaped: RelationalFanoutRow[] = picked.map(r => ({
+    source_id: r.source_id, slug: r.slug, hop: r.hop, edge_count: r.path_count,
+    via_link_types: [...new Set(r.best_path.edges.map(e => e.link_type))], path: r.best_path.nodes,
+    canonical_chunk_id: r.canonical_chunk_id,
+  }));
+  const seed = anchors[0]?.slug ?? '';
+  const hydrated = await hydrate(engine, fanoutShaped, seed, opts);
+  const remote = requiresSafeChunks(opts);
+  const byKey = new Map(picked.map(r => [`${r.source_id}:${r.slug}`, r] as const));
+  return hydrated.map(h => {
+    const r = byKey.get(`${h.source_id}:${h.slug}`)!;
+    return {
+      ...h,
+      relational: {
+        role: r.role, seed, hop: r.hop, path_count: r.path_count,
+        edges: r.best_path.edges.slice(-3).map(e => ({ ...e, context: presentEdgeContext(e.context, remote) })),
+      },
+    };
+  });
+}
+
+/**
+ * Typed one-hop orientation: add the neighbors a relation reaches through
+ * edges written on the other page (a company page saying "founded by X"),
+ * after the stored-direction hop-1 rows and before deeper rows.
+ */
+async function withOrientedOneHop(
+  engine: BrainEngine,
+  rows: RelationalFanoutRow[],
+  seeds: Array<{ source_id: string; slug: string }>,
+  parsed: RelationalQuery,
+  opts: RelationalArmOpts & { temporal?: EdgeTemporalOpts },
+): Promise<RelationalFanoutRow[]> {
+  const anchors: ChainAnchor[] = [];
+  for (const s of seeds) anchors.push(...await resolveChainAnchors(engine, s.slug, { ...opts, sourceIds: undefined, sourceId: s.source_id }));
+  const toward = parsed.direction === 'in' ? 'subject' : 'object';
+  const { rows: chain } = await runRelationalChain(engine, anchors, { hops: [{ linkTypes: parsed.linkTypes!, toward }], excludeAnchor: true }, opts);
+  const have = new Set(rows.map(r => `${r.source_id}:${r.slug}`));
+  const extra: RelationalFanoutRow[] = chain
+    .filter(r => r.role === 'answer' && !have.has(`${r.source_id}:${r.slug}`))
+    .map(r => ({
+      source_id: r.source_id, slug: r.slug, hop: 1, edge_count: 1, via_link_types: [...parsed.linkTypes!],
+      path: r.best_path.nodes, canonical_chunk_id: r.canonical_chunk_id,
+    }));
+  if (extra.length === 0) return rows;
+  const hop1 = rows.filter(r => r.hop <= 1);
+  return [...hop1, ...extra, ...rows.filter(r => r.hop > 1)].slice(0, Math.max(rows.length, opts.limit ?? 50));
 }

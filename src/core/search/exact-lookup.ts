@@ -11,6 +11,12 @@
  *   title probe  — an exact (normalized) full-title equality match, read off
  *                  the ALREADY-FETCHED page-grain title arm (zero extra
  *                  queries on the hot path).
+ *   identifier   — #7163: a query that is one phone number, email, URL, long
+ *                  digit run, hex id or code reads candidate chunks through
+ *                  the full-text index in every common written form and keeps
+ *                  the pages whose chunk text really contains it
+ *                  (search/identifier-query.ts). One keyword read, only for
+ *                  identifier-shaped queries.
  *
  * Supersession-filtered: a page that a `supersedes` link marks stale is
  * NEVER top-injected by this tier (the organic pipeline still surfaces it,
@@ -22,7 +28,7 @@
  * already in the organic set are promoted to rank-1; absent hits inject at
  * top-of-organic + epsilon (the alias-hop injection shape, page_id
  * included). Injected/promoted rows carry:
- *   - exact_lookup: 'slug' | 'title'  (autocut preserve predicate + telemetry)
+ *   - exact_lookup: 'slug' | 'title' | 'identifier'  (autocut preserve predicate + telemetry)
  *   - slug hits: alias_hit=true        (evidence → alias_hit → 'exists')
  *   - title hits: title_match_boost    (evidence → exact_title_match → 'exists')
  * so the T4 evidence/create_safety contract reads them as identity matches
@@ -31,13 +37,18 @@
  * Fail-open everywhere: a probe error returns the organic results unchanged.
  */
 
-import { sanitizeRemoteBody } from '../remote-body.ts';
+import { pageLeadSource, projectedLead } from '../page-window/bounded-lead.ts';
 import { hasReadPolicy } from './read-policy-sql.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult, PageReadPolicy } from '../types.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { isLookupShapedQuery } from './query-intent.ts';
 import { applySupersedeDownrank } from './hybrid.ts';
+import { isExcludedIdentity } from './alias-hop.ts';
+import { identifierKeywordQuery, parseIdentifier, textContainsIdentifier } from './identifier-query.ts';
+
+/** Keyword rows read for an identifier query before the containment check. */
+export const IDENTIFIER_POOL = 30;
 
 /** Cap on tier injections per query (mirrors the alias hop's discipline). */
 export const MAX_EXACT_LOOKUP_INJECT = 3;
@@ -70,6 +81,8 @@ export interface ExactLookupOpts extends PageReadPolicy {
   type?: string;
   types?: string[];
   excludeSlugs?: string[];
+  /** Resolved prefix excludes (see IdentityTierOpts in hybrid.ts). */
+  excludeSlugPrefixes?: string[];
 }
 
 /** Max distinct sources probed for a slug-shaped query on a federated call. */
@@ -92,14 +105,13 @@ export async function structuralExactLookup(
   const seen = new Set<string>();
   // #4480 — mirror the scored arms' shape filters so the tier can never
   // inject a page the caller explicitly filtered out.
-  const excluded = new Set(opts.excludeSlugs ?? []);
   const typeGate = (t: string | undefined | null): boolean => {
     if (opts.type && t !== opts.type) return false;
     if (opts.types && opts.types.length > 0 && (t == null || !opts.types.includes(t))) return false;
     return true;
   };
   const push = (r: SearchResult) => {
-    if (excluded.has(r.slug)) return;
+    if (isExcludedIdentity(r.slug, opts)) return;
     if (!typeGate(r.type)) return;
     const key = `${r.source_id ?? 'default'}::${r.slug}`;
     if (seen.has(key)) return;
@@ -127,7 +139,8 @@ export async function structuralExactLookup(
           title: page.title,
           type: page.type,
           source_id: page.source_id ?? scope ?? 'default',
-          chunk_text: sanitizeRemoteBody(page.compiled_truth ?? '').slice(0, 200),
+          // Large pages: a bounded, withdrawal-overlaid prefix is sanitized, never the whole body.
+          chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? scope ?? 'default', compiled_truth: await pageLeadSource(engine, page) })).slice(0, 200),
           chunk_index: 0,
           chunk_id: 0,
           score: 0, // caller assigns the injection score
@@ -154,6 +167,29 @@ export async function structuralExactLookup(
     }
   }
 
+  // #7163 identifier probe — a phone number, email, URL, long digit run, hex id
+  // or code: candidate chunks through the full-text index in every common
+  // written form, kept only when the chunk text really contains it.
+  const ident = parseIdentifier(q);
+  if (ident) {
+    try {
+      const rows = await engine.searchKeyword(identifierKeywordQuery(ident), {
+        limit: IDENTIFIER_POOL,
+        sourceId: opts.sourceId,
+        sourceIds: opts.sourceIds,
+        excludePrivate: opts.excludePrivate,
+        requireSafeChunks: opts.requireSafeChunks,
+        ...(opts.type ? { type: opts.type as SearchResult['type'] } : {}),
+        ...(opts.types?.length ? { types: opts.types as SearchResult['type'][] } : {}),
+      });
+      for (const r of rows) {
+        if (!r.keyword_relaxed && textContainsIdentifier(r.chunk_text, ident)) push({ ...r, keyword_hit: true, exact_lookup: 'identifier' });
+      }
+    } catch {
+      // fail-open: identifier probe error → no tier hit
+    }
+  }
+
   if (hits.length === 0) return [];
 
   // Supersession filter — a stale (superseded) page never wins the identity
@@ -172,8 +208,10 @@ export async function structuralExactLookup(
  * Promote/inject structural exact-lookup hits into a ranked result set.
  * Mirrors applyAliasHop's contract: hits already present are promoted to the
  * top (score = current-top + epsilon) and stamped; absent hits inject with
- * the same top-of-organic + epsilon score shape. Returns a NEW sorted array;
- * fail-open returns `results` unchanged.
+ * the same top-of-organic + epsilon score shape. Identity rows move to the
+ * front; every other row keeps its input order (never re-sorted by `score`,
+ * which would discard a reranked order). Returns a NEW array; fail-open
+ * returns `results` unchanged.
  */
 export async function applyExactLookupTier(
   engine: BrainEngine,
@@ -187,6 +225,16 @@ export async function applyExactLookupTier(
   } catch {
     return results;
   }
+  return applyExactLookupHits(results, hits);
+}
+
+/**
+ * A54 — the apply half of the tier, for hits `structuralExactLookup` already
+ * returned (the rerank gate looks them up before reranking; this applies them
+ * at the tier's post-rerank position without a second probe). Hit rows are
+ * copied before injection, so one hit list can be applied once per search.
+ */
+export function applyExactLookupHits(results: SearchResult[], hits: readonly SearchResult[]): SearchResult[] {
   if (hits.length === 0) return results;
 
   const out = [...results];
@@ -218,14 +266,13 @@ export async function applyExactLookupTier(
       if (hit.title_match_boost) {
         promoted.title_match_boost = Math.max(promoted.title_match_boost ?? 1.0, hit.title_match_boost);
       }
-      // Splice highest-index-first so earlier removals don't shift later ones.
-      for (let k = matchingIndexes.length - 1; k >= 0; k--) {
-        if (matchingIndexes[k] !== idx) out.splice(matchingIndexes[k], 1);
-      }
+      // Remove every chunk of the page, then put the promoted one first. No
+      // global re-sort: the rest keep their input (reranked) order.
+      for (let k = matchingIndexes.length - 1; k >= 0; k--) out.splice(matchingIndexes[k], 1);
+      out.unshift(promoted);
       continue;
     }
-    out.push({ ...hit, score: injectScore, base_score: injectScore });
+    out.unshift({ ...hit, score: injectScore, base_score: injectScore });
   }
-  out.sort((a, b) => b.score - a.score);
   return out;
 }

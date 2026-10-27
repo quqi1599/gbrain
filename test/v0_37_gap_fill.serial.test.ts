@@ -28,6 +28,7 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
 
 // ─────────────────────────────────────────────────────────────────────
 // Lane A.7 — Chunk-row INSERT model default tracks the gateway-resolved
@@ -313,13 +314,13 @@ describe('Lane D.3 — sync surfaces dim-mismatch recipe at incremental AND firs
     // Structural source-text assertion: pre-fix the incremental catch
     // (line 990) silently swallowed embed errors. Now both catches use
     // an instance check + the same recipe-printing branch.
-    const src = readFileSync(join(__dirname, '..', 'src', 'commands', 'sync.ts'), 'utf-8');
+    const src = surfaceSource('sync');
     const matches = src.match(/e instanceof EmbeddingDimMismatchError/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
   test('source-text grep: tip mentions --no-embed at the hint site', () => {
-    const src = readFileSync(join(__dirname, '..', 'src', 'commands', 'sync.ts'), 'utf-8');
+    const src = surfaceSource('sync');
     expect(src).toContain('--no-embed');
     expect(src).toContain('Tip:');
   });
@@ -479,6 +480,35 @@ describe('reinit-pglite — backup + reinit', () => {
     // One stderr note per defaulted flag.
     expect(err).toContain('--embedding-model defaulted from config: openai:text-embedding-3-large');
     expect(err).toContain('--embedding-dimensions defaulted from config: 1536');
+  });
+
+  test('C2: non-interactive without the bound approval exits 3 with the consent payload and leaves the brain in place', async () => {
+    const brain = join(tmpHome, '.gbrain', 'brain.pglite');
+    const outWrites: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (process.stdout as any).write = (c: string | Uint8Array) => { outWrites.push(String(c)); return true; };
+    const prev = process.env.GBRAIN_NON_INTERACTIVE;
+    process.env.GBRAIN_NON_INTERACTIVE = '1';
+    try {
+      const unauth = await captureRun(['--json']);
+      expect(unauth.exits).toEqual([3]);
+      const payload = JSON.parse(outWrites.join(''));
+      expect(payload).toMatchObject({ code: 'confirmation_required', effects: ['destructive'], actor: 'agent' });
+      expect(payload.risk).toContain(`mv ${brain}.bak ${brain}`);
+      expect(payload.risk).toContain('NOT carried over');
+      expect(payload.fix.argv.slice(-3)).toEqual(['--yes', '--expect', payload.plan_hash]);
+      // A bare --yes retry is not the user's approval of this plan.
+      outWrites.length = 0;
+      const bare = await captureRun(['--yes', '--json']);
+      expect(bare.exits).toEqual([3]);
+      expect(existsSync(join(brain, 'placeholder'))).toBe(true);
+      expect(existsSync(`${brain}.bak`)).toBe(false);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (process.stdout as any).write = origWrite;
+      if (prev === undefined) delete process.env.GBRAIN_NON_INTERACTIVE; else process.env.GBRAIN_NON_INTERACTIVE = prev;
+    }
   });
 
   test('no flags + config missing the values: still fails missing_model / missing_dims', async () => {

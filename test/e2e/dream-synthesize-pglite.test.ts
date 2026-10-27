@@ -221,10 +221,9 @@ describe('E2E synthesize — no API key skip path', () => {
     try {
       await rig.engine.setConfig('dream.synthesize.enabled', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
-      // A 1ms budget + 25 uncached files: the budget check runs after each
-      // per-file cache lookup, and 25 PGLite roundtrips take well over 1ms,
-      // so at least the tail of the corpus is guaranteed to defer (exact
-      // count depends on wall-clock — assert >= 1, not equality).
+      // Advance the triage clock past the 1ms budget on the first cache miss.
+      // Cache lookup speed varies with machine load, so real elapsed time
+      // cannot guarantee that any file is deferred.
       await rig.engine.setConfig('dream.triage.max_ms', '1');
       for (let i = 0; i < 25; i++) {
         writeFileSync(
@@ -233,14 +232,19 @@ describe('E2E synthesize — no API key skip path', () => {
         );
       }
       await withoutAnthropicKey(async () => {
+        let triageClock = 0;
         const result = await runPhaseSynthesize(rig.engine, {
           brainDir: rig.brainDir,
           dryRun: true,
+          triageNow: () => (triageClock += 2),
         });
         expect(result.status).toBe('ok');
+        // The phase must have read the injected clock; otherwise the counts
+        // below would again depend on real elapsed time.
+        expect(triageClock).toBeGreaterThan(0);
         const triage = (result.details as { triage: { deferred: number; degraded: number } }).triage;
-        expect(triage.deferred).toBeGreaterThanOrEqual(1);
-        expect(triage.deferred + triage.degraded).toBe(25);
+        expect(triage.deferred).toBe(25);
+        expect(triage.degraded).toBe(0);
         expect(result.summary).toContain('not yet triaged');
         expect(result.summary).toContain('dream retriage');
       });
@@ -527,6 +531,80 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
   }, 30_000);
 });
 
+describe('E2E synthesize — internal inputs never re-enter discovery (#5413, #5471)', () => {
+  test('a corpus file captured from a claude-cli scratch session is not discovered; an ordinary session is (#5413)', async () => {
+    const rig = await setupRig();
+    const claudeHome = mkdtempSync(join(tmpdir(), 'gbrain-synth-claude-'));
+    const savedClaude = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = claudeHome;
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      const selfId = '11111111-2222-4333-8444-555555555555';
+      const userId = '66666666-7777-4888-9999-000000000000';
+      const { mkdirSync } = require('node:fs') as typeof import('node:fs');
+      mkdirSync(join(claudeHome, 'projects', '-tmp-gbrain-claude-cli-cwd-4242'), { recursive: true });
+      mkdirSync(join(claudeHome, 'projects', '-home-user-app'), { recursive: true });
+      writeFileSync(join(claudeHome, 'projects', '-tmp-gbrain-claude-cli-cwd-4242', `${selfId}.jsonl`), '{"type":"user"}\n');
+      writeFileSync(join(claudeHome, 'projects', '-home-user-app', `${userId}.jsonl`), '{"type":"user"}\n');
+      writeFileSync(join(rig.corpusDir, `${selfId}.txt`), 'User: <turn>extract facts from this page</turn>\n'.repeat(80));
+      writeFileSync(join(rig.corpusDir, `${selfId}.seg-aaaaaaaaaaaa.txt`), 'User: <turn>extract facts from this segment</turn>\n'.repeat(80));
+      writeFileSync(join(rig.corpusDir, `${userId}.txt`), 'User: an ordinary conversation about widgets\n'.repeat(80));
+
+      await withoutAnthropicKey(async () => {
+        const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
+        expect(result.status).toBe('ok');
+        const verdicts = (result.details as { verdicts: Array<{ filePath: string }> }).verdicts;
+        expect(verdicts.map(v => v.filePath)).toEqual([join(rig.corpusDir, `${userId}.txt`)]);
+      });
+    } finally {
+      if (savedClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = savedClaude;
+      rmSync(claudeHome, { recursive: true, force: true });
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('unmarked dream outputs under the brain tree are not discovered; a transcript naming their paths is (#5471)', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.brainDir);
+      await rig.engine.setConfig('dream.patterns.output_slug_prefix', 'notes/patterns');
+      const { mkdirSync, symlinkSync } = require('node:fs') as typeof import('node:fs');
+      const unmarked = (title: string) =>
+        `---\ntitle: ${title}\ntype: note\n---\n\n` + `A synthesized paragraph about ${title}. `.repeat(80);
+      const outputs = [
+        'wiki/personal/reflections/2026-09-01-widget-thinking-abc123.md',
+        'wiki/originals/ideas/2026-09-01-widget-scaling-abc123.md',
+        'notes/patterns/widget-pattern.md',
+        'dream-cycle-summaries/2026-09-01.md',
+      ];
+      for (const rel of outputs) {
+        mkdirSync(join(rig.brainDir, rel, '..'), { recursive: true });
+        writeFileSync(join(rig.brainDir, rel), unmarked(rel));
+      }
+      mkdirSync(join(rig.brainDir, 'transcripts'), { recursive: true });
+      const convo = join(rig.brainDir, 'transcripts', '2026-09-01-convo.txt');
+      writeFileSync(convo,
+        'User: compare wiki/personal/reflections/2026-09-01-widget-thinking-abc123.md with notes/patterns/widget-pattern.md\n' +
+        'Agent: ' + 'meaningful conversation '.repeat(200));
+      // A second corpus root reaching the same outputs through a symlink.
+      symlinkSync(join(rig.brainDir, 'wiki'), join(rig.corpusDir, 'linked-wiki'));
+      await rig.engine.setConfig('dream.synthesize.meeting_transcripts_dir', rig.corpusDir);
+
+      await withoutAnthropicKey(async () => {
+        const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
+        expect(result.status).toBe('ok');
+        const verdicts = (result.details as { verdicts: Array<{ filePath: string }> }).verdicts;
+        expect(verdicts.map(v => v.filePath)).toEqual([convo]);
+      });
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+});
+
 describe('E2E synthesize — verdict cache (Q-2)', () => {
   test('subsequent run with same content reads from dream_verdicts cache', async () => {
     // Two synth runs through the verdict-cache path; default 5s is tight.
@@ -648,12 +726,21 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
     }
   }
 
+  // #6069: a degenerate verdict leaves only a backoff marker (score NULL), never a cached verdict.
+  function expectBackoffMarkerOnly(verdictRow: unknown, kind: string): void {
+    const row = verdictRow as { score: number | null; content_type: string | null; reasons: string[] } | null;
+    expect(row).not.toBeNull();
+    expect(row!.score).toBeNull();
+    expect(row!.content_type).toBe('triage_unreliable');
+    expect(row!.reasons).toEqual([`unreliable:${kind}`, 'attempt:1']);
+  }
+
   test('truncated judge response (stop_reason=length) → no dream_verdicts row + warning', async () => {
     const { verdictRow, stderr } = await runWithStubbedJudge({
       text: '{"scor', // reasoning ate the budget; partial JSON
       stopReason: 'length',
     });
-    expect(verdictRow).toBeNull();
+    expectBackoffMarkerOnly(verdictRow, 'truncated');
     expect(stderr).toMatch(/\[dream\] triage for 2026-05-01-session was truncated/);
     expect(stderr).toMatch(/not caching in dream_verdicts/);
   }, 30_000);
@@ -663,7 +750,7 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
       text: 'not json at all',
       stopReason: 'end',
     });
-    expect(verdictRow).toBeNull();
+    expectBackoffMarkerOnly(verdictRow, 'unparseable');
     expect(stderr).toMatch(/\[dream\] triage for 2026-05-01-session was unparseable/);
     expect(stderr).toMatch(/not caching in dream_verdicts/);
   }, 30_000);
@@ -675,7 +762,7 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
       text: '{"worth_processing": false, "reasons": ["routine ops"]}',
       stopReason: 'end',
     });
-    expect(verdictRow).toBeNull();
+    expectBackoffMarkerOnly(verdictRow, 'unparseable');
     expect(stderr).toMatch(/\[dream\] triage for 2026-05-01-session was unparseable/);
   }, 30_000);
 
@@ -1069,6 +1156,57 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     }
   }, 60_000);
 
+  test('explicit skip: the child completes, keeps its key, and the cooldown stamps so the next cycle does not re-bill (#5590)', async () => {
+    const rig = await setupRig();
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-test-oneshot-e2e';
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      const content = 'User: a verbatim paste of an existing page\n'.repeat(120);
+      const filePath = join(rig.corpusDir, '2026-08-16-paste.txt');
+      writeFileSync(filePath, content);
+      await seedVerdictFor(rig, filePath, content);
+
+      let oneshotCalls = 0;
+      __setChatTransportForTests(async () => {
+        oneshotCalls++;
+        const text = JSON.stringify({ pages: [], skipped: true, skip_reason: 'already captured' });
+        return {
+          text,
+          blocks: [{ type: 'text', text }],
+          stopReason: 'end',
+          usage: { input_tokens: 2000, output_tokens: 40, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-sonnet-4-6',
+          providerId: 'anthropic',
+        } as any;
+      });
+
+      const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
+      expect(result.status).toBe('ok');
+      expect(oneshotCalls).toBe(1);
+      const synthesis = (result.details as { synthesis: Record<string, unknown> }).synthesis;
+      expect(synthesis.dead_jobs).toBe(0);
+
+      const jobs = await rig.engine.executeRaw<{ status: string; idempotency_key: string | null }>(
+        `SELECT status, idempotency_key FROM minion_jobs WHERE name = 'subagent'`);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]!.status).toBe('completed');
+      expect(jobs[0]!.idempotency_key).not.toBeNull();
+      expect(await rig.engine.getConfig('dream.synthesize.last_completion_ts')).not.toBeNull();
+
+      const again = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
+      expect(again.status).toBe('skipped');
+      expect(oneshotCalls).toBe(1);
+    } finally {
+      if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = savedKey;
+      __setChatTransportForTests(null);
+      resetGateway();
+      await rig.cleanup();
+    }
+  }, 60_000);
+
   test('invalid output: same job falls back to the (gateway) agentic loop and completes', async () => {
     const rig = await setupRig();
     const savedKey = process.env.ANTHROPIC_API_KEY;
@@ -1251,6 +1389,65 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       // CDX-4: cooldown NOT stamped — the dead child's idempotency key is
       // released and the next nightly retries it instead of sleeping 12h.
       expect(await rig.engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
+    } finally {
+      if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = savedKey;
+      __setChatTransportForTests(null);
+      resetGateway();
+      await rig.cleanup();
+    }
+  }, 60_000);
+
+  test('a same-day rerun that writes zero pages keeps the existing summary (DB row and file)', async () => {
+    const rig = await setupRig();
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-test-summary-preserve';
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      await rig.engine.setConfig('agent.use_gateway_loop', 'true');
+
+      // The earlier run of the day already published its summary.
+      const date = '2026-08-16';
+      const summarySlug = `dream-cycle-summaries/${date}`;
+      const summaryPath = join(rig.brainDir, `${summarySlug}.md`);
+      await synthTesting.writeSummaryPage(rig.engine, rig.brainDir, summarySlug, date,
+        ['wiki/originals/ideas/earlier-page'], [{ jobId: 1, status: 'completed' }], 'default');
+      const bytes = readFileSync(summaryPath, 'utf8');
+      const before = await rig.engine.readPageSnapshot(summarySlug, { sourceId: 'default' });
+      expect(before).not.toBeNull();
+
+      const content = 'User: the doomed transcript whose writes all fail\n'.repeat(120);
+      const file = join(rig.corpusDir, `${date}-doomed.txt`);
+      writeFileSync(file, content);
+      await seedVerdictFor(rig, file, content);
+
+      // Same doomed shape as the mixed-outcome test: the only child dies.
+      let turns = 0;
+      __setChatTransportForTests(async () => {
+        const mk = (text: string, blocks: unknown[], stop: string) => ({
+          text, blocks, stopReason: stop,
+          usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-sonnet-4-6',
+          providerId: 'anthropic',
+        }) as any;
+        turns++;
+        if (turns === 1) return mk('here you go! pages!', [{ type: 'text', text: 'here you go! pages!' }], 'end');
+        if (turns === 2) {
+          return mk('', [{
+            type: 'tool-call', toolCallId: 'tc1', toolName: 'brain_put_page',
+            input: { slug: 'notallowed/sneaky-page', content: 'nope' },
+          }], 'tool_calls');
+        }
+        return mk('done', [{ type: 'text', text: 'done' }], 'end');
+      });
+
+      const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false, date });
+      expect(result.status).toBe('fail');
+      expect(result.error?.code).toBe('SYNTH_ALL_CHILDREN_DEAD');
+
+      expect(readFileSync(summaryPath, 'utf8')).toBe(bytes);
+      expect(await rig.engine.readPageSnapshot(summarySlug, { sourceId: 'default' })).toEqual(before);
     } finally {
       if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = savedKey;

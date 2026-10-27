@@ -27,8 +27,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { fileURLToPath } from 'node:url';
 
-const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
 
 let home: string;
 let mountsPath: string;
@@ -175,7 +176,7 @@ describe('untrusted callers cannot cross brains', () => {
   });
 
   test('makeContext ignores caller-supplied params.brain (stays on the connected engine)', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     const stub = {
       kind: 'pglite',
       executeRaw: async () => [],

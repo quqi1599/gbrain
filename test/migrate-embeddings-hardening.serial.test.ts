@@ -204,7 +204,7 @@ describe('poisonable skip is dead', () => {
     await engine.setConfig('embedding_dimensions', String(TO_DIMS));
 
     embeddedTexts = [];
-    const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+    const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
     expect(code).toBe(0); // completed — by DOING the work, not by skipping it
     // 2 drain re-embeds + 2 completion smoke-check query embeds (the smoke
     // check is part of the completed path). Vectors restored either way:
@@ -216,7 +216,7 @@ describe('poisonable skip is dead', () => {
 
     // And now that the brain is GENUINELY converged, the verified skip fires.
     embeddedTexts = [];
-    const again = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+    const again = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
     expect(again).toBe(0);
     expect(embeddedTexts.length).toBe(0); // no work, no spend
   }, 60000);
@@ -232,7 +232,7 @@ describe('poisonable skip is dead', () => {
       // env != target: the #1421 refusal, unchanged.
       process.env.GBRAIN_EMBEDDING_MODEL = 'voyage:voyage-4';
       process.env.GBRAIN_EMBEDDING_DIMENSIONS = String(FROM_DIMS);
-      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
       expect(code).toBe(1); // refused_env
     } finally {
       delete process.env.GBRAIN_EMBEDDING_MODEL;
@@ -251,13 +251,13 @@ describe('poisonable skip is dead', () => {
       started_at: '2026-08-01T00:00:00.000Z',
     } satisfies MigrationState));
     try {
-      const refused = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+      const refused = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
       expect(refused).toBe(1);
       // Marker untouched by the refusal.
       const marker = await readMigrationState(engine);
       expect(marker.state?.to_model).toBe('voyage:voyage-4');
 
-      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--retarget']);
+      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--retarget']);
       expect(code).toBe(0);
       // Completed: marker cleared; the abandoned target is in the completion
       // path's history via the superseded chain (marker was rewritten then
@@ -387,7 +387,7 @@ describe('reranker companion (D8)', () => {
       const plan = await resolveRerankerPlan(engine, 'fixture-provider:embedding-v1', 'voyage:voyage-4', undefined);
       expect(plan.exposed).not.toBeNull();
       expect(plan.exposed!.model).toBe(OUTGOING_RERANKER);
-      expect(plan.action).toEqual({ kind: 'switch', to: 'voyage:rerank-2.5' });
+      expect(plan.action).toEqual({ kind: 'switch', to: 'voyage:rerank-3-lite' });
     } finally {
       await engine.unsetConfig('search.reranker.model');
     }
@@ -404,7 +404,7 @@ describe('reranker companion (D8)', () => {
       const plan = await resolveRerankerPlan(engine, 'fixture-provider:embedding-v1', 'openai:text-embedding-3-small', undefined);
       expect(plan.exposed).not.toBeNull();
       expect(plan.action.kind).toBe('none');
-      expect((plan.action as { suggestion: string | null }).suggestion).toBe('voyage:rerank-2.5');
+      expect((plan.action as { suggestion: string | null }).suggestion).toBe('voyage:rerank-3-lite');
     } finally {
       await engine.unsetConfig('search.reranker.model');
     }
@@ -436,7 +436,7 @@ describe('reranker companion (D8)', () => {
       `INSERT INTO query_cache (id, query_text, source_id) VALUES ('qc-rr', 'stale rank order', 'default')
        ON CONFLICT (id) DO NOTHING`,
     );
-    const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--reranker', 'off']);
+    const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--reranker', 'off']);
     expect(code).toBe(0);
     expect(await engine.getConfig('search.reranker.enabled')).toBe('false');
     // Rank order changed ⇒ cache purged in the same transaction.
@@ -472,7 +472,7 @@ describe('reranker companion (D8)', () => {
       return origFetch(url as never, init);
     }) as typeof fetch;
     try {
-      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--reranker', 'voyage:rerank-2.5']);
+      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--reranker', 'voyage:rerank-2.5']);
       expect(code).toBe(0);
       expect(await engine.getConfig('search.reranker.model')).toBe('voyage:rerank-2.5');
       expect(await engine.getConfig('search.reranker.enabled')).toBe('true');
@@ -493,7 +493,7 @@ describe('reranker companion (D8)', () => {
       return origFetch(url as never);
     }) as typeof fetch;
     try {
-      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--reranker', 'voyage:rerank-2.5-lite']);
+      const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--reranker', 'voyage:rerank-2.5-lite']);
       expect(code).toBe(0); // embeddings converged; reranker failure is reported, not fatal
       // Old config kept — NOT flipped to the unreachable model.
       expect(await engine.getConfig('search.reranker.model')).toBe('voyage:rerank-2.5');
@@ -630,7 +630,7 @@ describe('locked branches refuse before any mutation', () => {
       const cap1 = captureStdout();
       let code1: number;
       try {
-        code1 = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--json']);
+        code1 = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--json']);
       } finally {
         cap1.restore();
       }
@@ -654,7 +654,7 @@ describe('locked branches refuse before any mutation', () => {
       const cap2 = captureStdout();
       let code2: number;
       try {
-        code2 = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--json']);
+        code2 = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--json']);
       } finally {
         cap2.restore();
       }
@@ -746,7 +746,7 @@ describe('config-plane hygiene (env leak + env-canonical gates)', () => {
       const cap = captureStdout();
       let code: number;
       try {
-        code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--json']);
+        code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--json']);
       } finally {
         cap.restore();
       }
@@ -832,7 +832,7 @@ describe('marker integrity across surfaces', () => {
     expect(wrongShape.state).toBeNull();
 
     // A fresh migration rewrites the marker clean (v2) instead of crashing.
-    const applied = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--no-embed']);
+    const applied = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--no-embed']);
     expect(applied).toBe(0);
     const clean = await readMigrationState(engine);
     expect(clean.corrupt).toBe(false);
@@ -840,7 +840,7 @@ describe('marker integrity across surfaces', () => {
     expect(clean.state?.to_model).toBe('openai:text-embedding-3-small');
 
     // Complete the run: marker cleared, brain left converged for later suites.
-    const completed = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+    const completed = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
     expect(completed).toBe(0);
     const after = await readMigrationState(engine);
     expect(after.state).toBeNull();
@@ -850,10 +850,10 @@ describe('marker integrity across surfaces', () => {
   test('retarget history: superseded chain + retargeted_at + resume-command flag rendering', async () => {
     // Target A at the SAME width (no schema churn), applied but not drained —
     // leaves a live marker for A.
-    const a = await runMigrate(['--to', 'openai:text-embedding-3-large', '--dim', String(TO_DIMS), '--yes', '--no-embed']);
+    const a = await runMigrate(['--to', 'openai:text-embedding-3-large', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--no-embed']);
     expect(a).toBe(0);
     // Retarget to B: the marker must record A in the superseded history.
-    const b = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--no-embed', '--retarget']);
+    const b = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--no-embed', '--retarget']);
     expect(b).toBe(0);
     const marker = await readMigrationState(engine);
     expect(marker.corrupt).toBe(false);
@@ -868,15 +868,57 @@ describe('marker integrity across surfaces', () => {
 
     // Converge again: resume B for real (drains the invalidated chunks).
     embeddedTexts = [];
-    const done = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+    const done = await runMigrate(['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
     expect(done).toBe(0);
     expect((await readMigrationState(engine)).state).toBeNull();
   }, 60000);
 });
 
 describe('smoke-check miss + heartbeat resilience', () => {
+  test('verifySearchRoundTrip samples one representative chunk per distinct eligible page (#5334)', async () => {
+    const targetModel = 'openai:text-embedding-3-small';
+    const sig = `${targetModel}:${TO_DIMS}`;
+    const titles = ['Distinct canary 0', `Distinct canary 1${' long title'.repeat(100)}`, 'Distinct canary 2'];
+    const vector = '[' + new Array(TO_DIMS).fill(0).map((_, i) => Math.sin(i) * 0.01 + 0.001).join(',') + ']';
+    const seed = async (slug: string, title: string, chunks: string[], signature: string) => {
+      await engine.putPage(slug, { type: 'note', title, compiled_truth: `# ${title}\n\nbody` });
+      await installFixtureChunks(engine, slug, chunks.map((chunk_text, chunk_index) => ({ chunk_index, chunk_text, chunk_source: 'compiled_truth', token_count: 30 })));
+      await engine.setPageEmbeddingSignature(slug, { signature });
+      await engine.executeRaw(`UPDATE content_chunks SET embedding = $1::vector, model = $2, embedded_at = now(), embedded_text_hash = md5(chunk_text)
+        WHERE page_id = (SELECT id FROM pages WHERE slug = $3)`, [vector, targetModel, slug]);
+    };
+    const body = (page: number, chunk: number) =>
+      `${'Recommendation: review this imported evidence. '.repeat(4)}distinct page ${page} chunk ${chunk} ${'More useful context. '.repeat((chunk + 1) * 20)}`;
+    try {
+      await seed('srm-diverse-a', titles[0], [0, 1, 2].map(c => body(0, c)), sig);
+      await seed('srm-diverse-b', titles[1], [0, 1, 2].map(c => body(1, c)), sig);
+      // The newest chunks all belong to one page: the old ORDER BY chunk id
+      // sampled it three times.
+      await seed('srm-diverse-c', titles[2], [2, 1, 0, 0, 0, 0].map(c => body(2, c)), sig);
+      // A newer page in another embedding space is never a sample.
+      await seed('srm-diverse-stale', 'Stale space', [body(9, 2)], 'old:model:1536');
+
+      embeddedTexts = [];
+      const outcome = await verifySearchRoundTrip(engine, { samples: 3 });
+      const ids = Object.fromEntries((await engine.executeRaw<{ slug: string; id: number }>(
+        "SELECT slug, id FROM pages WHERE slug LIKE 'srm-diverse-%'")).map(r => [r.slug, Number(r.id)]));
+      expect(outcome.samples.map(sample => sample.page_id)).toEqual([ids['srm-diverse-c'], ids['srm-diverse-b'], ids['srm-diverse-a']]);
+      expect(embeddedTexts).toHaveLength(3);
+      for (const page of [0, 1, 2]) {
+        expect(embeddedTexts.some(text => text.startsWith(`${titles[page].slice(0, 160)}\n`) && text.includes(`distinct page ${page} chunk 2`))).toBe(true);
+      }
+      expect(embeddedTexts.every(text => text.length <= 160 + 1 + 512)).toBe(true);
+      expect(JSON.stringify(outcome)).not.toContain('distinct page');
+    } finally {
+      await engine.executeRaw(`DELETE FROM content_chunks WHERE page_id IN (SELECT id FROM pages WHERE slug LIKE 'srm-diverse-%')`);
+      await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'srm-diverse-%'`);
+      embeddedTexts = [];
+    }
+  }, 60000);
+
   test('verifySearchRoundTrip reports warn/self_retrieval_miss with content-free samples', async () => {
     const canary = 'sealed-privacy-canary-text';
+    const targetModel = 'openai:text-embedding-3-small';
     try {
       // 11 decoy pages whose stored vectors EQUAL the fake transport's query
       // vector, then the victim LAST (highest chunk id ⇒ it is the sampled
@@ -888,25 +930,29 @@ describe('smoke-check miss + heartbeat resilience', () => {
         await installFixtureChunks(engine, slug, [
           { chunk_index: 0, chunk_text: `decoy chunk ${i}`, chunk_source: 'compiled_truth', token_count: 4 },
         ]);
+        await engine.setPageEmbeddingSignature(slug, { signature: `${targetModel}:${TO_DIMS}` });
       }
       await engine.putPage('srm-victim', { type: 'note', title: 'srm-victim', compiled_truth: '# victim\n\nbody' });
       await installFixtureChunks(engine, 'srm-victim', [
         { chunk_index: 0, chunk_text: canary, chunk_source: 'compiled_truth', token_count: 4 },
       ]);
+      await engine.setPageEmbeddingSignature('srm-victim', { signature: `${targetModel}:${TO_DIMS}` });
 
       // The fake transport's vector for ANY input (installTransport pattern).
       const q = new Array(TO_DIMS).fill(0).map((_, i) => Math.sin(i) * 0.01 + 0.001);
       const far = new Array(TO_DIMS).fill(0);
       far[0] = 1; // near-orthogonal to q (q[0] = 0.001)
       await engine.executeRaw(
-        `UPDATE content_chunks SET embedding = $1::vector
+        `UPDATE content_chunks SET embedding = $1::vector, model = $2,
+          embedded_at = now(), embedded_text_hash = md5(chunk_text)
           WHERE page_id IN (SELECT id FROM pages WHERE slug LIKE 'srm-decoy-%')`,
-        ['[' + q.join(',') + ']'],
+        ['[' + q.join(',') + ']', targetModel],
       );
       await engine.executeRaw(
-        `UPDATE content_chunks SET embedding = $1::vector
+        `UPDATE content_chunks SET embedding = $1::vector, model = $2,
+          embedded_at = now(), embedded_text_hash = md5(chunk_text)
           WHERE page_id IN (SELECT id FROM pages WHERE slug = 'srm-victim')`,
-        ['[' + far.join(',') + ']'],
+        ['[' + far.join(',') + ']', targetModel],
       );
 
       const outcome = await verifySearchRoundTrip(engine, { samples: 1 });
@@ -1008,7 +1054,7 @@ describe('empty-brain migration (plan pin 15)', () => {
       const cap1 = captureStdout();
       let code1: number;
       try {
-        code1 = await runMigrateOn(e2, ['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes']);
+        code1 = await runMigrateOn(e2, ['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1']);
       } finally {
         cap1.restore();
       }
@@ -1037,7 +1083,7 @@ describe('empty-brain migration (plan pin 15)', () => {
       const cap2 = captureStdout();
       let code2: number;
       try {
-        code2 = await runMigrateOn(e2, ['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--json']);
+        code2 = await runMigrateOn(e2, ['--to', 'openai:text-embedding-3-small', '--dim', String(TO_DIMS), '--yes', '--max-cost-usd', '1', '--json']);
       } finally {
         cap2.restore();
       }
@@ -1048,6 +1094,25 @@ describe('empty-brain migration (plan pin 15)', () => {
     } finally {
       await e2.disconnect();
       writeFileConfig('openai:text-embedding-3-small', TO_DIMS);
+    }
+  }, 120000);
+});
+
+describe('concurrent-writer census', () => {
+  test('an unreadable worker registry does not also drop the embed-job count', async () => {
+    const registry = join(tmpHome, '.gbrain', 'workers');
+    rmSync(registry, { recursive: true, force: true });
+    writeFileSync(registry, 'not a directory');
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'embed-backfill', 'default', 'waiting', now(), now())`,
+    );
+    try {
+      const ctx = await planMigrationFlow(engine, { to: 'openai:text-embedding-3-small', dim: TO_DIMS });
+      expect(ctx.concurrentWriters).toEqual({ workers: null, embedJobs: 1 });
+    } finally {
+      await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'embed-backfill'`);
+      rmSync(registry, { force: true });
     }
   }, 120000);
 });

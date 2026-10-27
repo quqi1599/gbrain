@@ -1,20 +1,18 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { LATEST_VERSION, runMigrations, MIGRATIONS, getIdleBlockers, hasPendingMigrations } from '../src/core/migrate.ts';
 import type { IdleBlocker } from '../src/core/migrate.ts';
+import { migrationStatementTimeoutMs } from '../src/core/migration-timeout.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { withColdPglite } from './helpers/with-snapshot.ts';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
 describe('migrate', () => {
   test('LATEST_VERSION is a number >= 1', () => {
     expect(typeof LATEST_VERSION).toBe('number');
     expect(LATEST_VERSION).toBeGreaterThanOrEqual(1);
-  });
-
-  test('runMigrations is exported and callable', async () => {
-    expect(typeof runMigrations).toBe('function');
   });
 
   // Integration tests for actual migration execution require DATABASE_URL
@@ -681,8 +679,7 @@ describe('migrate v14 — pages_updated_at_index (handler-based, engine-aware)',
   });
 
   test('v14 handler source delegates invalid-remnant cleanup to the shared helper (#1178)', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/v014-pages-updated-at-index.ts');
     const v14Start = src.indexOf("name: 'pages_updated_at_index'");
     expect(v14Start).toBeGreaterThan(-1);
     const v14Block = src.slice(v14Start, v14Start + 3000);
@@ -721,8 +718,7 @@ describe('migrate — DROP INDEX CONCURRENTLY invalid-remnant cleanup (#1178, fi
   ];
 
   test('no DO $$ ... EXECUTE .DROP INDEX CONCURRENTLY. shape remains anywhere in migrate.ts', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const src = surfaceSource('migrate');
     // `DO $$ ... END $$` blocks are a normal Postgres idiom used all over this
     // file for unrelated conditional DDL — only the specific combination that
     // EXECUTEs a DROP INDEX CONCURRENTLY string is the #1178 bug shape.
@@ -730,16 +726,14 @@ describe('migrate — DROP INDEX CONCURRENTLY invalid-remnant cleanup (#1178, fi
   });
 
   test('every known invalid-remnant site calls dropInvalidConcurrentIndex(engine, version, indexName)', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const src = surfaceSource('migrate');
     for (const { version, indexName } of KNOWN_SITES) {
       expect(src).toContain(`dropInvalidConcurrentIndex(engine, ${version}, '${indexName}')`);
     }
   });
 
   test('dropInvalidConcurrentIndex helper itself probes pg_index.indisvalid and issues a standalone DROP (no DO block)', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/helpers.ts');
     const helperStart = src.indexOf('async function dropInvalidConcurrentIndex');
     expect(helperStart).toBeGreaterThan(-1);
     const helperBlock = src.slice(helperStart, helperStart + 1200);
@@ -844,8 +838,7 @@ describe('migrate v66 — embed_stale_partial_index (D6)', () => {
   });
 
   test('v66 handler source delegates invalid-remnant cleanup to the shared helper (#1178)', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/v066-embed-stale-partial-index.ts');
     const v66Start = src.indexOf("name: 'embed_stale_partial_index'");
     expect(v66Start).toBeGreaterThan(-1);
     const v66Block = src.slice(v66Start, v66Start + 3000);
@@ -872,8 +865,7 @@ describe('migrate v66 — embed_stale_partial_index (D6)', () => {
   });
 
   test('dropInvalidConcurrentIndex helper itself probes pg_index.indisvalid and issues a standalone DROP (no DO block)', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const src = surfaceFileSource('migrate', 'src/core/schema-migrations/helpers.ts');
     const helperStart = src.indexOf('async function dropInvalidConcurrentIndex');
     expect(helperStart).toBeGreaterThan(-1);
     const helperBlock = src.slice(helperStart, helperStart + 1200);
@@ -903,12 +895,71 @@ describe('migrate runner v66 — partial index materialized on PGLite', () => {
     await engine.disconnect();
   });
 
-  test('v66 created idx_chunks_embedding_null on PGLite via handler branch', async () => {
-    const rows = await (engine as any).db.query(
+  // v225 drops the index again at head (content_chunks_stale_idx is the same
+  // partial index), so the handler branch is exercised directly.
+  test('v66 creates idx_chunks_embedding_null on PGLite via handler branch', async () => {
+    const indexes = async () => (await (engine as any).db.query(
       `SELECT indexname FROM pg_indexes WHERE indexname = 'idx_chunks_embedding_null'`
-    );
-    expect(rows.rows.length).toBe(1);
+    )).rows;
+    expect(await indexes()).toHaveLength(0);
+    await MIGRATIONS.find(m => m.version === 66)!.handler!(engine);
+    expect(await indexes()).toHaveLength(1);
   });
+});
+
+// v225: idx_chunks_embedding_null (v66) and content_chunks_stale_idx (v103)
+// were the same partial btree; v225 drops the v66 copy only while the kept
+// index is valid and identical.
+describe('v225 — drop_duplicate_embedding_null_index', () => {
+  const stale = async (engine: PGLiteEngine) => (await engine.executeRaw<{ indexname: string; indexdef: string }>(
+    `SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'content_chunks'
+      AND indexname IN ('idx_chunks_embedding_null', 'content_chunks_stale_idx') ORDER BY indexname`)).map(r => r.indexname);
+
+  test('a fresh brain keeps only content_chunks_stale_idx, and re-running is a no-op', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx']);
+      await MIGRATIONS.find(m => m.version === 225)!.handler!(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx']);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('a brain at v224 loses the duplicate and keeps the stale index', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      await MIGRATIONS.find(m => m.version === 66)!.handler!(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx', 'idx_chunks_embedding_null']);
+      await engine.setConfig('version', '224');
+      await runMigrations(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx']);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('keeps idx_chunks_embedding_null when content_chunks_stale_idx is missing or defined differently', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const v225 = MIGRATIONS.find(m => m.version === 225)!;
+      await MIGRATIONS.find(m => m.version === 66)!.handler!(engine);
+      await engine.executeRaw(`DROP INDEX content_chunks_stale_idx`);
+      await v225.handler!(engine);
+      expect(await stale(engine)).toEqual(['idx_chunks_embedding_null']);
+      await engine.executeRaw(`CREATE INDEX content_chunks_stale_idx ON content_chunks (page_id) WHERE embedding IS NULL`);
+      await v225.handler!(engine);
+      expect(await stale(engine)).toEqual(['content_chunks_stale_idx', 'idx_chunks_embedding_null']);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1230,7 +1281,7 @@ describe('PR #356 — LATEST_VERSION is max(versions), not array[-1]', () => {
 
     // Guard against regression to array[-1]: the production source must use
     // Math.max, never indexed access to the last element.
-    const src = readFileSync(resolve('src/core/migrate.ts'), 'utf-8');
+    const src = surfaceFileSource('migrate', 'src/core/migrate.ts');
     expect(src).toMatch(/LATEST_VERSION\s*=\s*MIGRATIONS\.length[\s\S]{0,200}Math\.max/);
     expect(src).not.toMatch(/MIGRATIONS\[MIGRATIONS\.length\s*-\s*1\]\.version/);
   });
@@ -1360,7 +1411,7 @@ describe('PR #356 + #363 — session timeouts applied via startup parameters', (
     // PgBouncer-transaction-mode-safe). The setSessionDefaults function is
     // kept as a no-op shim for back-compat with existing call sites.
     const dbSrc = readFileSync(resolve('src/core/db.ts'), 'utf-8');
-    const pgSrc = readFileSync(resolve('src/core/postgres-engine.ts'), 'utf-8');
+    const pgSrc = surfaceSource('postgres-engine');
 
     // Helper still exists for back-compat
     expect(dbSrc).toContain('export async function setSessionDefaults');
@@ -1398,13 +1449,21 @@ describe('PR #356 — non-transactional DDL runs via reserved connection', () =>
     // immediately above. The wrapper calls runMigrationSQL inside its retry
     // body, so it must come BEFORE in the source — which is why a prefix
     // match would catch the wrong function.
-    const source = readFileSync(resolve('src/core/migrate.ts'), 'utf-8');
+    const source = surfaceFileSource('migrate', 'src/core/migrate.ts');
 
     const runFnIdx = source.indexOf('async function runMigrationSQL(');
     expect(runFnIdx).toBeGreaterThan(-1);
     const fnBody = source.slice(runFnIdx, runFnIdx + 2500);
-    expect(fnBody).toContain('withReservedConnection');
-    expect(fnBody).toContain("SET statement_timeout = '600000'");
+    // The else-branch runs through schema-migrations/helpers.ts runMigrationStatement, which a handler's own
+    // statement (v265's VALIDATE CONSTRAINT) shares.
+    expect(fnBody).toContain('await runMigrationStatement(engine, m.version, sql);');
+    const helpers = surfaceFileSource('migrate', 'src/core/schema-migrations/helpers.ts');
+    const helperIdx = helpers.indexOf('export async function runMigrationStatement(');
+    expect(helperIdx).toBeGreaterThan(-1);
+    const helperBody = helpers.slice(helperIdx, helperIdx + 1500);
+    expect(helperBody).toContain('withReservedConnection');
+    expect(helperBody).toContain("SET statement_timeout = '${migrationStatementTimeoutMs()}'");
+    expect(migrationStatementTimeoutMs()).toBe(600_000);
   });
 });
 
@@ -2403,7 +2462,8 @@ describe('v134 — restore_chunks_embedding_null_partial_indexes', () => {
             AND indexname IN ('idx_chunks_embedding_null', 'content_chunks_stale_idx')
           ORDER BY indexname`,
       );
-      expect(rows.map(r => r.indexname)).toEqual(['content_chunks_stale_idx', 'idx_chunks_embedding_null']);
+      // v134 re-creates both; v225 then drops the v66 duplicate of content_chunks_stale_idx.
+      expect(rows.map(r => r.indexname)).toEqual(['content_chunks_stale_idx']);
       for (const r of rows) {
         expect(r.indexdef).toMatch(/WHERE\s+\(?embedding IS NULL\)?/i);
       }

@@ -7,16 +7,43 @@
  *     to no-_meta rather than failing the tool call.
  *   - Cache key is (source_id, session_id, hash(takesHoldersAllowList sorted)).
  *     Visibility-aware: cache entries don't bleed across token tiers.
- *   - 30s TTL per session. Refreshed on extraction event via `bumpCache`.
+ *   - 30s TTL per session. A successful mutating tool call on the engine
+ *     drops that engine's entries (`invalidateHotMemoryForEngine`, called by
+ *     dispatch on every MCP transport), and every hit revalidates the
+ *     source's withdrawal-ledger watermark, so a forget committed by any
+ *     process is never served from the cache.
+ *   - #5575 ENG-11: the key also folds the effective read eligibility (floor
+ *     and activation control), and every hit revalidates the brain's trust
+ *     policy generation (eligibility/generation.ts), read before the rows.
+ *     A tier change, quarantine transition, floor or `trust.%` config change
+ *     or purge in any process makes the next call rebuild. When the
+ *     generation cannot be read, or the rebuild fails, nothing is delivered;
+ *     a cached payload is never served in its place.
+ *   - Facts are read through the 'hot_memory' proactive eligibility (floor,
+ *     quarantined pages, needs_rederive in SQL; activation control by
+ *     eligibility/activation.ts after ranking), and each carries its
+ *     `trust_tier` and `origin`. The payload's `suppressed` field counts what
+ *     activation control withheld, never its content (DX-10).
  *   - Cap at top-K facts per response so the injection stays lean.
+ *   - A session with no facts of its own falls back to the source's newest
+ *     24h facts unless the caller passes `sessionOnly` (the IPC handlers do
+ *     when `context.hot_memory.session_only` is on); the flag is part of the
+ *     cache key, so the two answers never share an entry.
  *
  * Both stdio and HTTP MCP transports pass this hook into dispatchToolCall
  * so the felt-memory feature works on every transport.
  */
 
 import type { OperationContext } from './../operations.ts';
-import type { FactRow } from './../engine.ts';
+import type { BrainEngine, FactRow } from './../engine.ts';
 import { effectiveConfidence } from './decay.ts';
+import { collapseHotFacts } from './capture-dedup.ts';
+import { proactiveEligibility } from '../eligibility/registry.ts';
+import { partitionForActivation, suppressionSummary } from '../eligibility/activation.ts';
+import { trustFields } from '../eligibility/labels.ts';
+import { eligibilityCacheField, readTrustGeneration } from '../eligibility/generation.ts';
+import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { isConfigTruthy } from '../config.ts';
 
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_TOP_K = 10;
@@ -31,12 +58,47 @@ const DEFAULT_TOP_K = 10;
  */
 export const HOT_MEMORY_CACHE_MAX_ENTRIES = 1000;
 
+/** DB-plane, default false: hot memory never falls back to other sessions' facts. */
+export const HOT_MEMORY_SESSION_ONLY_KEY = 'context.hot_memory.session_only';
+
+/** The serve-side reading of `context.hot_memory.session_only`; an unreadable value keeps the default (false). */
+export async function readHotMemorySessionOnly(engine: Pick<BrainEngine, 'getConfig'>): Promise<boolean> {
+  return isConfigTruthy(await engine.getConfig(HOT_MEMORY_SESSION_ONLY_KEY).catch(() => null));
+}
+
 interface CacheEntry {
   expiresAt: number;
   payload: Record<string, unknown> | undefined;
+  withdrawals?: string;
+  /** The trust policy generation the payload was built under (ENG-11). */
+  trustGeneration?: string;
 }
 
 const _cache = new Map<string, CacheEntry>();
+const _generations = new WeakMap<object, number>();
+
+/**
+ * Drop every cached payload built from `engine` and bump its generation, so
+ * a build that read the database before the write cannot store its stale
+ * result afterwards.
+ */
+export function invalidateHotMemoryForEngine(engine: object): void {
+  _generations.set(engine, (_generations.get(engine) ?? 0) + 1);
+  const key = ENGINE_KEYS.get(engine);
+  if (!key) return;
+  for (const k of _cache.keys()) if (k.split('::')[0] === key) _cache.delete(k);
+}
+
+/**
+ * Changes whenever a withdrawal is recorded for the source, by any process.
+ * Read-only embedder engines without raw SQL fall back to the TTL alone.
+ */
+async function withdrawalWatermark(engine: OperationContext['engine'], sourceId: string): Promise<string> {
+  if (typeof engine.executeRaw !== 'function') return '';
+  const [row] = await engine.executeRaw<{ n: number; at: string | null }>(
+    'SELECT count(*)::int AS n, max(withdrawn_at)::text AS at FROM fact_withdrawals WHERE source_id = $1', [sourceId]);
+  return `${row?.n ?? 0}:${row?.at ?? ''}`;
+}
 
 /** Bounded set: evict the oldest-expiry entry when inserting at capacity. */
 function cacheSet(key: string, entry: CacheEntry): void {
@@ -65,7 +127,7 @@ function cacheSet(key: string, entry: CacheEntry): void {
 export async function getBrainHotMemoryMeta(
   name: string,
   ctx: OperationContext,
-  opts: { topK?: number; ttlMs?: number } = {},
+  opts: { topK?: number; ttlMs?: number; sessionOnly?: boolean } = {},
 ): Promise<Record<string, unknown> | undefined> {
   // Don't inject on tool calls that themselves manipulate hot memory —
   // the agent doesn't need the brain's hot memory wrapped around its own
@@ -87,7 +149,10 @@ export async function getBrainHotMemoryMeta(
   // private included) warms the cache and a later remote/world-only call with
   // the same source+session+allowList is SERVED the private payload — a
   // cross-tier leak through the cache, not through the query.
-  const tier = ctx.remote === false ? 'all' : 'world';
+  // The operator opt-out (search.remote_private_pages) changes what a world
+  // read returns, so it is part of the tier too.
+  const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+  const tier = ctx.remote === false ? 'all' : excludePrivate ? 'world' : 'world+private-pages';
   // encodeCacheField (F5): source_id / session_id are caller-controlled and
   // may contain the '::' delimiter; percent-encode ':' so bumpHotMemoryCache's
   // split('::') can never mis-slice a component.
@@ -96,51 +161,93 @@ export async function getBrainHotMemoryMeta(
   // the same source id / tier / session must never share hot-memory payloads
   // — a cached entry from brain A served to brain B's caller is a cross-brain
   // fact leak through the cache, not through any query.
-  const cacheKey = `${engineCacheField(ctx.engine)}::${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}`;
-
   const ttl = Math.max(1000, opts.ttlMs ?? DEFAULT_TTL_MS);
+  const sessionOnly = opts.sessionOnly === true;
   const topK = Math.max(1, Math.min(opts.topK ?? DEFAULT_TOP_K, 25));
+
+  // The watermark and the trust generation are read before the rows, so a
+  // build that raced a forget or a trust transition stores the older value
+  // and the next hit rebuilds. The eligibility is read after the generation:
+  // a `trust.%` config change bumps it.
+  // The two are independent, so they are sent together (one round trip).
+  const generation = _generations.get(ctx.engine) ?? 0;
+  const withdrawalsRead = withdrawalWatermark(ctx.engine, sourceId);
+  const trustGenerationRead = readTrustGeneration(ctx.engine);
+  trustGenerationRead.catch(() => {});
+  const withdrawals = await withdrawalsRead;
+  let trustGeneration: string;
+  let policy: Awaited<ReturnType<typeof proactiveEligibility>>;
+  try {
+    trustGeneration = await trustGenerationRead;
+    policy = await proactiveEligibility(ctx, 'hot_memory');
+  } catch {
+    return undefined;
+  }
+  // The effective eligibility is part of the key: two connections with
+  // different floors never share an entry.
+  const cacheKey = `${engineCacheField(ctx.engine)}::${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}::${encodeCacheField(eligibilityCacheField(policy))}::${sessionOnly ? 'session-only' : 'fallback'}`;
 
   // Cache hit?
   const cached = _cache.get(cacheKey);
   if (cached) {
-    if (cached.expiresAt > Date.now()) return cached.payload;
-    // Expired: evict BEFORE the rebuild. If the rebuild below throws (the
-    // caller's try/catch absorbs it), the dead entry must not linger — with
-    // remote-influencable keys, lingering corpses defeat the size bound.
+    if (cached.expiresAt > Date.now() && cached.withdrawals === withdrawals && cached.trustGeneration === trustGeneration) return cached.payload;
+    // Expired or withdrawn since: evict BEFORE the rebuild. If the rebuild
+    // below throws (the caller's try/catch absorbs it), the dead entry must
+    // not linger — with remote-influencable keys, lingering corpses defeat
+    // the size bound.
     _cache.delete(cacheKey);
   }
+  const store = (entry: CacheEntry) => {
+    if ((_generations.get(ctx.engine) ?? 0) === generation) cacheSet(cacheKey, { ...entry, withdrawals, trustGeneration });
+  };
 
   // Build a fresh payload. Visibility tier: remote → world-only;
   // local → all rows.
   const visibility = ctx.remote === false ? undefined : ['world'] as ('world' | 'private')[];
 
-  let rows: FactRow[] = [];
+  // Floor, quarantined pages and needs_rederive apply in SQL; activation
+  // control runs after ranking so the withheld count can be reported.
+  const eligibility = { ...policy, suppressFlagged: false };
+
+  // #5888 V2: over-fetch so collapsing duplicates still fills topK.
+  let fetched: FactRow[] = [];
   if (sessionId) {
-    rows = await ctx.engine.listFactsBySession(sourceId, sessionId, {
-      activeOnly: true, limit: topK, visibility,
+    fetched = await ctx.engine.listFactsBySession(sourceId, sessionId, {
+      activeOnly: true, limit: topK * 3, visibility, excludePrivate, fingerprint: true, eligibility,
     });
   }
-  // If no session-scoped rows, fall back to recent across the source.
-  if (rows.length === 0) {
-    rows = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
-      activeOnly: true, limit: topK, visibility,
+  // If no session-scoped rows, fall back to recent across the source, unless
+  // the caller asked for this session's facts only.
+  if (fetched.length === 0 && !sessionOnly) {
+    fetched = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
+      activeOnly: true, limit: topK * 3, visibility, excludePrivate, fingerprint: true, eligibility,
     });
   }
-  if (rows.length === 0) {
-    cacheSet(cacheKey, { expiresAt: Date.now() + ttl, payload: undefined });
+  if (fetched.length === 0) {
+    store({ expiresAt: Date.now() + ttl, payload: undefined });
     return undefined;
   }
 
-  // Sort by effective confidence (decayed) before truncating.
+  // One representative per (fingerprint, entity) group, then sort by
+  // effective confidence (decayed) before truncating.
+  const collapsed = await collapseHotFacts(ctx.engine, sourceId, fetched);
   const now = new Date();
-  rows.sort((a, b) => effectiveConfidence(b, now) - effectiveConfidence(a, now));
-  rows = rows.slice(0, topK);
+  collapsed.sort((a, b) => effectiveConfidence(b, now) - effectiveConfidence(a, now));
+  const { kept, withheld } = await partitionForActivation(ctx.engine, collapsed, r => ({ table: 'facts', id: r.id }), policy);
+  const rows = kept.slice(0, topK).map(k => k.item);
+  // Under trust.agent_activation=allow (the default) a flagged fact stays in the block, labeled unconfirmed.
+  const unconfirmed = new Set(kept.filter(k => k.unconfirmed).map(k => k.item.id));
+  const suppressed = suppressionSummary(withheld);
+  if (rows.length === 0 && !suppressed) {
+    store({ expiresAt: Date.now() + ttl, payload: undefined });
+    return undefined;
+  }
 
   const payload = {
     brain_hot_memory: {
       source_id: sourceId,
       session_id: sessionId,
+      ...(suppressed ? { suppressed } : {}),
       facts: rows.map(r => ({
         id: r.id,
         fact: r.fact,
@@ -149,6 +256,7 @@ export async function getBrainHotMemoryMeta(
         // weight HIGH-tier facts in their context budget.
         notability: r.notability,
         entity_slug: r.entity_slug,
+        ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}),
         valid_from: r.valid_from.toISOString(),
         // v0.45.7 ambient recall: recording time, so delta's "new facts since my
         // last wake" filters on WHEN the fact was learned, not its semantic
@@ -158,6 +266,9 @@ export async function getBrainHotMemoryMeta(
         // in) rides the pack/delta projections instead of being recall-only.
         context: r.context ?? null,
         confidence: Number(effectiveConfidence(r, now).toFixed(3)),
+        ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
+        ...trustFields(r.trust_tier, r.write_origin),
+        ...(unconfirmed.has(r.id) ? { unconfirmed: true as const } : {}),
       })),
     },
   };
@@ -171,7 +282,7 @@ export async function getBrainHotMemoryMeta(
     const vu = r.valid_until?.getTime();
     if (vu !== undefined && Number.isFinite(vu) && vu < expiresAt) expiresAt = vu;
   }
-  cacheSet(cacheKey, { expiresAt, payload });
+  store({ expiresAt, payload });
   return payload;
 }
 
@@ -179,7 +290,7 @@ export async function getBrainHotMemoryMeta(
 export function bumpHotMemoryCache(sourceId: string, sessionId: string | null): void {
   // Walk the cache and prune any entry matching this source+session
   // regardless of visibility tier, allow-list hash, OR engine — key layout is
-  // engine::encField(source)::tier::encField(session)::allowHash. Pruning
+  // engine::encField(source)::tier::encField(session)::allowHash::eligibility::scope. Pruning
   // across engines is deliberate over-invalidation: a bump is a freshness
   // signal and a stale-drop on a sibling engine costs one rebuild, never a
   // leak. Components are ':'-encoded, so split('::') slices cleanly even

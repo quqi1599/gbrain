@@ -13,6 +13,7 @@ import { loadConfig } from '../core/config.ts';
 import { AIConfigError, AITransientError } from '../core/ai/errors.ts';
 import { lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
 import type { Recipe } from '../core/ai/types.ts';
+import { FAILED_EXIT_CODE } from '../core/exit-codes.ts';
 
 const SCHEMA_VERSION = 1;
 
@@ -44,6 +45,7 @@ function configureFromEnv(): void {
 }
 
 export function envReady(recipe: Recipe, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (recipe.authPresent) return recipe.authPresent(env);
   const required = recipe.auth_env?.required ?? [];
   if (required.length === 0) return true; // e.g. local Ollama
   return required.every(k => !!env[k]);
@@ -98,8 +100,8 @@ export function formatRecipeTable(recipes: Recipe[], env: NodeJS.ProcessEnv = pr
   // in test/providers.test.ts. Auto-widening keeps the contract — every row's
   // id is followed by at least one space — without per-recipe column tuning.
   const idCol = Math.max(14, ...recipes.map(r => r.id.length + 1));
-  const totalWidth = idCol + 18 + 8 + 8 + 8 + 16; // tier+embed+expand+chat+status
-  rows.push('PROVIDER'.padEnd(idCol) + 'TIER'.padEnd(18) + 'EMBED'.padEnd(8) + 'EXPAND'.padEnd(8) + 'CHAT'.padEnd(8) + 'STATUS');
+  const totalWidth = idCol + 18 + 8 + 8 + 8 + 8 + 8 + 16; // tier+embed+expand+chat+rerank+decide+status
+  rows.push('PROVIDER'.padEnd(idCol) + 'TIER'.padEnd(18) + 'EMBED'.padEnd(8) + 'EXPAND'.padEnd(8) + 'CHAT'.padEnd(8) + 'RERANK'.padEnd(8) + 'DECIDE'.padEnd(8) + 'STATUS');
   rows.push('-'.repeat(totalWidth));
   for (const r of recipes) {
     const hasEmbed = !!r.touchpoints.embedding && (r.touchpoints.embedding.models.length > 0);
@@ -113,6 +115,8 @@ export function formatRecipeTable(recipes: Recipe[], env: NodeJS.ProcessEnv = pr
       (hasEmbed ? 'yes' : '—').padEnd(8) +
       (hasExpand ? 'yes' : '—').padEnd(8) +
       (hasChat ? 'yes' : '—').padEnd(8) +
+      (r.touchpoints.reranker ? 'yes' : '—').padEnd(8) +
+      (r.touchpoints.decide ? 'yes' : '—').padEnd(8) +
       status,
     );
   }
@@ -269,6 +273,7 @@ async function runTest(args: string[]): Promise<void> {
       const result = await gwChat({
         messages: [{ role: 'user', content: 'Reply with just the word: pong' }],
         maxTokens: 16,
+        allowFallback: false,
       });
       const ms = Date.now() - start;
       const preview = (result.text || '<empty>').replace(/\s+/g, ' ').slice(0, 80);
@@ -283,8 +288,8 @@ async function runTest(args: string[]): Promise<void> {
       process.exit(2);
     } else if (e instanceof AITransientError) {
       console.error(`  ✗ transient error (${ms}ms): ${e.message}`);
-      console.error(`    Retry after a moment.`);
-      process.exit(3);
+      console.error(`    Retry after a moment (retryable).`);
+      process.exit(FAILED_EXIT_CODE);
     } else {
       console.error(`  ✗ unknown error (${ms}ms): ${e instanceof Error ? e.message : e}`);
       process.exit(4);
@@ -440,7 +445,7 @@ function prosFor(r: Recipe, touchpoint: TouchpointFilter): string[] {
     if (r.id === 'anthropic') out.push('Default subagent driver', 'Prompt-cache support', 'Strong tool calling');
     else if (r.id === 'openai') out.push('Strong tool calling', 'Wide adapter support');
     else if (r.id === 'google') out.push('1M context', 'Cheap');
-    else if (r.id === 'deepseek') out.push('25-40x cheaper than Anthropic', 'Strong reasoning');
+    else if (r.id === 'deepseek') out.push('About 7-17x cheaper than Anthropic Sonnet 5.5 to Opus 5.5 at peak rates', 'Strong reasoning');
     else if (r.id === 'groq') out.push('500 tok/s inference', 'Cheap fallback');
     else if (r.id === 'together') out.push('Open-weights house', 'Llama / Qwen / Mixtral');
     return out;
@@ -469,7 +474,7 @@ function pickRecommended(options: ProviderOption[], env: Record<string, boolean>
   const embOpts = options.filter(o => o.touchpoint === 'embedding');
   if (env.VOYAGE_API_KEY) {
     const voyage = embOpts.find(o => o.id.startsWith('voyage:'));
-    if (voyage) return { id: voyage.id, reason: 'VOYAGE_API_KEY set — the default: voyage-4 at 1024 dims; the same key powers the rerank-2.5 reranker and the multimodal model.' };
+    if (voyage) return { id: voyage.id, reason: 'VOYAGE_API_KEY set — the default: voyage-4 at 1024 dims; the same key powers the rerank-3-lite reranker and the multimodal model.' };
   }
   if (env.OPENAI_API_KEY) {
     const openai = embOpts.find(o => o.id.startsWith('openai:'));

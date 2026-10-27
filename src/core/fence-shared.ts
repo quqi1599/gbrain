@@ -28,8 +28,9 @@
  * whitespace trimmed, with the outer pipes already stripped.
  *
  * Escaped pipes (`\|`) stay inside their cell and are decoded back to `|`.
- * Other backslashes are preserved verbatim so existing fence text such as
- * Windows paths remains byte-stable across a render/parse cycle.
+ * After cell boundaries are found, `<br>` (also `<br/>` and `<br />`, case
+ * insensitive) decodes to `\n`. A literal `<br>` in a claim therefore reads
+ * back as a newline. Other backslashes are preserved verbatim.
  */
 export function parseRowCells(line: string): string[] | null {
   const trimmed = line.trim();
@@ -50,7 +51,46 @@ export function parseRowCells(line: string): string[] | null {
     }
   }
   cells.push(cell.trim());
-  return cells;
+  return cells.map(decodeFenceCell);
+}
+
+/**
+ * The cell-content decoder `parseRowCells` applies after cell boundaries are
+ * found: `<br>` (also `<br/>`, `<br />`, case insensitive) → `\n`, then one
+ * level of the fence-marker encoding below is removed. Exported so a parser
+ * that tracks offsets itself (`fence-repair/raw-rows.ts`) reads cells
+ * byte-identically to `parseRowCells`.
+ */
+export function decodeFenceCell(cell: string): string {
+  return cell.replace(/<br\s*\/?>/gi, '\n').replace(ENCODED_MARKER_RE, (_m, amps: string, kind: string, edge: string) =>
+    amps === '' ? `gbrain:${kind}:${edge}` : `gbrain&${amps.slice('amp;'.length)}#58;${kind}:${edge}`);
+}
+
+/**
+ * Fence-marker text inside a cell (#5395). A claim that quotes
+ * `gbrain:facts:begin` outside code would otherwise be written as a live
+ * marker inside the table: the fence scanner pairs with it, the row and
+ * every row after it vanish with no warning, and the remote boundary cuts
+ * the body at the section. The encoding lengthens the ampersand run in
+ * front of `#58;` (`&#58;` is the HTML entity for `:`; GFM renders it as a
+ * colon, and no marker regex matches it):
+ *
+ *   gbrain:facts:begin          → gbrain&#58;facts:begin
+ *   gbrain&#58;facts:begin      → gbrain&amp;#58;facts:begin
+ *   gbrain&amp;#58;facts:begin  → gbrain&amp;amp;#58;facts:begin
+ *
+ * Decoding removes exactly one level, so the codec is injective: a claim
+ * that literally held `gbrain&#58;facts:begin` reads back as that literal,
+ * never as a live marker. A `&#58;` not followed by `(facts|takes):(begin|end)`
+ * is left alone in both directions, and the transcript renderer's
+ * `gbrain\:facts:begin` form contains no bare marker and passes through.
+ */
+const BARE_OR_ENCODED_MARKER_RE = /gbrain(:|&(?:amp;)*#58;)(facts|takes):(begin|end)/g;
+const ENCODED_MARKER_RE = /gbrain&((?:amp;)*)#58;(facts|takes):(begin|end)/g;
+
+function encodeFenceMarkers(s: string): string {
+  return s.replace(BARE_OR_ENCODED_MARKER_RE, (_m, mid: string, kind: string, edge: string) =>
+    mid === ':' ? `gbrain&#58;${kind}:${edge}` : `gbrain&amp;${mid.slice(1)}${kind}:${edge}`);
 }
 
 /**
@@ -73,7 +113,8 @@ export function isSeparatorRow(cells: string[]): boolean {
  * via the `context` cell at the domain layer, not here).
  */
 export function stripStrikethrough(s: string): { text: string; struck: boolean } {
-  const m = s.match(/^~~(.+?)~~$/);
+  // [\s\S] rather than `.`: cells may hold decoded newlines (<br>).
+  const m = s.match(/^~~([\s\S]+?)~~$/);
   if (m) return { text: m[1].trim(), struck: true };
   return { text: s, struck: false };
 }
@@ -90,9 +131,39 @@ export function parseStringCell(raw: string): string | undefined {
 
 /**
  * Escape a value for safe placement inside a pipe-separated cell. Replaces
- * any literal `|` with `\|` so the table layout stays intact. `parseRowCells`
- * is the inverse and decodes the escape after identifying cell boundaries.
+ * literal `|` with `\|` and line breaks (`\r\n`, `\r`, `\n`) with `<br>` so
+ * each row stays on one physical line, and encodes fence-marker text (see
+ * `encodeFenceMarkers`) so a quoted marker never becomes a live one.
+ * `parseRowCells` decodes these after identifying cell boundaries. A
+ * literal `<br>` collides with this encoding and reads back as a newline.
  */
 export function escapeFenceCell(s: string): string {
-  return s.replace(/\|/g, '\\|');
+  return encodeFenceMarkers(s.replace(/\|/g, '\\|').replace(/\r\n?|\n/g, '<br>'));
+}
+
+/** The most claim forms one segment-text statement tests per row; a longer list runs in batches of this size. */
+export const CLAIM_FORMS_BATCH = 512;
+
+/** Each claim lowered, plain and as a facts-fence cell stores it (escapeFenceCell), deduplicated: the forms stored text holds it in. */
+export function claimTextForms(claims: readonly string[]): string[] {
+  return [...new Set(claims.flatMap(claim => [claim.toLowerCase(), escapeFenceCell(claim).toLowerCase()]).filter(Boolean))];
+}
+
+/**
+ * A fence rewrite refused because the fence it starts from does not parse
+ * cleanly. Every rewriter re-renders the rows the parser returned, so
+ * rewriting such a fence would silently delete the rows the parser skipped.
+ * The message names the fence only: parser warnings embed row text, so they
+ * stay on `warnings` for the caller to locate, never in the message.
+ */
+export class FenceRewriteRefusal extends Error {
+  constructor(readonly fence: 'facts' | 'takes', readonly warnings: readonly string[]) {
+    super(`The ${fence} fence does not parse cleanly, so it was not rewritten; fix the fence first.`);
+    this.name = 'FenceRewriteRefusal';
+  }
+}
+
+/** Throw `FenceRewriteRefusal` when the parse a rewrite starts from has warnings. */
+export function assertFenceRewritable(fence: 'facts' | 'takes', parsed: { warnings: readonly string[] }): void {
+  if (parsed.warnings.length > 0) throw new FenceRewriteRefusal(fence, parsed.warnings);
 }

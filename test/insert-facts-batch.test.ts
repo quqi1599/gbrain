@@ -380,21 +380,31 @@ describe('engine.insertFacts — v0.46 (#3014) supersession transport', () => {
     expect(persisted.rows[0].superseded_by).toBeNull();
   });
 
-  test('chain (#N names another struck row) → superseded_by NULL + warning', async () => {
+  test('chain (#N names another superseded row) → every hop links, no warning', async () => {
     // Row 1 superseded by #2; row 2 is itself struck (superseded by #3).
+    // B-13: an A -> B -> C history keeps both links.
     const r = await engine.insertFacts(
       [struck(1, 2, { fact: 'link a' }), struck(2, 3, { fact: 'link b' }), fixtureFact(3, { fact: 'live tail' })],
       { source_id: 'default' },
     );
-    // Row 1 → row 2 is a chain (row 2 struck) → NULL + warning.
-    // Row 2 → row 3 (live) resolves cleanly.
-    expect(r.warnings.some(w => w.includes('struck'))).toBe(true);
+    expect(r.warnings).toEqual([]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const persisted = await (engine as any).db.query(
       `SELECT row_num, superseded_by FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY row_num`,
     );
-    expect(persisted.rows[0].superseded_by).toBeNull();          // row 1: chain rejected
+    expect(Number(persisted.rows[0].superseded_by)).toBe(Number(r.ids[1])); // row 1 → row 2
     expect(Number(persisted.rows[1].superseded_by)).toBe(Number(r.ids[2])); // row 2 → row 3
+  });
+
+  test('forgotten target (struck, not superseded) → superseded_by NULL + warning', async () => {
+    const forgotten = { ...fixtureFact(2, { fact: 'withdrawn' }), expired_at: new Date('2026-01-01T00:00:00Z') };
+    const r = await engine.insertFacts([struck(1, 2, { fact: 'link a' }), forgotten], { source_id: 'default' });
+    expect(r.warnings.some(w => w.includes('struck'))).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const persisted = await (engine as any).db.query(
+      `SELECT superseded_by FROM facts WHERE row_num = 1 AND source_markdown_slug = 'people/alice'`,
+    );
+    expect(persisted.rows[0].superseded_by).toBeNull();
   });
 
   test('int4-overflow reference (11-digit #N) resolves as dangling — never throws', async () => {
@@ -538,5 +548,58 @@ describe('engine.insertFacts — v0.46 (#3014) atomic deleteForPageFirst reconci
       `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY row_num NULLS LAST`,
     );
     expect(rows.rows.map((x: { fact: string }) => x.fact)).toEqual(['fresh fence row', 'legacy forget record']);
+  });
+});
+
+describe('engine.insertFacts — #6574 chunked multi-row insert', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const q = async (sql: string, params: unknown[] = []) => (await (engine as any).db.query(sql, params)).rows;
+
+  test('a duplicate row_num inside one batch keeps the first input and nulls the rest, as the per-row loop did', async () => {
+    const r = await engine.insertFacts(
+      [fixtureFact(1, { fact: 'first wins' }), fixtureFact(1, { fact: 'second loses' }), fixtureFact(2, { fact: 'other' })],
+      { source_id: 'default' },
+    );
+    expect(r.inserted).toBe(2);
+    const rows = await q(`SELECT id, row_num, fact FROM facts ORDER BY row_num`);
+    expect(rows.map((x: { fact: string }) => x.fact)).toEqual(['first wins', 'other']);
+    expect(rows.map((x: { id: number }) => Number(x.id))).toEqual(r.ids.map(Number));
+  });
+
+  test('a batch past one chunk keeps order, skips cross-chunk duplicates and resolves supersession across chunks', async () => {
+    const n = 1_203;
+    const rows: BatchFact[] = Array.from({ length: n }, (_, i) => fixtureFact(i + 1, { fact: `claim ${i + 1}` }));
+    rows.push(fixtureFact(7, { fact: 'late duplicate of row 7' }));
+    rows[0] = fixtureFact(1, { fact: 'retired', expired_at: new Date('2026-06-01T00:00:00Z'), superseded_by_row: n });
+    const r = await engine.insertFacts(rows, { source_id: 'default' });
+    expect(r.inserted).toBe(n);
+    expect(r.warnings).toEqual([]);
+    const stored = await q(`SELECT id, row_num, fact, superseded_by FROM facts ORDER BY id`);
+    expect(stored.map((x: { row_num: number }) => Number(x.row_num))).toEqual(Array.from({ length: n }, (_, i) => i + 1));
+    expect(stored.map((x: { id: number }) => Number(x.id))).toEqual(r.ids.map(Number));
+    expect(stored.find((x: { row_num: number }) => Number(x.row_num) === 7).fact).toBe('claim 7');
+    const last = stored.find((x: { row_num: number }) => Number(x.row_num) === n);
+    expect(Number(stored[0].superseded_by)).toBe(Number(last.id));
+  });
+
+  test('an embedded row keeps its vector, model and text hash; a row without one stays unembedded', async () => {
+    const [{ dims }] = await q(`SELECT atttypmod AS dims FROM pg_attribute WHERE attrelid = 'facts'::regclass AND attname = 'embedding'`);
+    const vector = new Float32Array(Number(dims)).fill(0.25);
+    await engine.insertFacts(
+      [fixtureFact(1, { fact: 'embedded', embedding: vector, embedding_model: 'test-model' }), fixtureFact(2, { fact: 'plain', embedding_model: 'ignored' })],
+      { source_id: 'default' },
+    );
+    const rows = await q(`SELECT row_num, embedding IS NOT NULL AS has_vector, embedded_at IS NOT NULL AS has_at, embedding_model,
+      embedded_text_hash = md5(fact) AS hash_ok, embedded_text_hash FROM facts ORDER BY row_num`);
+    expect(rows[0]).toMatchObject({ has_vector: true, has_at: true, embedding_model: 'test-model', hash_ok: true });
+    expect(rows[1]).toMatchObject({ has_vector: false, has_at: false, embedding_model: null, embedded_text_hash: null });
+  });
+
+  test('free text with JSON-hostile characters and a lone surrogate lands intact (the surrogate as U+FFFD)', async () => {
+    const hostile = 'quotes " \\ backslash, {braces}, [brackets], comma, em — dash, emoji 🚀, lone \uD83D end';
+    await engine.insertFacts([fixtureFact(1, { fact: hostile, context: 'ctx "q"' })], { source_id: 'default' });
+    const [row] = await q(`SELECT fact, context FROM facts`);
+    expect(row.fact).toBe(hostile.replace('\uD83D end', '\uFFFD end'));
+    expect(row.context).toBe('ctx "q"');
   });
 });

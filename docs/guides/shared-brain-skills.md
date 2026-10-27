@@ -56,7 +56,12 @@ canonical-owner binding.
 The source must have no Git sync commit, external repository, connector, or
 company-ingestion policy. Existing external roots and incomplete or mismatched
 receipts retain the ordinary never-synced/stale checks; managed persistence alone
-does not exempt a source. No `last_sync_at` timestamp is fabricated. The separate
+does not exempt a source. No `last_sync_at` timestamp is fabricated. A dedicated
+skills source is the other exemption: a source holding an adopted skill pack
+(live heads on its current incarnation) whose content is a read-only catalog, with
+no Git commit recorded and, when doctor may read the checkout, no `.git` under
+its root, counts as `read_only_pack_count` in `sync_freshness`. A git-backed pack
+is still judged stale. The separate
 `canonical_content_writes` check reports queued publication and required recovery
 for these roots. Both checks classify ownership from database records; remote
 doctor does not inspect or execute commands against stored filesystem paths.
@@ -380,11 +385,157 @@ does not expose them to every source. Do not count `pending_host_work` or
 per-source `action_required` as completion even if the migration ledger says
 the mechanical checkpoint completed.
 
+While a source's inventory, ownership (writer), projection or policy stage, or
+a brain-level pending action, is still open, `gbrain apply-migrations --list` shows 0.53.0 as
+`applied_pending_host_work` (not `applied`), `--list --json` adds an
+`applied_pending_host_work` array whose `fix.argv` is the read-only
+inventory, and `gbrain doctor` warns on `minions_migration` with
+`details.code: migration_host_work_pending`:
+
+```bash
+gbrain apply-migrations --migration 0.53.0 --dry-run --json   # each source's next step; changes nothing
+gbrain apply-migrations --yes                                  # after the work: the re-check records it done
+```
+
+The `members` stage alone (no installation enrolled yet, as on every new
+brain) is not host work, and neither is a source that opted out with
+`gbrain sources shared-skills <id> off`; a brain that declines the migration
+(below) never reports it.
+
 The host report's `member_installations` inventories known members per source,
 with `joined`, `refresh_pending`, `delivery_reported`, `source_changed`, or
 `left` and a `next_action`. `delivery_reported` means client-reported artifact
 delivery only; every row remains native-unverified. Unknown or disconnected
 installations are not proven migrated by that inventory.
+
+### Decline the migration for the whole brain
+
+**Say to your agent:** *"We are not adopting shared skills on this brain; stop
+the v0.53.0 migration from running on every upgrade."* The agent runs
+
+```bash
+gbrain config set shared_skills.migration.enabled false
+```
+
+The key is brain-level database config, so it applies to every machine that
+uses that database. From then on `gbrain apply-migrations` (including the
+`bun install` postinstall, `gbrain upgrade` and `gbrain post-upgrade`) skips
+v0.53.0 entirely: no inventory, no `shared_skills.migration.v1*` config
+writes, and the applied-migration re-check does not run. `gbrain
+apply-migrations --list` and `--dry-run` show it as `declined` with the key,
+`gbrain doctor` reports `minions_migration` ok with `declined: ['0.53.0']`,
+and `get_health.migrations.declined` lists it. An explicit `gbrain
+apply-migrations --migration 0.53.0` refuses with `migration_declined` (exit
+3) and the command that turns it back on instead of overriding the owner's
+choice from one machine. To adopt shared skills later:
+
+```bash
+gbrain config set shared_skills.migration.enabled true
+gbrain apply-migrations --yes
+```
+
+Per-source opt-outs (next section) still apply once the migration runs.
+
+## Choose which sources adopt shared skills
+
+**Say to your agent:** *"Stop the shared-skills migration from touching the
+acme-example source; it already serves its own skills."* The agent runs
+`gbrain sources shared-skills acme-example off` on the brain host.
+
+The 0.53.0 migration adopts the skillpack of every owned content source. A
+source that already delivers skills another way (its own brain-resident pack
+read through `list_brain_skillpack`/`get_skill`, or a plugin install) can opt
+out. The setting is `config.shared_skills` on the source; when it is `false`
+the migration preserves the source's files and reports
+`source_shared_skills_disabled`.
+
+Prerequisites: a shell on the brain host (the command reads and writes the
+host's source configuration) and the source id from `gbrain sources list`.
+
+```bash
+gbrain sources shared-skills acme-example status --json   # read-only
+gbrain sources shared-skills acme-example off             # opt out
+gbrain sources shared-skills acme-example on              # back to the default
+```
+
+Expected result: every form prints `config.shared_skills` (`false`, or unset,
+which means on), the effective policy mode (`content`, `preserve_files` or
+`explicit_pack_required`) with its reason code, an explanation, and any parked
+inventory. After `off`, the next `gbrain apply-migrations --migration 0.53.0 --yes`
+reports the source as `source_shared_skills_disabled` and changes none of its
+files or grants. `on` deletes the key; the default is on.
+
+`on` cannot override the source kind. A connector-managed source stays
+`preserve_files` and an unapproved external repository stays
+`explicit_pack_required`, both with `source_skill_adoption_required`; `status`
+says so instead of reporting the source as adopted.
+
+Failure example: on a thin client, or from any connection other than the
+brain host's own CLI, the command refuses with `trusted_local_only`. Its fix
+is the same command for the host operator (`actor: host_admin`) and its verify
+is the read-only `status --json` form. On a hosted brain, ask the host's
+operator to run it there. An unknown action exits with `invalid_params` and
+names the `status` form.
+
+Verify: `gbrain sources shared-skills <id> status --json`, the `shared_skills`
+object in `gbrain sources status <id> --json`, or
+`gbrain doctor --only shared_skills_sources`, which lists opted-out sources.
+
+### Oversized skill packs
+
+The migration inventories a pack within bounded limits. These database config
+keys hold today's defaults; `gbrain config set` refuses a value above the
+ceiling. Only the brain host's CLI writes them.
+
+| Key | Default | Ceiling |
+| --- | --- | --- |
+| `shared_skills.inventory.max_files` | 256 | 4096 |
+| `shared_skills.inventory.max_total_bytes` | 4194304 (4 MiB) | 67108864 (64 MiB) |
+| `shared_skills.inventory.max_file_bytes` | 262144 | 8388608 (8 MiB) |
+| `shared_skills.inventory.max_entries` | 1024 | 16384 |
+
+Symlinks, hard links, unsafe paths and the eight-directory depth limit are not
+configurable.
+
+A pack over a bound parks its source once: the per-source migration record
+holds `parked` (the bound, the limits in force and when it parked), the stage
+reports `payload_too_large` with the next step, and the rest of the migration
+completes instead of recording a partial run. Later runs skip the source
+without re-reading the pack. Resume it in one of three ways, then run
+`gbrain apply-migrations --migration 0.53.0 --yes`:
+
+1. Raise the named bound: `gbrain config set shared_skills.inventory.max_file_bytes 524288`.
+2. Opt the source out: `gbrain sources shared-skills <id> off`.
+3. Shrink the pack, then release it: `gbrain sources shared-skills <id> on`.
+
+`gbrain doctor` warns `shared_skills_sources` while a source is parked.
+
+A pack whose adoption could never publish is refused at inventory instead of
+after it: one canonical adoption writes one `SKILL.md` per declared skill plus
+`skillpack.json`, at most 128 files (the persistence bundle bound), so a pack
+declaring 128 or more skills reports `payload_too_large` as an action (not a
+conflict) until it is split across sources or trimmed (#5476). This is separate
+from the per-skill bound of 64 declared files.
+
+### Reviewed changes after inventory
+
+When skill files change after the migration inventory, the inventory stage
+reports a conflict that lists the changed paths and the exact acceptance
+command with a digest of the current files. Review the changes with the user;
+only after they agree run
+`gbrain apply-migrations --migration 0.53.0 --accept-reviewed-inventory <source>=<digest> --yes`.
+A later edit changes the digest, so the old command is refused again. Hashes
+are byte-exact, so a checkout that rewrites line endings (CRLF on Windows)
+counts as a change: pin `*.md text eol=lf` in `.gitattributes` before
+inventorying. An inventory that never completed (for example, the root was
+missing or wrong when it ran) is simply taken again at the corrected root; a
+completed inventory whose root moved still refuses (#5569).
+
+An install whose 0.53.0 migration already shows as wedged (three partial runs
+before parking existed) resumes with
+`gbrain apply-migrations --force-retry 0.53.0`, then
+`gbrain apply-migrations --migration 0.53.0 --yes`; the oversized source parks
+and the migration completes.
 
 ## Troubleshoot, leave, and recover
 
@@ -411,6 +562,34 @@ rather than assuming it shares a `connect` installation's receipt path.
 | `revision_conflict` / `local_conflict` | Preserve both edits and inspect current revisions/ownership receipts before retrying. |
 | `restart_required` | Restart the harness and record actual new-conversation evidence. Files alone do not clear this check. |
 | `left_with_retained_files` | Preserve the reported edits, disable native cached instructions through the harness controls, and restart. |
+| `membership_inactive` | The receipt's enrollment epoch was left or superseded. See [membership inactive after a re-enrollment](#membership-inactive-after-a-re-enrollment). |
+
+### Membership inactive after a re-enrollment
+
+**Say to your agent:** *"My shared skills say membership inactive; refresh them."*
+The agent runs `gbrain bootstrap harness --refresh-skills` on the harness host.
+
+A `leave_brain` then `join_brain` by the same principal (for example to bind a
+follow policy the owner approved later) moves the server's enrollment epoch
+on, while the receipt and native router keep the old one, so the router's
+`sync_brain_skills` call answers `membership_inactive`. For a
+bootstrap-managed installation:
+
+```bash
+gbrain bootstrap harness --refresh-skills
+gbrain bootstrap harness --status
+```
+
+`--refresh-skills` re-joins each live entry under its recorded credential
+and follow policy, so the receipt and router adopt the current epoch; no
+token is minted or revoked. `--status` prints each entry's receipt epoch, and
+`gbrain doctor` warns `bootstrap_harness_health` (code
+`shared_skills_epoch_superseded`) when the receipt epoch differs from the
+brain's membership row. A refresh whose recorded policy is wider than the
+active membership answers `follow_approval_required`: leave and re-run
+`gbrain bootstrap harness` after owner approval. A rotation leave whose own
+epoch was superseded completes locally (`remote_membership_reason:
+superseded`) so the previous token can be revoked.
 
 `leave_brain` stops this principal's membership. The managed adapter's leave
 path also removes unchanged owned files; changed files are retained. Neither
@@ -422,7 +601,11 @@ erasure of source material, history, or backups.
 
 Managed removal disables local following and attempts owned-file cleanup even
 when offline or already revoked. `remote_membership_pending: true` means the
-host has not acknowledged leave; retry remote cleanup when possible. Do not
+host has not acknowledged leave; retry remote cleanup when possible. A
+bootstrap-managed enrollment whose credential is already revoked cannot leave
+remotely; `gbrain bootstrap harness` finishes its local cleanup and records it
+as left with reason `credential_revoked`, because a revoked principal's
+membership is inert ([cleanup pending](bootstrap.md#cleanup-pending)). Do not
 claim a server-side departure from successful local deletion, or delete edited
 files to make the status look complete.
 

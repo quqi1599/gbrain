@@ -1,29 +1,56 @@
+import { withTrustKeep } from './context.ts';
 import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { loadConfig } from '../config.ts';
 import { contentHash } from '../utils.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { OperationError, type OperationContext } from '../ops/contract.ts';
+import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { assertPageRevision } from '../page-state/types.ts';
 import { initializeLocalPersistence, requestPrincipalForContext } from './page-mutations.ts';
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
-import { admitWrite, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
+import { admitWrite, assertLifetimeIdHeadroom, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { digest, requireUuid } from './digest.ts';
 import { waitForWrite, writeResponse } from './service.ts';
-import { prepareFileTarget } from './page-prepare.ts';
+import { maintenancePublishWaitMs } from './maintenance-wait.ts';
+import { databaseOnlyPublication, prepareFileTarget } from './page-prepare.ts';
 import type { WriteRequest } from './model.ts';
 import type { PreparedMutation } from './coordinator.ts';
 
-export async function grandfatherCanonicalPage(engine: BrainEngine,
-  selected: { id: number; slug: string; source_id: string; source_incarnation: string },
-  before: (page: typeof selected & { frontmatter: Record<string, unknown>; knowledge_revision: string; request_id: string }) => void | Promise<void>): Promise<'touched' | 'skipped'> {
+type GrandfatherSelection = { id: number; slug: string; source_id: string; source_incarnation: string };
+type GrandfatherOutcome = { status: 'touched'; revision: string | null };
+
+export async function grandfatherCanonicalPage(engine: BrainEngine, selected: GrandfatherSelection,
+  before: (page: GrandfatherSelection & { frontmatter: Record<string, unknown>; knowledge_revision: string; request_id: string }) => void | Promise<void>,
+): Promise<GrandfatherOutcome | { status: 'skipped' }> {
+  const admitted = await admitCanonicalGrandfather(engine, selected, before);
+  return admitted.status === 'skipped' ? admitted : admitted.complete();
+}
+
+/**
+ * #5530: admit one page's grandfather write without waiting for it. The step
+ * admits a bounded window of pages before waiting, so their Git effects are
+ * ready together and the effect runner commits them as one group instead of
+ * one commit per page. `complete()` waits for the publication and settles the
+ * page's checkpoint exactly as the serial path does.
+ */
+/** Refuse a managed grandfather pass up front when its page admissions cannot fit the ID caps. */
+export async function assertGrandfatherCapacity(engine: BrainEngine, pages: number): Promise<void> {
+  const ctx: OperationContext = { engine, config: loadConfig() ?? { engine: engine.kind }, sourceId: 'default', remote: false, dryRun: false,
+    logger: { info() {}, warn() {}, error() {} } };
+  await initializeLocalPersistence(ctx);
+  await assertLifetimeIdHeadroom(engine, await requestPrincipalForContext(ctx), pages);
+}
+
+export async function admitCanonicalGrandfather(engine: BrainEngine, selected: GrandfatherSelection,
+  before: (page: GrandfatherSelection & { frontmatter: Record<string, unknown>; knowledge_revision: string; request_id: string }) => void | Promise<void>,
+): Promise<{ status: 'skipped' } | { status: 'admitted'; complete: () => Promise<GrandfatherOutcome> }> {
   const snapshot = await engine.readPageSnapshot(selected.slug, { sourceId: selected.source_id });
   if (!snapshot || snapshot.page.id !== selected.id || snapshot.sourceIncarnation !== selected.source_incarnation ||
-    Object.hasOwn(snapshot.page.frontmatter ?? {}, 'validate')) return 'skipped';
+    Object.hasOwn(snapshot.page.frontmatter ?? {}, 'validate')) return { status: 'skipped' };
   const extension = snapshot.page.source_path ? extname(snapshot.page.source_path).toLowerCase() : '';
-  if (['code', 'image'].includes(snapshot.page.type) || extension && !['.md', '.mdx'].includes(extension)) return 'skipped';
+  if (['code', 'image'].includes(snapshot.page.type) || extension && !['.md', '.mdx'].includes(extension)) return { status: 'skipped' };
   const ctx: OperationContext = { engine, config: loadConfig() ?? { engine: engine.kind }, sourceId: selected.source_id,
     remote: false, dryRun: false, logger: { info() {}, warn() {}, error() {} } };
   await initializeLocalPersistence(ctx);
@@ -42,46 +69,66 @@ export async function grandfatherCanonicalPage(engine: BrainEngine,
     assertReplayIntent(prior, intentDigest({ operation: 'put_page', sourceId: selected.source_id, slug: selected.slug, callerIntent }));
   } else await before({ ...selected, frontmatter: snapshot.page.frontmatter ?? {}, knowledge_revision: snapshot.revision, request_id: requestId });
   const binding = await getWorktreeBinding(engine, selected.source_id);
-  try {
-    const request = prior ?? await admitWrite(engine, { principal, operation: 'put_page', sourceId: selected.source_id,
-      sourceIncarnation: selected.source_incarnation, pageId: selected.id, slug: selected.slug, requestId, authority, callerIntent,
-      intent: { kind: 'managed_grandfather', expected_revision: snapshot.revision },
-      worktreeId: binding?.worktree_id, topologyGeneration: binding?.topology_generation });
-    writeResponse(await waitForWrite(engine, request, ctx.config));
-    await engine.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [op, fingerprint, JSON.stringify([requestId])]);
-    return 'touched';
-  } catch (error) {
+  const settleFailure = async (error: unknown): Promise<never> => {
     if (error instanceof OperationError && error.writeRequest && ['failed', 'conflict', 'cancelled'].includes(error.writeRequest.state)) {
       await engine.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [op, fingerprint, JSON.stringify([requestId])]);
     }
     throw error;
-  }
+  };
+  let request: WriteRequest;
+  try {
+    request = prior ?? await admitWrite(engine, { principal, operation: 'put_page', sourceId: selected.source_id,
+      sourceIncarnation: selected.source_incarnation, pageId: selected.id, slug: selected.slug, requestId, authority, callerIntent,
+      intent: { kind: 'managed_grandfather', expected_revision: snapshot.revision },
+      worktreeId: binding?.worktree_id, topologyGeneration: binding?.topology_generation });
+  } catch (error) { return settleFailure(error); }
+  return { status: 'admitted', complete: async () => {
+    try {
+      const committed = writeResponse(await waitForWrite(engine, request, ctx.config, maintenancePublishWaitMs()));
+      await engine.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [op, fingerprint, JSON.stringify([requestId])]);
+      // The publication revision lets verification tell a later rewrite from a lost grandfather.
+      return { status: 'touched', revision: typeof committed.revision === 'string' ? committed.revision : null };
+    } catch (error) { return settleFailure(error); }
+  } };
 }
 
 export async function prepareGrandfatherMutation(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {
   if (row.operation !== 'put_page' || row.intent?.kind !== 'managed_grandfather' || row.authority.remote !== false || row.authority.principal.kind !== 'local_cli') {
-    throw new OperationError('permission_denied', 'Grandfathering requires the trusted canonical migration path.');
+    throw opError('permission_denied', 'Grandfathering requires the trusted canonical migration path.',
+      `Request ${row.request_id} is not a trusted local grandfather write, so nothing changed. Grandfathering runs only from gbrain apply-migrations on the brain host.`);
   }
   await authorizeStoredRequest(engine, row);
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
-  if (!snapshot || snapshot.page.id !== row.page_id) throw new OperationError('page_identity_changed', 'The grandfathered page identity changed.');
+  if (!snapshot || snapshot.page.id !== row.page_id) {
+    throw opError('page_identity_changed', 'The grandfathered page identity changed.',
+      `${row.slug} in ${row.source_id} was deleted or replaced after grandfathering was queued, so it was skipped; the next migration run re-plans from current pages.`);
+  }
   assertPageRevision(snapshot, { expectedRevision: row.intent.expected_revision as string });
-  if (Object.hasOwn(snapshot.page.frontmatter ?? {}, 'validate')) throw new OperationError('revision_conflict', 'A validation decision already exists.');
+  if (Object.hasOwn(snapshot.page.frontmatter ?? {}, 'validate')) {
+    throw opError('revision_conflict', 'A validation decision already exists.',
+      `${row.slug} in ${row.source_id} already records a validate decision, so grandfathering left it unchanged; nothing else is needed.`);
+  }
   if (snapshot.page.frontmatter != null && (typeof snapshot.page.frontmatter !== 'object' || Array.isArray(snapshot.page.frontmatter))) {
-    throw new OperationError('invalid_params', 'Grandfathering requires valid object frontmatter.');
+    throw opError('invalid_params', 'Grandfathering requires valid object frontmatter.',
+      `${row.slug} in ${row.source_id} has frontmatter that is not a YAML mapping. Fix the page's frontmatter, then run the migration again.`);
   }
   const frontmatter = { ...snapshot.page.frontmatter, validate: false };
   const hash = contentHash({ ...snapshot.page, frontmatter, tags: snapshot.tags });
   const file = await prepareFileTarget(engine, row, snapshot, serializePageToMarkdown({ ...snapshot.page, frontmatter }, snapshot.tags));
   if (file && !['.md', '.mdx'].includes(extname(file.path).toLowerCase())) {
-    throw new OperationError('invalid_params', 'Non-Markdown artifacts cannot be grandfathered by rewriting their bytes.');
+    throw opError('invalid_params', 'Non-Markdown artifacts cannot be grandfathered by rewriting their bytes.',
+      `${row.slug} in ${row.source_id} is backed by a non-Markdown file, so grandfathering skips it rather than rewrite its bytes; no action is needed.`);
   }
-  return { observedRevision: snapshot.revision, file, deferEmbedding: true, apply: async tx => {
+  return { observedRevision: snapshot.revision, file, ...databaseOnlyPublication(row, file), deferEmbedding: true, apply: async tx => {
     await tx.createVersion(row.slug, { sourceId: row.source_id });
-    const updated = await tx.executeRaw(`UPDATE pages SET frontmatter=jsonb_set(COALESCE(frontmatter,'{}'::jsonb),'{validate}','false'::jsonb),content_hash=$4
+    // A mechanical validate:false stamp authors nothing: the page keeps its trust tier (#5575).
+    const updated = await withTrustKeep(tx, ['pages'], () => tx.executeRaw(`UPDATE pages SET frontmatter=jsonb_set(COALESCE(frontmatter,'{}'::jsonb),'{validate}','false'::jsonb),content_hash=$4
       WHERE id=$1 AND source_id=$2 AND knowledge_revision=$3::uuid AND NOT(COALESCE(frontmatter,'{}'::jsonb)?'validate') RETURNING id`,
-    [row.page_id, row.source_id, snapshot.revision, hash]);
-    if (updated.length !== 1) throw new OperationError('revision_conflict', 'The validation decision changed before publication.');
+    [row.page_id, row.source_id, snapshot.revision, hash]));
+    if (updated.length !== 1) {
+      throw opError('revision_conflict', 'The validation decision changed before publication.',
+        `${row.slug} in ${row.source_id} changed while it was being grandfathered, so the transaction rolled back; the next migration run re-plans from current pages.`);
+    }
     if (snapshot.page.text_projection_revision === snapshot.revision) {
       await tx.executeRaw('UPDATE pages SET text_projection_revision=knowledge_revision WHERE id=$1 AND source_id=$2', [row.page_id, row.source_id]);
     }

@@ -16,6 +16,8 @@ import { prepareManagedFactsMutation } from '../../src/core/persistence/facts-pr
 import { serializePageToMarkdown } from '../../src/core/markdown.ts';
 import { upsertFactRow } from '../../src/core/facts-fence.ts';
 import { withEnv } from './with-env.ts';
+import { testWaitMs } from './wait-for.ts';
+import { __setMaintenanceWriteWaitForTests } from '../../src/core/persistence/maintenance-wait.ts';
 
 const hostModel = 'openai:text-embedding-3-large';
 const selectedModel = 'openai:text-embedding-3-small';
@@ -27,6 +29,7 @@ type Case = typeof managedEmbeddingCases[number];
 
 export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Case): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-fact-model-'));
+  let restoreWait = () => {};
   try {
     await withEnv({ GBRAIN_HOME: home }, async () => {
       await disposePersistenceConsumer(engine);
@@ -62,6 +65,7 @@ export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Ca
       const embeddings: string[] = [];
       let allEmbeddings = 0;
       const deferred = ['changed_before_publication', 'changed_before_replay', 'disabled_before_replay', 'file_disabled_before_replay', 'unchanged_replay', 'unsigned_replay'].includes(scenario);
+      if (deferred) restoreWait = __setMaintenanceWriteWaitForTests(testWaitMs(250));
       __setChatTransportForTests(async () => {
         generations++;
         if (scenario === 'changed_before_embedding') await engine.setConfig('embedding_model', hostModel);
@@ -85,6 +89,11 @@ export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Ca
       const failure = ['invalid_policy', 'invalid_model', 'invalid_dimensions', 'changed_before_embedding', 'disabled_before_embedding', 'changed_after_embedding', 'cancelled'].includes(scenario);
       if (deferred) {
         await expect(run()).rejects.toMatchObject({ code: 'write_pending' });
+        // The short wait exists only so this first call reports write_pending fast. Every replay below is the thing
+        // under test (the retained batch committing once the worktree is active again) and waits under the product's
+        // own MAINTENANCE_PUBLISH_WAIT_MS: a cold replay takes 210-370 ms, so the 250 ms override made it a coin flip
+        // (F2, `unchanged_replay` → write_pending under shard load). The outer finally still covers the throw path.
+        restoreWait(); restoreWait = () => {};
         await disposePersistenceConsumer(engine);
         await engine.executeRaw("UPDATE persistence_worktrees SET state='active' WHERE id=$1::uuid", [binding.worktree_id]);
         if (scenario === 'changed_before_publication') {
@@ -95,18 +104,24 @@ export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Ca
           const result = await publishMutation(engine, row, prepared, localHostId());
           expect(result.state).not.toBe('committed');
         } else if (scenario === 'unchanged_replay') {
+          restoreWait();
+          restoreWait = () => {};
           expect(await run()).toMatchObject({ inserted: 1 });
           expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND embedding IS NOT NULL', [sourceId])).toHaveLength(2);
         } else {
           if (scenario === 'unsigned_replay') await engine.executeRaw("UPDATE persistence_requests SET intent=intent-'embedding' WHERE source_id=$1 AND intent->>'kind'='managed_facts_entity'", [sourceId]);
           else if (scenario === 'file_disabled_before_replay') config.embedding_disabled = true;
           else await engine.setConfig(scenario === 'disabled_before_replay' ? 'embedding_disabled' : 'embedding_model', scenario === 'disabled_before_replay' ? 'true' : hostModel);
-          await expect(run()).rejects.toBeDefined();
-          const beforeReceipt = await engine.executeRaw('SELECT state,error_code,outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
+          // The typed refusal, not any rejection: a write_pending here would otherwise satisfy both asserts and the
+          // "same receipt twice" comparison below vacuously.
+          await expect(run()).rejects.toMatchObject({ code: 'embedding_configuration' });
+          const beforeReceipt = await engine.executeRaw<{ state: string; error_code: string | null }>('SELECT state,error_code,outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
+          expect(beforeReceipt).toHaveLength(1);
+          expect(beforeReceipt[0].state).toBe('failed');
           await engine.setConfig('embedding_model', selectedModel);
           await engine.setConfig('embedding_disabled', 'false');
           config.embedding_disabled = false;
-          await expect(run()).rejects.toBeDefined();
+          await expect(run()).rejects.toMatchObject({ code: 'embedding_configuration' });
           expect(await engine.executeRaw('SELECT state,error_code,outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2', [sourceId, slug])).toEqual(beforeReceipt);
         }
         expect(generations).toBe(1);
@@ -144,6 +159,7 @@ export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Ca
       expect(getEmbeddingModel()).toBe(hostModel);
     });
   } finally {
+    restoreWait();
     await disposePersistenceConsumer(engine);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     __setChatTransportForTests(null); __setEmbedTransportForTests(null); resetGateway();

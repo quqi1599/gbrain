@@ -81,6 +81,18 @@ export interface FileDiagnostics {
    * drift — ingest must not freeze the watermark.
    */
   expectedEmpty?: boolean;
+  /**
+   * E-N4: the file yielded assistant turns but not one user turn. The usual
+   * cause is a host format change the parser no longer recognizes (#5163), so
+   * ingest reports it as drift and holds the watermark.
+   */
+  userTurnsMissing?: boolean;
+  /**
+   * #6741: a Codex sub-agent rollout with assistant turns and no user turn. Its
+   * task arrives as injected context by design, so it is understood, not drift,
+   * and does not hold the watermark.
+   */
+  subagentRollout?: boolean;
 }
 
 export interface ParseSessionsOpts {
@@ -149,6 +161,21 @@ export function transcriptFullId(sourceId: string): string {
 
 /** Max slugified-title length inside an export slug (keeps slugs readable). */
 const TITLE_SLUG_MAX = 48;
+
+/**
+ * Normalize an adapter's source timestamp to UTC (gbrain-evals N12-2). A
+ * string carrying an explicit offset ('2026-08-10T22:30:00-07:00') becomes
+ * its UTC ISO instant, so the date and the hour downstream come from the
+ * same instant. Everything else passes through unchanged: UTC strings stay
+ * byte-identical (no churn for existing imports), and unparseable or
+ * zone-less strings keep their current behavior. Non-strings become ''.
+ */
+export function utcTimestamp(v: unknown): string {
+  if (typeof v !== 'string') return '';
+  if (!/[+-]\d{2}:?\d{2}$/.test(v.trim())) return v;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? v : new Date(ms).toISOString();
+}
 
 /**
  * The one slug builder for every imported conversation page.

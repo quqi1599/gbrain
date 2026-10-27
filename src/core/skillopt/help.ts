@@ -34,11 +34,25 @@ Models:
   --optimizer-model MODEL       Reflects + proposes. Default models.tier.deep
   --target-model MODEL          Executes the skill. Default models.tier.subagent
   --judge-model MODEL           Scores rollouts. Default models.tier.reasoning
+  --reflect-max-tokens N        Output cap for every optimizer call (patch and
+                                rewrite reflect). Beats the
+                                skillopt.reflect_max_tokens config; default
+                                32000 for thinking optimizers, 4096 otherwise.
+                                Raise it when the receipt reports
+                                reflect_*_truncated. Judge/bootstrap caps are
+                                separate.
+  --models-strict               Abort before any spend unless every active
+                                model (optimizer, target, judge, expansion,
+                                chat, embedding, reranker when enabled) was
+                                chosen by touchpoint-specific configuration,
+                                not models.default or a built-in default.
+                                Same as skillopt.models_strict=true.
 
 Modes:
   --patch                       Edit ops only (default; safer)
   --rewrite                     Allow full rewrites of sections
-  --dry-run                     Plan + cost estimate, no LLM calls
+  --dry-run                     Models plan, strict verdict + cost estimate,
+                                no LLM calls (exit 1 only on a strict failure)
   --no-mutate                   Write proposed.md without replacing SKILL.md
   --allow-mutate-bundled        Required to mutate a bundled skill in place.
                                 ALSO requires --held-out (>=5 rows); without it
@@ -47,18 +61,22 @@ Modes:
   --json                        Machine-readable stdout
 
 Safety:
-  --max-cost-usd N              Hard cap. Default 5.00. Preflight refuses
-                                if estimate exceeds. 0 disables the cap
-                                (unpriced model ids then warn-once instead
-                                of aborting with no_pricing).
-  --no-max-cost                 Shorthand for --max-cost-usd 0.
+  --max-usd N|off               Hard cap. Default 5.00. Preflight refuses
+                                if estimate exceeds. A model with no price
+                                runs under the default with a warning; an
+                                explicit cap refuses it before any spend
+                                until you register its rate (gbrain pricing
+                                set). off runs uncapped (spend still ledgered).
+  --max-cost-usd N              Legacy spelling of --max-usd; 0 still means
+                                uncapped (deprecated: write --max-usd off).
+  --no-max-cost                 Shorthand for --max-usd off.
   --max-runtime-min N           Wall-clock cap. Default 30
   --force                       Bypass dirty-working-tree refusal (rare)
   --resume <run-id>             Resume a prior interrupted run
 
 Batch + fleet + background:
   --all                         Optimize every skill with a benchmark
-                                (per-skill cap = --max-cost-usd; brain-wide
+                                (per-skill cap = --max-usd; brain-wide
                                 cap = --brain-wide-max-cost-usd, default $10)
   --brain-wide-max-cost-usd N   Cumulative ceiling for --all (default 10.00)
   --target-models a,b,c         Fleet mode: optimize ONCE per model. Always
@@ -74,8 +92,17 @@ Batch + fleet + background:
 
 Exit codes:
   0 = improved + accepted (or --no-mutate proposed.md written)
-  1 = no improvement (best skill unchanged)
-  2 = aborted by gate (dirty tree / over budget / bench validation / etc.)
+  1 = no improvement (the optimizer replied usably; best skill unchanged)
+  2 = aborted (dirty tree / over budget / bench validation / etc.) or errored,
+      including a run whose optimizer never produced a usable reply
+      (optimizer_output_unusable). Errored and aborted runs keep their
+      checkpoint and print the exact resume command.
+
+Diagnostics:
+  Every run prints a models banner (each touchpoint, its model and the flag or
+  key that chose it) before any spend, and a "Models called" table (including
+  engine-internal query expansion and embeddings) at the end. Each error code
+  in the summary links to its fix in docs/guides/skillopt.md#<code>.
 
 Examples:
   # Generate a starter benchmark from the skill itself (recommended):

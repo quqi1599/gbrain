@@ -69,6 +69,61 @@ describe('current projection planner estimates', () => {
   });
 });
 
+describe('projection statistics refresh after a write pass', () => {
+  const planRows = async (db: PGlite) => (await db.query<{ 'QUERY PLAN': Array<{ Plan: { 'Plan Rows': number } }> }>(
+    `EXPLAIN (FORMAT JSON) SELECT * FROM pages p WHERE ${currentTextProjectionFilter('p')}`)).rows[0]['QUERY PLAN'][0].Plan['Plan Rows'];
+
+  test('a pass below 50 + 10% of pages keeps collected statistics; a larger pass or uncollected statistics refresh', async () => {
+    const db = new PGlite();
+    try {
+      const engine = fixtureEngine(db);
+      await db.exec(`CREATE TABLE pages (id integer PRIMARY KEY, text_projection_revision uuid, knowledge_revision uuid);
+        INSERT INTO pages SELECT i, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001' FROM generate_series(1, 10000) i;`);
+      await db.exec(PROJECTION_STATISTICS_SQL);
+      expect(await planRows(db)).toBe(10000);
+      await db.query('UPDATE pages SET text_projection_revision = NULL WHERE id <= 999');
+      const stale = await planRows(db);
+      expect(stale).toBeGreaterThan(9001);
+      expect(await refreshProjectionStatistics(engine, 999)).toBe(true);
+      expect(await planRows(db)).toBe(stale);
+      expect(await refreshProjectionStatistics(engine, 1049)).toBe(true);
+      expect(await planRows(db)).toBe(stale);
+      expect(await refreshProjectionStatistics(engine, 1050)).toBe(true);
+      expect(await planRows(db)).toBe(9001);
+      await db.exec(`DROP STATISTICS pages_text_projection_current_stats;
+        CREATE STATISTICS pages_text_projection_current_stats ON ((text_projection_revision = knowledge_revision)) FROM pages;`);
+      await expect(verifyProjectionStatistics(engine)).rejects.toThrow('not been collected');
+      expect(await refreshProjectionStatistics(engine, 1)).toBe(true);
+      await verifyProjectionStatistics(engine);
+    } finally { await db.close(); }
+  }, 30_000);
+
+  test('PGLite: growth of planner_stats_deltas alone keeps a small pass off the full ANALYZE; another grown table still runs it', async () => {
+    const db = new PGlite();
+    try {
+      const engine = fixtureEngine(db);
+      const relpages = async (table: string) => Number((await db.query<{ relpages: number }>(
+        'SELECT relpages FROM pg_class WHERE oid = $1::regclass', [table])).rows[0].relpages);
+      const grow = (table: string) => db.exec(`INSERT INTO ${table}(n) SELECT i FROM generate_series(1, 20000) i; DELETE FROM ${table};`);
+      await db.exec(`CREATE TABLE pages (id integer PRIMARY KEY, text_projection_revision uuid, knowledge_revision uuid);
+        INSERT INTO pages SELECT i, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001' FROM generate_series(1, 10000) i;
+        CREATE TABLE planner_stats_deltas (id bigserial PRIMARY KEY, n integer);
+        CREATE TABLE facts (id bigserial PRIMARY KEY, n integer);
+        INSERT INTO planner_stats_deltas(n) VALUES (1); INSERT INTO facts(n) VALUES (1);
+        ANALYZE;`);
+      await db.exec(PROJECTION_STATISTICS_SQL);
+      await grow('planner_stats_deltas');
+      const sampled = await relpages('planner_stats_deltas');
+      expect(await refreshProjectionStatistics(engine, 100)).toBe(true);
+      expect(await relpages('planner_stats_deltas')).toBe(sampled);
+      await grow('facts');
+      expect(await refreshProjectionStatistics(engine, 100)).toBe(true);
+      expect(await relpages('facts')).toBeGreaterThan(1);
+      expect(await relpages('planner_stats_deltas')).toBeGreaterThan(sampled);
+    } finally { await db.close(); }
+  }, 30_000);
+});
+
 describe('projection statistics migration postconditions', () => {
   test('empty initialization and later population both collect valid statistics', async () => {
     const db = new PGlite();
@@ -133,3 +188,26 @@ describe('projection migration ledger verification', () => {
     await verifyProjectionStatistics(engine);
   }, 60_000);
 });
+
+describe('PGLite planner statistics after a bulk write', () => {
+  test('refresh analyzes every table so joins on source and links see real row counts', async () => {
+    const db = new PGlite();
+    try {
+      await db.exec(`CREATE TABLE pages(id integer PRIMARY KEY, source_id text NOT NULL, frontmatter jsonb,
+          text_projection_revision uuid, knowledge_revision uuid);
+        CREATE INDEX pages_source_idx ON pages(source_id);
+        CREATE TABLE links(from_page_id integer, to_page_id integer);
+        INSERT INTO pages SELECT i, 'vault', '{}'::jsonb, NULL, NULL FROM generate_series(1, 3000) i;
+        INSERT INTO links SELECT i, i + 1 FROM generate_series(1, 2000) i;`);
+      await db.exec(PROJECTION_STATISTICS_SQL.replace(/ANALYZE[^;]*;/, ''));
+      expect(await refreshProjectionStatistics(fixtureEngine(db))).toBe(true);
+      const stats = await db.query<{ tablename: string; attname: string }>(
+        `SELECT tablename, attname FROM pg_stats WHERE (tablename, attname) IN (('pages', 'source_id'), ('links', 'from_page_id'))`);
+      expect(stats.rows.length).toBe(2);
+      const plan = await db.query<{ 'QUERY PLAN': Array<{ Plan: { 'Plan Rows': number } }> }>(
+        `EXPLAIN (FORMAT JSON) SELECT * FROM pages WHERE source_id = ANY('{vault}'::text[])`);
+      expect(plan.rows[0]['QUERY PLAN'][0].Plan['Plan Rows']).toBe(3000);
+    } finally { await db.close(); }
+  }, 30_000);
+});
+

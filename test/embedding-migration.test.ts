@@ -22,6 +22,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import type { ChunkInput } from '../src/core/types.ts';
@@ -71,7 +72,7 @@ async function seedEmbedded(slug: string, text: string, signature: string | null
   const chunks: ChunkInput[] = [
     { chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 4, embedding: undefined },
   ];
-  await engine.upsertChunks(slug, chunks);
+  await installFixtureChunks(engine, slug, chunks);
   await engine.executeRaw(
     `UPDATE content_chunks
         SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[$1::int]), ',') || ']')::vector
@@ -101,6 +102,71 @@ async function seedUnembedded(slug: string, text: string): Promise<void> {
     { chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 4, embedding: undefined },
   ]);
 }
+
+describe('embedding migration excludes soft-deleted pages', () => {
+  test.each(['guarded', 'raw'] as const)('%s signature invalidation preserves tombstone vectors and invalidates live vectors', async (mode) => {
+    await seedEmbedded('deleted-drift', 'retained vector', 'old:model:1');
+    await seedEmbedded('live-drift', 'stale vector', 'old:model:1');
+    await engine.softDeletePage('deleted-drift', { sourceId: 'default' });
+    const readVector = (slug: string) => engine.executeRaw<{ embedding: string | null }>(
+      `SELECT cc.embedding::text AS embedding FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+       WHERE p.slug = $1 AND p.source_id = 'default'`, [slug]);
+    const retained = await readVector('deleted-drift');
+    expect(retained[0]!.embedding).not.toBeNull();
+    const opts = { signature: 'new:model:1' };
+    const invalidated = mode === 'guarded'
+      ? await invalidateStaleSignatureEmbeddingsGuarded(engine, opts)
+      : await engine.invalidateStaleSignatureEmbeddings(opts);
+    expect(invalidated).toBe(1);
+    expect(await readVector('deleted-drift')).toEqual(retained);
+    expect(await readVector('live-drift')).toEqual([{ embedding: null }]);
+  });
+
+  test('content drift invalidates only live chunks and preserves deleted chunk metadata', async () => {
+    for (const slug of ['deleted-content-drift', 'live-content-drift']) {
+      await seedUnembedded(slug, 'current text');
+      const [{ dim }] = await engine.executeRaw<{ dim: number }>(
+        "SELECT atttypmod AS dim FROM pg_attribute WHERE attrelid='content_chunks'::regclass AND attname='embedding' AND attnum>0");
+      await engine.executeRaw(`UPDATE content_chunks SET embedding=('[' || array_to_string(array_fill(0.0::real,ARRAY[$1::int]),',') || ']')::vector,
+        embedded_text_hash=md5('old text'),embedded_at='2020-01-01T00:00:00Z'
+        WHERE page_id=(SELECT id FROM pages WHERE slug=$2 AND source_id='default')`, [dim, slug]);
+    }
+    await engine.softDeletePage('deleted-content-drift', { sourceId: 'default' });
+    const readDeleted = () => engine.executeRaw(`SELECT embedding::text,embedded_text_hash,embedded_at FROM content_chunks
+      WHERE page_id=(SELECT id FROM pages WHERE slug='deleted-content-drift' AND source_id='default')`);
+    const before = await readDeleted();
+    expect(await engine.invalidateContentDriftEmbeddings()).toBe(1);
+    expect(await readDeleted()).toEqual(before);
+    expect(await engine.executeRaw(`SELECT embedding FROM content_chunks WHERE page_id=(SELECT id FROM pages
+      WHERE slug='live-content-drift' AND source_id='default')`)).toEqual([{ embedding: null }]);
+  });
+
+  test('counts and both cursor orders ignore tombstones while preserving their recoverable chunks', async () => {
+    await seedUnembedded('tombstone', 'deleted chunk');
+    await engine.softDeletePage('tombstone', { sourceId: 'default' });
+    await seedUnembedded('live', 'live');
+    await seedUnembedded('later-tombstone', 'later deleted');
+    await engine.softDeletePage('later-tombstone', { sourceId: 'default' });
+    const updatedAt = '2020-01-02T03:04:05.000Z';
+    await engine.executeRaw("UPDATE pages SET updated_at = $1::timestamptz WHERE slug = 'live' AND source_id = 'default'", [updatedAt]);
+    for (const scope of [{}, { sourceId: 'default' }]) {
+      expect(await engine.countStaleChunks(scope)).toBe(1);
+      expect(await engine.countStaleChunks({ ...scope, signature: 'new:model:1024', includeNullSignature: true })).toBe(1);
+      expect(await engine.sumStaleChunkChars(scope)).toBe(4);
+      for (const orderBy of ['page_id', 'updated_desc'] as const) {
+        const rows = await engine.listStaleChunks({ ...scope, orderBy, batchSize: 1 });
+        expect(rows.map(row => row.slug)).toEqual(['live']);
+        const last = rows[0]!;
+        const rest = await engine.listStaleChunks({ ...scope, orderBy, batchSize: 1,
+          afterPageId: last.page_id, afterChunkIndex: last.chunk_index,
+          ...(orderBy === 'updated_desc' ? { afterUpdatedAt: updatedAt } : {}) });
+        expect(rest).toHaveLength(0);
+      }
+    }
+    expect((await engine.getPage('tombstone', { sourceId: 'default', includeDeleted: true }))?.deleted_at).not.toBeNull();
+    expect(await engine.executeRaw("SELECT count(*)::int AS n FROM content_chunks WHERE page_id=(SELECT id FROM pages WHERE slug='tombstone')")).toEqual([{ n: 1 }]);
+  });
+});
 
 describe('resolveMigrationTarget', () => {
   test('requires provider:model shape', () => {
@@ -317,6 +383,17 @@ describe('applyEmbeddingMigration', () => {
     expect(await embeddingColWidth('facts')).toBe(target);
   });
 
+  test('#4252: a dim change keeps the facts btree indexes that read the embedding column (v237 idx_facts_unembedded)', async () => {
+    const target = colDim === 512 ? 256 : 512;
+    const factIndexes = async () => (await engine.executeRaw<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'facts' AND indexname = 'idx_facts_unembedded'`)).map(r => r.indexname);
+    expect(await factIndexes()).toEqual(['idx_facts_unembedded']);
+    const plan = await planEmbeddingMigration(engine, { to: 'openai:text-embedding-3-small', dim: target });
+    expect((await applyEmbeddingMigration(engine, plan)).status).toBe('applied');
+    expect(await embeddingColWidth('facts')).toBe(target);
+    expect(await factIndexes()).toEqual(['idx_facts_unembedded']);
+  });
+
   test('post-transition the query cache can actually STORE a row at the new width', async () => {
     const target = colDim === 512 ? 256 : 512;
     const plan = await planEmbeddingMigration(engine, {
@@ -424,7 +501,7 @@ describe('#4305 false target stamps + #4306 embed_skip-safe invalidation', () =>
       type: 'note', title: slug, compiled_truth: `# ${slug}`,
       ...(opts.frontmatter ? { frontmatter: opts.frontmatter } : {}),
     });
-    await engine.upsertChunks(slug, [
+    await installFixtureChunks(engine, slug, [
       { chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 4, model: opts.model },
     ]);
     if (opts.embedded !== false) {

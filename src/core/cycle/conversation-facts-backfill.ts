@@ -37,6 +37,7 @@
  *   cycle.conversation_facts_backfill.max_walltime_min     (20)
  *   cycle.conversation_facts_backfill.max_total_walltime_min (30)
  *   cycle.conversation_facts_backfill.types                (all of ALLOWED_TYPES — src/core/facts/conversation-types.ts)
+ *   cycle.conversation_facts_backfill.exclude_sources      (none: a JSON array or comma list of source ids the phase skips, #7043)
  *
  * `.types` is the single source of truth for "enabled types" — the CLI
  * default reads from the same key (Eng-v2 A2).
@@ -49,10 +50,10 @@ import {
   loadPricingOverrides,
 } from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
-import { assertUnmanagedCanonicalWriter } from '../persistence/maintenance.ts';
 import { listSources } from '../sources-ops.ts';
 import {
   runExtractConversationFactsCore,
+  emptyExtractConversationFactsResult,
   isAbortError,
   type ExtractConversationFactsResult,
 } from '../../commands/extract-conversation-facts.ts';
@@ -60,6 +61,9 @@ import {
 // binding extract-conversation-facts.ts re-exports) so this phase is part of
 // the drift-guarded set in test/conversation-facts-type-allowlist-drift.test.ts.
 import { ALLOWED_TYPES, type AllowedType } from '../facts/conversation-types.ts';
+import { conversationFactsCostCap } from '../facts/conversation-budget.ts';
+import { noPricingMessage } from '../budget/no-pricing.ts';
+import { OperationError } from '../ops/contract.ts';
 
 /** Per-phase wrapper opts. */
 export interface ConversationFactsBackfillPhaseOpts {
@@ -86,13 +90,16 @@ export interface ConversationFactsBackfillPhaseResult {
 
 const CFG_PREFIX = 'cycle.conversation_facts_backfill';
 
-interface ResolvedConfig {
+export interface ResolvedConfig {
   enabled: boolean;
   maxCostUsd: number;          // per source per cycle
   maxTotalCostUsd: number;     // brain-wide per cycle
+  explicitCostCap: boolean;
   maxWalltimeMin: number;      // per source per cycle
   maxTotalWalltimeMin: number; // brain-wide per cycle
   types: AllowedType[];
+  /** #7043: source ids the phase never extracts (`exclude_sources`, default none). */
+  excludeSources: string[];
   /**
    * v0.41.15.0 (D9 in cycle context): in-process worker count per
    * per-source invocation. Default 1 — cycle is opt-in per CLAUDE.md,
@@ -102,9 +109,10 @@ interface ResolvedConfig {
   workers: number;
 }
 
-async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
+/** The backfill's resolved config (switch, caps, types); doctor reads the same values. */
+export async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
   const get = (k: string) => engine.getConfig(`${CFG_PREFIX}.${k}`);
-  const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw] =
+  const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw, excludeRaw] =
     await Promise.all([
       get('enabled'),
       get('max_cost_usd'),
@@ -113,6 +121,7 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
       get('max_total_walltime_min'),
       get('types'),
       get('workers'),
+      get('exclude_sources'),
     ]);
 
   // Truthy-string parse mirrors isFactsExtractionEnabled.
@@ -155,8 +164,10 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
 
   return {
     enabled: enabledFlag,
+    excludeSources: parseSourceList(excludeRaw),
     maxCostUsd: parseFloatOrDefault(maxCost, 1.0),
     maxTotalCostUsd: parseFloatOrDefault(maxTotalCost, 5.0),
+    explicitCostCap: maxCost !== null || maxTotalCost !== null,
     maxWalltimeMin: parseFloatOrDefault(maxWall, 20),
     maxTotalWalltimeMin: parseFloatOrDefault(maxTotalWall, 30),
     types,
@@ -191,19 +202,21 @@ export async function runPhaseConversationFactsBackfill(
     );
   }
 
-  await assertUnmanagedCanonicalWriter(engine, 'conversation fact backfill');
   const startedAt = Date.now();
+  const costCap = await conversationFactsCostCap(engine, cfg.maxTotalCostUsd, cfg.explicitCostCap, pricingOverrides);
   const maxTotalWalltimeMs = cfg.maxTotalWalltimeMin * 60_000;
   const maxWalltimeMs = cfg.maxWalltimeMin * 60_000;
 
-  const sources = await listSources(engine);
+  const listed = await listSources(engine);
+  const excluded = listed.filter(src => cfg.excludeSources.includes(src.id)).map(src => src.id);
+  const sources = listed.filter(src => !excluded.includes(src.id));
   if (sources.length === 0) {
     return {
       phase: 'conversation_facts_backfill',
       status: 'ok',
       duration_ms: Date.now() - startedAt,
-      summary: 'no sources to process',
-      details: { sources_count: 0 },
+      summary: excluded.length ? `no sources to process (${excluded.length} excluded by ${CFG_PREFIX}.exclude_sources)` : 'no sources to process',
+      details: { sources_count: 0, ...(excluded.length ? { sources_excluded: excluded } : {}) },
     };
   }
 
@@ -216,35 +229,10 @@ export async function runPhaseConversationFactsBackfill(
   let skippedByBrainWideWalltime = 0;
   let sourcesBudgetExhausted = 0;
   let sourcesWalltimeExhausted = 0;
+  const sourcesNotOwned: string[] = [];
   let totalSpent = 0;
 
-  const zeroResult = (): ExtractConversationFactsResult => ({
-    pages_considered: 0,
-    pages_processed: 0,
-    pages_skipped: 0,
-    pages_skipped_unparsed: 0,
-    pages_skipped_type_mismatch: 0,
-    pages_skipped_insufficient_turns: 0,
-    pages_skipped_since: 0,
-    pages_skipped_too_large: 0,
-    pages_skipped_disappeared: 0,
-    pages_skipped_completed: 0,
-    pages_skipped_non_extractable: 0,
-    pages_marked_non_extractable: 0,
-    pages_skipped_unrecognized_speaker: 0,
-    pages_failed: 0,
-    pages_llm_fallback: 0,
-    // v0.41.15.0 (D6 + D11): new counters from the per-page lock
-    // + delete-orphans-first replay safety.
-    pages_lock_skipped: 0,
-    orphan_facts_cleaned: 0,
-    segments_processed: 0,
-    facts_extracted: 0,
-    facts_inserted: 0,
-    // #4052: alias_exact resolution counters (required on the result type).
-    fallback_slugify_count: 0,
-    resolution_errors: 0,
-  });
+  const zeroResult = emptyExtractConversationFactsResult;
 
   // #3627: the per-source caps (max_cost_usd / max_walltime_min) were parsed
   // but never enforced — one runaway source could eat the whole brain-wide
@@ -267,14 +255,14 @@ export async function runPhaseConversationFactsBackfill(
       }
 
       // Brain-wide cost check (sum of per-source tracker spends).
-      const remainingCostUsd = cfg.maxTotalCostUsd - totalSpent;
+      const remainingCostUsd = costCap === undefined ? Infinity : costCap - totalSpent;
       if (remainingCostUsd <= 0) {
         skippedByBrainWideCap = sources.length - i;
         break;
       }
 
       const perSourceWallMs = Math.min(maxWalltimeMs, remainingWallMs);
-      const perSourceCapUsd = Math.min(cfg.maxCostUsd, remainingCostUsd);
+      const perSourceCapUsd = costCap === undefined ? undefined : Math.min(cfg.maxCostUsd, remainingCostUsd);
       const tracker = new BudgetTracker({
         maxCostUsd: perSourceCapUsd,
         maxRuntimeMs: perSourceWallMs,
@@ -333,6 +321,9 @@ export async function runPhaseConversationFactsBackfill(
           perSourceResults[src.id] = {
             ...zeroResult(),
             budget_exhausted: true,
+            budget_reason: err.reason,
+            budget_model: err.modelId,
+            ...(err.pricing ? { budget_pricing: err.pricing } : {}),
             error: err.message,
           };
         } else if (isAbortError(err)) {
@@ -341,6 +332,9 @@ export async function runPhaseConversationFactsBackfill(
           // is still cycle-runner control flow — propagate it rather than
           // downgrading it to a per-source failure record.
           throw err;
+        } else if (err instanceof OperationError && err.code === 'owner_unavailable') {
+          sourcesNotOwned.push(src.id); // its owner host extracts it (as fence_repair skips); reported, not a failure
+          perSourceResults[src.id] = zeroResult();
         } else {
           // Per-source failure: record + continue with next source.
           perSourceResults[src.id] = {
@@ -390,8 +384,8 @@ export async function runPhaseConversationFactsBackfill(
     resolution_errors: 0,
     sources_processed: 0,
   };
-  for (const r of Object.values(perSourceResults)) {
-    if (!r.error) totals.sources_processed++;
+  for (const [id, r] of Object.entries(perSourceResults)) {
+    if (!r.error && !sourcesNotOwned.includes(id)) totals.sources_processed++;
     totals.pages_processed += r.pages_processed;
     totals.pages_skipped += r.pages_skipped;
     totals.pages_skipped_unparsed += r.pages_skipped_unparsed;
@@ -409,10 +403,14 @@ export async function runPhaseConversationFactsBackfill(
   }
 
   const anyError = Object.values(perSourceResults).some(
-    (r) => r.error || r.pages_failed > 0,
+    (r) => r.error || r.pages_failed > 0 || r.budget_reason === 'no_pricing',
   );
   const status = anyError ? 'warn' : 'ok';
-  const summary = `${totals.facts_inserted} facts inserted across ${totals.sources_processed}/${sources.length} sources, ~$${totalSpent.toFixed(4)} spent`;
+  const noPricing = [...new Map(Object.values(perSourceResults)
+    .flatMap((r) => r.budget_pricing ? [[r.budget_pricing.model, r.budget_pricing] as const] : [])).values()];
+  const summary = `${totals.facts_inserted} facts inserted across ${totals.sources_processed}/${sources.length} sources, ~$${totalSpent.toFixed(4)} spent` +
+    noPricing.map((g) => `. ${noPricingMessage(g)}`).join('') + notOwnedNote(sourcesNotOwned)
+    + (excluded.length ? `. Skipped ${excluded.length} source(s) listed in ${CFG_PREFIX}.exclude_sources (${excluded.join(', ')})` : '');
 
   return {
     phase: 'conversation_facts_backfill',
@@ -442,12 +440,31 @@ export async function runPhaseConversationFactsBackfill(
       // #3627: per-source cap enforcement observability.
       sources_budget_exhausted: sourcesBudgetExhausted,
       sources_walltime_exhausted: sourcesWalltimeExhausted,
+      sources_skipped_not_owner: sourcesNotOwned,
+      sources_excluded: excluded,
+      no_pricing: noPricing,
       types: cfg.types,
       max_cost_usd: cfg.maxCostUsd,
+      cost_cap_enforced: costCap !== undefined,
       max_walltime_min: cfg.maxWalltimeMin,
       max_total_cost_usd: cfg.maxTotalCostUsd,
       max_total_walltime_min: cfg.maxTotalWalltimeMin,
       per_source: perSourceResults,
     },
   };
+}
+
+/** `exclude_sources`: a JSON array of source ids or a comma-separated list; anything else excludes nothing. */
+function parseSourceList(raw: string | null): string[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter((id): id is string => typeof id === 'string' && id.trim() !== '').map(id => id.trim());
+    if (typeof parsed !== 'string') return [];
+  } catch { /* a comma-separated list */ }
+  return raw.split(',').map(id => id.trim()).filter(Boolean);
+}
+
+function notOwnedNote(ids: string[]): string {
+  return ids.length ? `. Skipped ${ids.length} managed source(s) this host does not own (${ids.join(', ')}); run the phase on their owner host` : '';
 }

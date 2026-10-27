@@ -88,9 +88,11 @@ export function resolveContextualSynopsisLeaseSettings(
  * `source_id` field in the payload that mismatches the loaded value
  * triggers UnrecoverableError (stale/malicious payload defense).
  *
- * `expected_source_id` is optional — when present, the handler verifies
- * it matches the loaded page's source_id. Lets the submitter (mode-switch
- * hook with known per-source plans) catch its own staleness.
+ * `expected_source_id` is optional — when present, the page is resolved in
+ * that source only; a same-slug page in another source is never selected,
+ * and a page missing from that source fails the job without re-embedding
+ * anything. Lets the submitter (mode-switch hook with known per-source
+ * plans) catch its own staleness.
  */
 export interface ContextualReindexJobData {
   page_slug: string;
@@ -104,7 +106,7 @@ export interface MakeContextualReindexHandlerOpts {
 }
 
 export async function resolveContextualSynopsisModel(
-  engine: BrainEngine,
+  engine: BrainEngine | null,
   explicitModel?: string,
 ): Promise<string> {
   return resolveModel(engine, {
@@ -127,28 +129,24 @@ export function makeContextualReindexHandler(opts: MakeContextualReindexHandlerO
 
   return async function contextualReindexHandler(
     ctx: MinionJobContext,
-  ): Promise<{ ok: true; mode_applied: string; chunks_embedded: number }> {
+  ): Promise<{ ok: boolean; mode_applied: string; chunks_embedded: number; skip_reason?: string; next?: string }> {
     const data = parseJobData(ctx.data);
 
     // Load page row to derive the authoritative source_id (D27 P2-1).
-    // Without sourceId we can't do a lookup at all — fall back to
-    // 'default' for the initial lookup, then if the page isn't found
-    // there, surface as unrecoverable (the submitter should have
-    // included expected_source_id).
-    let foundPage = await tryLoadPageAcrossSources(engine, data.page_slug);
+    // With expected_source_id the lookup is scoped to that source and a
+    // miss is final (stale payload): falling back across sources would
+    // re-embed another source's same-slug page. Without it, try 'default'
+    // and then every live source.
+    const foundPage = data.expected_source_id
+      ? await engine.getPage(data.page_slug, { sourceId: data.expected_source_id })
+      : await tryLoadPageAcrossSources(engine, data.page_slug);
     if (!foundPage) {
       throw new UnrecoverableError(
-        `Page not found for slug '${data.page_slug}'. ` +
-          `Submitter should include expected_source_id or the page may have been deleted.`,
-      );
-    }
-
-    // D27 P2-1: reject mismatched expected_source_id (stale payload).
-    if (data.expected_source_id && data.expected_source_id !== foundPage.source_id) {
-      throw new UnrecoverableError(
-        `Source id mismatch for page '${data.page_slug}': expected ` +
-          `'${data.expected_source_id}', page actually lives in ` +
-          `'${foundPage.source_id}'. Stale payload?`,
+        data.expected_source_id
+          ? `Page not found for slug '${data.page_slug}' in its expected source. ` +
+            `The payload is stale or the page was deleted; nothing was re-embedded.`
+          : `Page not found for slug '${data.page_slug}'. ` +
+            `Submitter should include expected_source_id or the page may have been deleted.`,
       );
     }
 
@@ -283,7 +281,7 @@ function abortError(): Error {
 function classifyResult(
   pageSlug: string,
   result: ReembedPageResult,
-): { ok: true; mode_applied: string; chunks_embedded: number } {
+): { ok: boolean; mode_applied: string; chunks_embedded: number; skip_reason?: string; next?: string } {
   switch (result.kind) {
     case 'success':
       return {
@@ -301,7 +299,10 @@ function classifyResult(
         chunks_embedded: result.chunks_embedded,
       };
     case 'skipped':
-      return { ok: true, mode_applied: 'skipped', chunks_embedded: 0 };
+      // A fact purge's pending derivation sweep blocks the page's paid synopsis: not done, and not a cap to raise.
+      if (result.reason === 'purge_sweep_pending') return { ok: false, mode_applied: 'skipped', chunks_embedded: 0, skip_reason: result.reason,
+        next: 'A fact purge\'s sweep of stored derivation results covers this page, so no synopsis was paid for. gbrain doctor --only derivation_purge_sweeps names the purge and the command that finishes its sweep (gbrain forget --purge --status --request-id <request_id> --continue); then run the reindex again.' };
+      return { ok: true, mode_applied: 'skipped', chunks_embedded: 0, skip_reason: result.reason };
     case 'transient_error':
       // Throw so Minion retries. The queue's backoff policy handles
       // rate-limit + network blips.

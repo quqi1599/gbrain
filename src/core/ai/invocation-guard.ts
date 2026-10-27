@@ -3,10 +3,12 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export interface AIInvocation {
   operation: string;
   model: string;
-  kind: 'chat' | 'embedding' | 'rerank' | 'multimodal';
+  kind: 'chat' | 'embedding' | 'rerank' | 'multimodal' | 'decide' | 'transcription';
   maxInputTokens?: number;
   maxOutputTokens?: number;
   cacheWriteTtl?: '5m' | '1h';
+  /** The input tokens the request is estimated at, for meters when the provider reports no usage. */
+  estimatedInputTokens?: number;
 }
 export interface AIInvocationUsage {
   inputTokens: number;
@@ -25,8 +27,16 @@ export function isAIInvocationPolicyError(error: unknown): boolean {
 }
 
 /** Isolated to this async job; concurrent local work never inherits its owner. */
-export function withAIInvocationGuard<T>(guard: AIInvocationGuard, run: () => Promise<T>): Promise<T> {
-  return guards.run(guard, run);
+export function withAIInvocationGuard<T>(guard: AIInvocationGuard, run: () => Promise<T>, opts: { inherit?: boolean } = {}): Promise<T> {
+  const parent = opts.inherit ? guards.getStore() : undefined;
+  if (!parent) return guards.run(guard, run);
+  return guards.run(async call => {
+    const outer = await parent(call);
+    let inner: AIInvocationPermit;
+    try { inner = await guard(call); }
+    catch (error) { await outer.settle(null); throw error; }
+    return { settle: async usage => { await outer.settle(usage); await inner.settle(usage); } };
+  }, run);
 }
 export function withAIInvocationPreflight<T>(preflight: (call: AIInvocation) => Promise<void>, run: () => Promise<T>): Promise<T> {
   const parent = guards.getStore();
@@ -37,8 +47,95 @@ export function withAIInvocationPreflight<T>(preflight: (call: AIInvocation) => 
 }
 export function hasAIInvocationGuard(): boolean { return guards.getStore() !== undefined; }
 
-/** One provider attempt. No guessed usage, no release on an ambiguous failure. */
-export async function invokeAI<T>(call: AIInvocation, run: () => Promise<T>, usage: (result: T) => AIInvocationUsage | null | Promise<AIInvocationUsage | null>): Promise<T> {
+/**
+ * Who a model call is for: the write request, effect, job or cycle phase that
+ * caused it. Set by the persistence effect dispatcher, the facts queue, the job
+ * worker and the cycle runner; read by invocation observers.
+ */
+export interface AIAttribution {
+  request_id?: string;
+  effect?: string;
+  job_id?: number | string;
+  job_name?: string;
+  phase?: string;
+}
+const attributions = new AsyncLocalStorage<AIAttribution>();
+
+/** Run `fn` with `patch` merged over the current attribution. */
+export function withAIAttribution<T>(patch: AIAttribution, fn: () => T): T {
+  return attributions.run({ ...attributions.getStore(), ...patch }, fn);
+}
+export function currentAIAttribution(): AIAttribution | null { return attributions.getStore() ?? null; }
+
+/**
+ * One observed model call. Observation never changes execution: retries,
+ * token defaults and admission behave exactly as with no observer installed.
+ * Usage is the provider-reported usage of the call's final attempt.
+ */
+export interface AIInvocationEvent {
+  call: AIInvocation;
+  outcome: 'ok' | 'error' | 'refused';
+  usage: AIInvocationUsage | null;
+  startedAt: number;
+  ms: number;
+  attribution: AIAttribution | null;
+}
+export type AIInvocationObserver = (event: AIInvocationEvent) => void;
+const observers = new Set<AIInvocationObserver>();
+let observerFailures = 0;
+
+/** Register an observer of every model call in this process. Returns its disposer; adding the same function twice is a no-op. */
+export function observeAIInvocations(observer: AIInvocationObserver): () => void {
+  observers.add(observer);
+  return () => { observers.delete(observer); };
+}
+const meters = new AsyncLocalStorage<AIInvocationObserver>();
+/** True when a global observer or an enclosing meter (`withAIInvocationMeter`) would see a call. */
+export function hasAIInvocationObservers(): boolean { return observers.size > 0 || meters.getStore() !== undefined; }
+
+/** Observe only the model calls made inside `run` (one search request's cost); an enclosing meter still sees them. */
+export function withAIInvocationMeter<T>(meter: AIInvocationObserver, run: () => Promise<T>): Promise<T> {
+  const parent = meters.getStore();
+  return meters.run(parent ? event => { parent(event); meter(event); } : meter, run);
+}
+/** Observer throws are swallowed and counted here, never surfaced to the call. */
+export function aiInvocationObserverFailures(): number { return observerFailures; }
+
+function notifyObservers(event: AIInvocationEvent): void {
+  for (const observer of observers) {
+    try { observer(event); } catch { observerFailures += 1; }
+  }
+}
+
+/**
+ * One provider attempt. No guessed usage, no release on an ambiguous failure:
+ * a failed attempt settles null (keep the maximum) unless `rejected` proves the
+ * provider refused the request unbilled.
+ */
+export async function invokeAI<T>(call: AIInvocation, run: () => Promise<T>, usage: (result: T) => AIInvocationUsage | null | Promise<AIInvocationUsage | null>,
+  rejected?: (error: unknown) => AIInvocationUsage | null): Promise<T> {
+  const meter = meters.getStore();
+  if (observers.size === 0 && !meter) return admitAndRun(call, run, usage, rejected);
+  const startedAt = Date.now();
+  let outcome: AIInvocationEvent['outcome'] = 'error';
+  let measured: AIInvocationUsage | null = null;
+  try {
+    const result = await admitAndRun(call, run, usage, rejected);
+    outcome = 'ok';
+    try { measured = await usage(result); } catch { measured = null; }
+    return result;
+  } catch (error) {
+    if (isAIInvocationPolicyError(error)) outcome = 'refused';
+    throw error;
+  } finally {
+    const event: AIInvocationEvent = { call, outcome, usage: measured, startedAt, ms: Date.now() - startedAt, attribution: currentAIAttribution() };
+    notifyObservers(event);
+    if (meter) { try { meter(event); } catch { observerFailures += 1; } }
+  }
+}
+
+async function admitAndRun<T>(call: AIInvocation, run: () => Promise<T>, usage: (result: T) => AIInvocationUsage | null | Promise<AIInvocationUsage | null>,
+  rejected?: (error: unknown) => AIInvocationUsage | null): Promise<T> {
   const guard = guards.getStore();
   if (!guard) return run();
   let permit: AIInvocationPermit;
@@ -49,7 +146,7 @@ export async function invokeAI<T>(call: AIInvocation, run: () => Promise<T>, usa
   }
   let result: T;
   try { result = await run(); }
-  catch (error) { await permit.settle(null); throw error; }
+  catch (error) { await permit.settle(rejected?.(error) ?? null); throw error; }
   let measured: AIInvocationUsage | null;
   try { measured = await usage(result); }
   catch (error) { await permit.settle(null); throw error; }

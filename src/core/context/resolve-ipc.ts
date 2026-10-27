@@ -37,6 +37,10 @@
  *     response, and an old serve answers `unknown_kind:sync_start` so the
  *     client degrades to the documented stop-the-serve refusal.
  *
+ *   sync_nudge (secret-gated, protocol:2, versioned) — GBRA-133 PR 2a: record a
+ *     wanted marker (sync trigger, a busy delegated sync) and nudge the serve's
+ *     commit notifier; acknowledged with the marker. Wire shapes in sync-ipc.ts.
+ *
  *   sweep_start / sweep_status (secret-gated, protocol:2) — #677:
  *     serve-delegated maintenance sweep, the same start+poll shape as the
  *     sync kinds (no abort — a sweep is a bounded run). Wire shapes in
@@ -67,6 +71,8 @@ import type { TurnContextResult } from './turn-context.ts';
 import type {
   SyncAbortRequest,
   SyncAbortResponse,
+  SyncNudgeRequest,
+  SyncNudgeResponse,
   SyncStartRequest,
   SyncStartResponse,
   SyncStatusRequest,
@@ -219,6 +225,19 @@ export interface ContextPackRequest {
    * OpenClaw assemble poll.
    */
   manifestOnly?: boolean;
+  /**
+   * Always-loaded core (additive, read-only): return only the core block for
+   * the session source — no assembly, no cursor advance, no banking. Used by
+   * the OpenClaw assemble lane. An older serve ignores it and assembles.
+   */
+  coreOnly?: boolean;
+  /**
+   * #5575 ENG-11 (additive, coreOnly companion): the trust cache identity of
+   * the client's memoized core block. When the serve's current identity
+   * matches, it answers `coreTrust.unchanged` without assembling. An older
+   * serve ignores it and returns the full block without an identity.
+   */
+  coreIdentity?: string;
 }
 
 export type IpcRequest =
@@ -228,6 +247,7 @@ export type IpcRequest =
   | SyncStartRequest
   | SyncStatusRequest
   | SyncAbortRequest
+  | SyncNudgeRequest
   | SweepStartRequest
   | SweepStatusRequest;
 
@@ -257,11 +277,16 @@ export interface ContextPackResponse {
 
 export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;
 export type TurnContextHandler = (req: TurnContextRequest) => Promise<TurnContextResult | null>;
-export type ContextPackHandler = (req: ContextPackRequest) => Promise<TurnContextResult | null>;
+/**
+ * `progress.assembled` is set by a handler once its pack is assembled; the transport's backstop returns that pack
+ * (marked `server_budget`) instead of nothing when the handler's later work (core, session state, brief) runs past it.
+ */
+export type ContextPackHandler = (req: ContextPackRequest, progress?: { assembled?: TurnContextResult | null }) => Promise<TurnContextResult | null>;
 
 export type SyncStartIpcHandler = (req: SyncStartRequest) => SyncStartResponse | Promise<SyncStartResponse>;
 export type SyncStatusIpcHandler = (req: SyncStatusRequest) => SyncStatusResponse | Promise<SyncStatusResponse>;
 export type SyncAbortIpcHandler = (req: SyncAbortRequest) => SyncAbortResponse | Promise<SyncAbortResponse>;
+export type SyncNudgeIpcHandler = (req: SyncNudgeRequest) => SyncNudgeResponse | Promise<SyncNudgeResponse>;
 export type SweepStartIpcHandler = (req: SweepStartRequest) => SweepStartResponse | Promise<SweepStartResponse>;
 export type SweepStatusIpcHandler = (req: SweepStatusRequest) => SweepStatusResponse | Promise<SweepStatusResponse>;
 
@@ -273,6 +298,7 @@ export interface IpcHandlers {
   sync_start?: SyncStartIpcHandler;
   sync_status?: SyncStatusIpcHandler;
   sync_abort?: SyncAbortIpcHandler;
+  sync_nudge?: SyncNudgeIpcHandler;
   sweep_start?: SweepStartIpcHandler;
   sweep_status?: SweepStatusIpcHandler;
 }
@@ -296,6 +322,12 @@ export interface IpcServerOpts {
    * and must not be counted.
    */
   onTurnContextDelivered?: (result: TurnContextResult, req: TurnContextRequest) => void;
+  /**
+   * context_pack sibling of onTurnContextDelivered (wave 5 D5): fired ONLY
+   * after an ok context_pack response with a non-empty block was written —
+   * the SessionStart brief's delivery seam (telemetry + repeat ledger).
+   */
+  onContextPackDelivered?: (result: TurnContextResult, req: ContextPackRequest) => void;
   /**
    * The server's registered source [CX2-10]. turn_context requests naming a
    * DIFFERENT sourceId are rejected with 'source_mismatch'; the handler always
@@ -351,18 +383,36 @@ export interface IpcPathConfig {
  * database_path must not key off the path — there is no PGLite brain (and
  * no serve) behind it (v0.45.7 gate, preserved).
  *
- * Multi-serve note: on Postgres several serves for the SAME database_url
- * share this path; the first LIVE provider wins — a later serve probes the
- * socket, finds a live owner, and defers (null binding) instead of unlinking
- * it (#4896). Bound-source rejection [CX2-10] still applies per request.
+ * Multi-serve note (#5042): on Postgres every serve binds the resolve
+ * socket of its own bound source (`sourceId` → `resolve-<hash12(url)>-
+ * <hash12(source)>.sock`), so serves for different sources of one database
+ * coexist. Without `sourceId` this returns the legacy URL-only path, which a
+ * serve also binds when it is free (first LIVE provider wins; a later serve
+ * defers instead of unlinking it, #4896). The persistence socket ignores
+ * `sourceId`: it routes to the single resident owner, so it stays
+ * brain-keyed. Bound-source rejection [CX2-10] still applies per request.
  */
-export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' = 'resolve'): string | null {
+export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' = 'resolve', sourceId?: string): string | null {
   if (!cfg) return null;
   if (cfg.engine === 'pglite' && cfg.database_path) return localIpcSocketPath(join(cfg.database_path, `.gbrain-${kind}.sock`));
   if (cfg.engine === 'postgres' && cfg.database_url) {
-    return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}.sock`));
+    const sourceKey = kind === 'resolve' && sourceId ? `-${hash12(sourceId)}` : '';
+    return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}${sourceKey}.sock`));
   }
   return null;
+}
+
+/**
+ * The resolve socket a hook calls (#5042): its own source's socket
+ * (`GBRAIN_SOURCE`, else `default`) when a serve listens there, else the
+ * legacy URL-only socket (an older serve, or a serve bound to a source the
+ * hook does not name). PGLite has a single path (one serve per data dir).
+ */
+export async function hookResolveSocketForConfig(cfg: IpcPathConfig | null | undefined, sourceId: string | undefined): Promise<string | null> {
+  const legacy = resolveSocketPathForConfig(cfg);
+  const keyed = resolveSocketPathForConfig(cfg, 'resolve', sourceId || 'default');
+  if (!legacy || !keyed || keyed === legacy) return legacy;
+  return (await socketHasLiveListener(keyed)) ? keyed : legacy;
 }
 
 /**
@@ -594,6 +644,8 @@ export type SyncAbortClientRequest = Omit<SyncAbortRequest, 'kind' | 'protocol'>
 export type SyncStartIpcResult = SyncStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 export type SyncStatusIpcResult = SyncStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 export type SyncAbortIpcResult = SyncAbortResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SyncNudgeClientRequest = Omit<SyncNudgeRequest, 'kind' | 'protocol'>;
+export type SyncNudgeIpcResult = SyncNudgeResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 
 /**
  * Delegated-sync clients: same fail-soft ladder as requestTurnContext —
@@ -628,6 +680,16 @@ export async function requestSyncAbort(
 ): Promise<SyncAbortIpcResult> {
   const line = JSON.stringify({ kind: 'sync_abort', protocol: 2, ...req } satisfies SyncAbortRequest);
   return syncRoundTrip<SyncAbortResponse>(socketPath, line, opts.timeoutMs ?? SYNC_ABORT_CLIENT_TIMEOUT_MS);
+}
+
+/** GBRA-133 PR 2a: record a wanted marker through the serve (same fail-soft ladder; an older serve reads stale_serve). */
+export async function requestSyncNudge(
+  socketPath: string,
+  req: SyncNudgeClientRequest,
+  opts: { timeoutMs?: number } = {},
+): Promise<SyncNudgeIpcResult> {
+  const line = JSON.stringify({ kind: 'sync_nudge', protocol: 2, ...req } satisfies SyncNudgeRequest);
+  return syncRoundTrip<SyncNudgeResponse>(socketPath, line, opts.timeoutMs ?? SYNC_START_CLIENT_TIMEOUT_MS);
 }
 
 // ── Delegated-sweep clients (#677) — same fail-soft ladder as sync ─────────
@@ -802,6 +864,7 @@ export async function startResolveIpcServer(
         let resp: string;
         let delivered: { block: PointerBlock; req: ResolveRequest } | null = null;
         let deliveredTurnContext: { result: TurnContextResult; req: TurnContextRequest } | null = null;
+        let deliveredPack: { result: TurnContextResult; req: ContextPackRequest } | null = null;
         try {
           const parsed = JSON.parse(line) as IpcRequest;
           const kind = (parsed as { kind?: unknown }).kind ?? 'resolve';
@@ -830,9 +893,10 @@ export async function startResolveIpcServer(
               deliveredTurnContext = { result: tcResp.block, req };
             }
           } else if (kind === 'context_pack') {
-            resp = JSON.stringify(
-              await handleContextPack(parsed as ContextPackRequest, handlers, opts),
-            );
+            const req = parsed as ContextPackRequest;
+            const cpResp = await handleContextPack(req, handlers, opts);
+            resp = JSON.stringify(cpResp);
+            if (cpResp.ok && cpResp.block && cpResp.block.text) deliveredPack = { result: cpResp.block, req };
           } else if (kind === 'sync_start') {
             resp = JSON.stringify(
               await handleSyncKind(parsed as SyncStartRequest, handlers.sync_start, opts),
@@ -844,6 +908,10 @@ export async function startResolveIpcServer(
           } else if (kind === 'sync_abort') {
             resp = JSON.stringify(
               await handleSyncKind(parsed as SyncAbortRequest, handlers.sync_abort, opts),
+            );
+          } else if (kind === 'sync_nudge') {
+            resp = JSON.stringify(
+              await handleSyncKind(parsed as SyncNudgeRequest, handlers.sync_nudge, opts),
             );
           } else if (kind === 'sweep_start') {
             resp = JSON.stringify(
@@ -868,6 +936,9 @@ export async function startResolveIpcServer(
           }
           if (deliveredTurnContext && opts.onTurnContextDelivered) {
             try { opts.onTurnContextDelivered(deliveredTurnContext.result, deliveredTurnContext.req); } catch { /* telemetry only */ }
+          }
+          if (deliveredPack && opts.onContextPackDelivered) {
+            try { opts.onContextPackDelivered(deliveredPack.result, deliveredPack.req); } catch { /* telemetry only */ }
           }
         } catch { /* client gone — do NOT log undelivered pointers */ }
         conn.end();
@@ -964,9 +1035,10 @@ async function handleContextPack(
       const t = setTimeout(() => r('__budget__'), CONTEXT_PACK_SERVER_BUDGET_MS + 200);
       t.unref?.();
     });
-    const result = await Promise.race([handlers.context_pack(req), budget]);
+    const progress: { assembled?: TurnContextResult | null } = {};
+    const result = await Promise.race([handlers.context_pack(req, progress), budget]);
     if (result === '__budget__') {
-      return { ok: true, protocol: 2, block: null, degradedReason: 'server_budget' };
+      return { ok: true, protocol: 2, block: progress.assembled ?? null, degradedReason: 'server_budget' };
     }
     return {
       ok: true,

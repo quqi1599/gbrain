@@ -5,6 +5,8 @@ import {
   isNewerVersion,
   extractChangelogBetween,
 } from '../src/commands/check-update.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
+import { fileURLToPath } from 'node:url';
 
 describe('parseSemver', () => {
   test('parses standard version', () => {
@@ -165,15 +167,13 @@ describe('extractChangelogBetween', () => {
 
 describe('check-update CLI', () => {
   test('check-update is in CLI_ONLY set', async () => {
-    const source = await Bun.file(
-      new URL('../src/cli.ts', import.meta.url).pathname
-    ).text();
+    const source = surfaceSource('cli');
     expect(source).toContain("'check-update'");
   });
 
   test('--help prints usage and exits 0', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'check-update', '--help'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -185,7 +185,7 @@ describe('check-update CLI', () => {
 
   test('--json returns valid JSON with required fields', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'check-update', '--json'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });

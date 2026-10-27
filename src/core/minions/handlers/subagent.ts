@@ -24,7 +24,7 @@
  * as P2 items in the plan file.
  */
 
-import { retainToolWriteRequestId, assertToolWriteCommitted, isPendingToolWrite } from '../tool-write-identity.ts';
+import { retainToolWriteRequestId, awaitCommittedToolWrite, isPendingToolWrite } from '../tool-write-identity.ts';
 import Anthropic from '@anthropic-ai/sdk';
 import type { MinionJobContext, MinionJob } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
@@ -38,7 +38,7 @@ import type {
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { loadConfig, isConfigTruthy } from '../../config.ts';
-import { buildBrainTools, selectAllowedTools } from '../tools/brain-allowlist.ts';
+import { buildBrainPutPagesTool, buildBrainTools, selectAllowedTools } from '../tools/brain-allowlist.ts';
 import {
   acquireLease,
   releaseLease,
@@ -57,6 +57,7 @@ import { toolLoop as gatewayToolLoop, isThinkingModel, THINKING_MODEL_MAX_OUTPUT
 import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
+import { directStopReason, gatewayStopReason, replayTerminalStopReason } from '../subagent-stop-reason.ts';
 import type { OneshotFallbackReason } from '../types.ts';
 import {
   loadPriorMessages,
@@ -76,6 +77,7 @@ import { applyDelegatedData, guardDelegatedTools } from '../delegated-tools.ts';
 import { withDelegatedSpend } from '../delegated-spend.ts';
 import { invokeAI, sdkInvocationUsage, hasAIInvocationGuard } from '../../ai/invocation-guard.ts';
 import { chatInvocation } from '../../ai/guarded-generation.ts';
+import { resolveChatPerTurnTimeoutMs } from '../handler-timeouts.ts';
 
 // ── Defaults ────────────────────────────────────────────────
 
@@ -191,14 +193,16 @@ export interface SubagentDeps {
 
 /**
  * F1 (adversarial review): a replayed terminal assistant turn that hit the
- * output cap must NOT launder into 'end_turn'. The zero-attempt honesty gate
- * (finalizeWriteAccounting) keys on stop_reason, and a truncated zero-write
- * run replaying as a clean finish would consume the transcript's idempotency
- * key with zero pages written — the exact silent-loss class #4217 kills. The
- * live stop reason is not persisted; `tokens_out >= cap` recovers it (a
- * length stop reports the capped count). A clean turn producing EXACTLY cap
- * tokens is a theoretical false positive; its consequence is dead-letter +
- * key release + nightly retry — self-healing, never silent loss.
+ * output cap must NOT launder into 'end_turn' (replayTerminalStopReason in
+ * ../subagent-stop-reason.ts, which also maps an empty persisted turn to
+ * 'error', #6448). The zero-attempt honesty gate (finalizeWriteAccounting)
+ * keys on stop_reason, and a truncated zero-write run replaying as a clean
+ * finish would consume the transcript's idempotency key with zero pages
+ * written — the exact silent-loss class #4217 kills. The live stop reason is
+ * not persisted; `tokens_out >= cap` recovers it (a length stop reports the
+ * capped count). A clean turn producing EXACTLY cap tokens is a theoretical
+ * false positive; its consequence is dead-letter + key release + nightly
+ * retry — self-healing, never silent loss.
  */
 /**
  * Convert a lease-lost abort into the lease-full requeue vocabulary. When
@@ -242,13 +246,6 @@ async function runLoopConvertingLeaseLoss<T>(
     if (detail !== null) throw new UnrecoverableError(`prompt_too_long: ${detail}`);
     throw e;
   }
-}
-
-function replayTerminalStopReason(
-  tokensOut: number | null | undefined,
-  maxOutputTokens: number,
-): SubagentStopReason {
-  return tokensOut != null && tokensOut >= maxOutputTokens ? 'max_tokens' : 'end_turn';
 }
 
 export function makeSubagentHandler(deps: SubagentDeps) {
@@ -312,7 +309,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         ? { ...inner, synth_mode_used: 'agentic' }
         : inner;
     return finalizeWriteAccounting(engine, ctx.id, stamped, {
-      requireWrites: dataForAccounting.require_writes === true,
+      requireWrites: dataForAccounting.require_writes === true, allowCleanZeroWrites: dataForAccounting.allow_clean_zero_writes === true,
       // OV-4: a successful oneshot job's verdict is scoped to its own
       // invocation family; a fallback wrote through the loop (no oneshot
       // rows exist — validation precedes all writes), so job-wide is exact.
@@ -380,8 +377,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         : null;
       // Terminal = assistant turn with NO pending tool dispatch in EITHER
       // block vocabulary (legacy Anthropic `tool_use`, gateway `tool-call`)
-      // AND actual text (the gateway terminal rule) — a pending-tool replay
-      // must still pass the gate before the loop resumes on the provider.
+      // AND actual text — stricter than the replay rule (#6448: an empty
+      // tail replays as 'error' with no provider call), because an empty
+      // tail holds no completed work for this exception to protect.
       const alreadyTerminal = lastRow?.role === 'assistant'
         && Array.isArray(lastBlocks)
         && !lastBlocks.some(b => b?.type === 'tool_use' || b?.type === 'tool-call')
@@ -432,6 +430,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       await engine.getConfig('agent.max_output_tokens').catch(() => null),
       model,
     );
+    const turnTimeoutMs = resolveChatPerTurnTimeoutMs(await engine.getConfig('ai.chat.per_turn_timeout_ms').catch(() => null));
     // v0.41 Approach C: systemPrompt is now built AFTER toolDefs (a few
     // lines below) so the renderer can splice a tool-usage preamble
     // listing each available tool's usage_hint. The renderer is
@@ -473,7 +472,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       brainId: data.brain_id,
       allowedSlugPrefixes: data.allowed_slug_prefixes,
       // #1586: cycle-resolved source scope for tool-call OperationContexts.
-      sourceId: data.source_id,
+      sourceId: data.source_id, readBudgetBytes: data.read_budget_bytes, stageWrites: data.stage_writes === true && !submitted, // GBRA-60: trusted local jobs only
     });
     const selectedTools = selectAllowedTools(registry, data.allowed_tools);
     const guardTools = (tools: ToolDef[], deferEmbeds = false) => guardDelegatedTools(engine, config, submitted, ctx.id, tools, deps.toolRegistry !== undefined, deferEmbeds);
@@ -532,15 +531,16 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       if (dispatchOneshot) {
         // Rebuild put_page with deferEmbeds so the embed network call leaves
         // the model path (the standing embed machinery backfills).
-        const oneshotRegistry = deps.toolRegistry ?? buildBrainTools({
+        const oneshotToolOpts = {
           subagentId: ctx.id,
           engine,
           config,
           brainId: data.brain_id,
           allowedSlugPrefixes: data.allowed_slug_prefixes,
           sourceId: data.source_id,
-          deferEmbeds: true,
-        });
+          deferEmbeds: true, readBudgetBytes: data.read_budget_bytes,
+        };
+        const oneshotRegistry = deps.toolRegistry ?? buildBrainTools(oneshotToolOpts);
         // Honor allowed_tools EXACTLY like the loop registry — a submitter
         // that scoped its job read-only must not gain write capability by
         // setting mode: oneshot (put_page filtered out → no_put_page_tool
@@ -553,7 +553,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           data,
           model,
           maxOutputTokens,
+          turnTimeoutMs,
           putPageTool: oneshotTools.find(t => t.name === 'brain_put_page'),
+          putPagesTool: data.dream_output && !submitted && !deps.toolRegistry && oneshotTools.some(t => t.name === 'brain_put_page') ? buildBrainPutPagesTool(oneshotToolOpts) : undefined,
           leaseKey: gatewayLeaseKey,
           maxConcurrent,
           leaseTtlMs,
@@ -578,6 +580,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         toolDefs,
         maxTurns,
         maxOutputTokens,
+        turnTimeoutMs,
         leaseKey: gatewayLeaseKey,
         maxConcurrent,
         leaseTtlMs,
@@ -658,7 +661,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         return {
           result: finalText,
           turns_count: assistantTurns,
-          stop_reason: replayTerminalStopReason(last.tokens_out, maxOutputTokens),
+          stop_reason: replayTerminalStopReason(last.tokens_out, maxOutputTokens, finalText),
           tokens: tokenTotals,
         };
       }
@@ -702,10 +705,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           retainToolWriteRequestId(use.input, ctx.id, last.message_idx, useOrdinal, use.id, use.name);
           await persistToolExecPending(engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input);
           try {
-            const output = await toolDef.execute(use.input, {
+            const output = await awaitCommittedToolWrite(ctx, use.name, () => toolDef.execute(use.input, {
               engine, jobId: ctx.id, remote: true, signal: ctx.signal,
-            });
-            assertToolWriteCommitted(output, use.name);
+            }));
             await persistToolExecComplete(engine, ctx.id, last.message_idx, useOrdinal, use.id, output);
             synthesizedResults.push({
               type: 'tool_result', tool_use_id: use.id,
@@ -973,15 +975,16 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           b.type === 'tool_use',
       );
       if (toolUses.length === 0) {
-        // #2778: an output-cap hit is NOT end_turn — the text (and possibly a
-        // dropped trailing tool_use block) is truncated. Surface it as its own
-        // stop_reason instead of silently reporting a clean end_turn.
-        stopReason = assistantMsg.stop_reason === 'max_tokens' ? 'max_tokens' : 'end_turn';
         // Concatenate text blocks as the final answer.
         finalText = blocks
           .filter(b => b.type === 'text' && typeof b.text === 'string')
           .map(b => b.text as string)
           .join('\n');
+        // #2778: an output-cap hit is NOT end_turn — the text (and possibly a
+        // dropped trailing tool_use block) is truncated. #6448: a refusal is
+        // 'refusal' and an empty body on a clean stop is 'error', never a
+        // silently reported clean end_turn.
+        stopReason = directStopReason(assistantMsg.stop_reason, finalText);
         break;
       }
 
@@ -1050,13 +1053,12 @@ export function makeSubagentHandler(deps: SubagentDeps) {
 
         const toolStart = Date.now();
         try {
-          const output = await toolDef.execute(use.input, {
+          const output = await awaitCommittedToolWrite(ctx, toolName, () => toolDef.execute(use.input, {
             engine,
             jobId: ctx.id,
             remote: true,
             signal: ctx.signal,
-          });
-          assertToolWriteCommitted(output, toolName);
+          }));
           await persistToolExecComplete(engine, ctx.id, assistantIdx, useOrdinal, use.id, output);
           logSubagentHeartbeat({
             job_id: ctx.id,
@@ -1148,6 +1150,8 @@ interface GatewayRunArgs {
   maxTurns: number;
   /** #2778: per-turn output-token cap (resolved by resolveMaxOutputTokens). */
   maxOutputTokens: number;
+  /** `ai.chat.per_turn_timeout_ms`: each turn's chat backstop (#4921). */
+  turnTimeoutMs: number;
   /**
    * #4194/CDX-7 — per-turn rate-lease parameters. Pre-fix the gateway path
    * made provider calls with no lease at all (the legacy loop's acquisition
@@ -1176,7 +1180,7 @@ interface GatewayRunArgs {
  * reconciler sees both shapes uniformly.
  */
 async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResult> {
-  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, leaseKey, maxConcurrent, leaseTtlMs } = args;
+  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, turnTimeoutMs, leaseKey, maxConcurrent, leaseTtlMs } = args;
 
   // Map ToolDef → ChatToolDef (gateway shape). The gateway's chat() bridges
   // this to provider-specific tool definitions via the Vercel AI SDK.
@@ -1197,9 +1201,8 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       idempotent: t.idempotent === true,
       async execute(input: unknown, signal: AbortSignal): Promise<unknown> {
         try {
-          const output = await t.execute(input, { engine, jobId: ctx.id, remote: true, signal });
-          assertToolWriteCommitted(output, t.name);
-          return output;
+          return await awaitCommittedToolWrite({ deadlineAtMs: ctx.deadlineAtMs, signal }, t.name,
+            () => t.execute(input, { engine, jobId: ctx.id, remote: true, signal }));
         } catch (error) {
           if (isPendingToolWrite(error)) pendingToolWrite = error;
           throw error;
@@ -1247,6 +1250,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       priorTools: priorToolsV1,
       toolDefs,
       signal: ctx.signal,
+      jobDeadlineAtMs: ctx.deadlineAtMs,
     });
 
   // Terminal early-return (#1151 parity): the prior run already reached
@@ -1257,7 +1261,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     return {
       result: terminalText,
       turns_count: priorChatMessages.filter(m => m.role === 'assistant').length,
-      stop_reason: replayTerminalStopReason(lastAssistant?.tokens_out, maxOutputTokens),
+      stop_reason: replayTerminalStopReason(lastAssistant?.tokens_out, maxOutputTokens, terminalText),
       tokens: priorTokens,
     };
   }
@@ -1316,6 +1320,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     maxTurns,
     maxTokens: maxOutputTokens,
     abortSignal: ctx.signal,
+    turnTimeoutMs,
     cacheSystem,
     // #4194/CDX-7: every provider round-trip holds a rate-lease slot (worker
     // parity with the legacy loop's per-turn acquisition). Lease-full throws
@@ -1473,23 +1478,10 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     maxConcurrent,
   );
 
-  // Map gateway stop reason to SubagentStopReason. 'length' (output-cap hit)
-  // maps to 'max_tokens' — the #2778 honesty vocabulary the direct Anthropic
-  // path already uses — NOT 'end_turn' (#4088: truncation is not a clean
-  // finish). aborted maps to error.
-  const stopReason: SubagentStopReason = result.stopReason === 'end'
-    ? 'end_turn'
-    : result.stopReason === 'length'
-      ? 'max_tokens'
-      : result.stopReason === 'max_turns'
-        ? 'max_turns'
-        : result.stopReason === 'refusal'
-          ? 'refusal'
-          : result.stopReason === 'content_filter'
-            ? 'refusal'
-            : result.stopReason === 'aborted'
-              ? 'error'
-              : 'end_turn';
+  // Map gateway stop reason to SubagentStopReason (../subagent-stop-reason.ts):
+  // 'length' is 'max_tokens' (#2778/#4088: truncation is not a clean finish);
+  // empty_response, aborted and unrecoverable are 'error' (#6448).
+  const stopReason: SubagentStopReason = gatewayStopReason(result.stopReason);
 
   return {
     result: result.finalText,
@@ -1511,6 +1503,8 @@ interface ReconcileArgs {
   priorTools: PersistedToolExec[];
   toolDefs: ToolDef[];
   signal: AbortSignal;
+  /** Bounds how long a re-dispatched pending tool write keeps replaying (#5474). */
+  jobDeadlineAtMs: number | null;
 }
 
 interface ReconcileResult {
@@ -1647,8 +1641,8 @@ async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileRes
       retainToolWriteRequestId(call.input, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName);
       await persistToolExecPending(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input);
       try {
-        const output = await toolDef.execute(call.input, { engine, jobId, remote: true, signal });
-        assertToolWriteCommitted(output, call.toolName);
+        const output = await awaitCommittedToolWrite({ deadlineAtMs: args.jobDeadlineAtMs, signal }, call.toolName,
+          () => toolDef.execute(call.input, { engine, jobId, remote: true, signal }));
         await persistToolExecComplete(engine, jobId, msg.message_idx, callIdx, call.toolCallId, output);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output });
       } catch (e) {
@@ -1673,20 +1667,19 @@ async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileRes
 
   const chatMessages: ChatMessage[] = work.map(w => ({ role: w.role, content: w.blocks }));
 
-  // Terminal case: the transcript already ends on an assistant turn that
-  // carried real text and made no tool calls (prior run reached end_turn).
-  // Surface its text; skip the loop. An assistant turn whose blocks are all
-  // empty (e.g. a reasoning-only/null-text turn that adaptation dropped) is NOT
-  // terminal — falling through lets the loop re-issue the call rather than
-  // returning an empty result.
+  // Terminal case: the transcript already ends on an assistant turn that made
+  // no tool calls (the prior run reached its last turn). Surface its text and
+  // skip the loop. #6448: ANY such tail is terminal, text or not — a
+  // reasoning-only / blank turn re-issued to the provider would end the
+  // request on an assistant message (a prefill Haiku 5.5 rejects with HTTP
+  // 400); the caller maps the empty text to stop_reason 'error' instead.
   const lastMsg = work[work.length - 1];
   let terminalText: string | null = null;
   if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.blocks.some(b => b.type === 'tool-call')) {
-    const text = lastMsg.blocks
+    terminalText = lastMsg.blocks
       .filter((b): b is Extract<ChatBlock, { type: 'text' }> => b.type === 'text')
       .map(b => b.text)
       .join('\n');
-    if (text.trim() !== '') terminalText = text;
   }
 
   return { chatMessages, nextMessageIdx: maxIdx + 1, terminalText };

@@ -6,7 +6,7 @@ Vector search alone underdelivers on real personal-knowledge queries. This doc e
 
 1. **Vector (HNSW on pgvector)** — semantic similarity. Catches "who works on retrieval quality at acme-example?" → pages mentioning "alice-example + retrieval" even when the user never typed "acme".
 2. **BM25 keyword** — lexical match. Catches names, exact phrases, code identifiers, anything where the user remembers the literal token. Survives the cases where vector search drifts into thematic neighbors.
-3. **Reciprocal-rank fusion (RRF)** — merges vector + keyword rankings without weighting one over the other globally. Each strategy gets to vote.
+3. **Reciprocal-rank fusion (RRF)** — merges vector + keyword rankings without weighting one over the other globally. Each strategy gets to vote, and the vote is for a PAGE: arms return each page's best chunk, often different chunks, so fusion sums a page's votes across arms onto the page's lead chunk (largest own vote, ties to the vector arm's chunk); the page's other chunks keep their own votes so they cannot crowd other pages out of a chunk-limited result.
 4. **Knowledge graph traversal** — follows recorded typed edges. It can answer relationship queries whose relevant endpoints are not close in embedding space; it depends on the edges being present and correct, and does not by itself establish causality.
 
 ## Why each one alone fails
@@ -23,17 +23,22 @@ Vector search alone underdelivers on real personal-knowledge queries. This doc e
 
 BrainBench (corpus + harness in the sibling [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo) measures retrieval P@5, R@5, MRR, nDCG@5 on a 240-page Opus-generated rich-prose corpus. (This is the retrieval-ranking benchmark; the in-repo `gbrain eval brainbench` suite — [`docs/eval/BRAINBENCH.md`](../eval/BRAINBENCH.md) — gates the memory behaviors *above* retrieval: unprompted context push, write-back fidelity, cross-session continuity.)
 
-| Strategy | P@5 | R@5 | Notes |
-|---|---|---|---|
-| ripgrep BM25 only | ~18 | ~75 | Lexical-only baseline |
-| vector-only RAG | ~18 | ~80 | Standard RAG implementation |
-| gbrain graph-disabled (hybrid + RRF, no graph traversal) | ~18 | ~85 | Hybrid alone |
-| **gbrain default (full stack)** | **49.1** | **97.9** | Graph + extract-quality lift |
+The [September 9, 2026 refresh](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-09-09-retrieval-refresh.md) (gbrain v0.48.4.0, three ingestion
+orders, fixed-denominator P@5) measured the 145 relationship questions:
 
-The recorded lift on that synthetic corpus was **+31 P@5 points** for graph
-plus extraction-quality changes together. It does not isolate the graph's
-contribution, establish universal superiority, or predict accuracy on a
-different corpus. See the linked harness for the experiment's scope.
+| Adapter | Mean P@5 | Mean R@5 |
+|---|---:|---:|
+| Specialized `gbrain` (recognizes four question templates, follows the fixture graph) | **0.3421** | **0.9791** |
+| Reference hybrid | 0.1917 | 0.6874 |
+| Keyword ranker | 0.1710 | 0.6244 |
+| Vector only | 0.1076 | 0.4069 |
+
+The specialized adapter is strong on the templates it understands, but this is a
+comparison between whole systems. The refresh found that the older headline
+(P@5 49.1%, "+31.4 points over graph-disabled") was not a graph-only effect and
+used metric helpers since corrected; do not cite it. On the fuzzy and externally
+authored families the keyword and vector paths win some comparisons. None of
+this predicts accuracy on a different corpus.
 
 ## Auto-link: why zero-LLM-call edge extraction works
 
@@ -57,7 +62,7 @@ Heuristic link-type inference (`attended`, `works_at`, `invested_in`, `founded`,
 
 ## Cross-encoder reranker: 60% top-1 reshuffle
 
-The reranker is on for the `balanced` and `tokenmax` mode bundles, off for `conservative`. The mode-bundle default is Voyage `rerank-2.5` (`DEFAULT_RERANKER_MODEL`, same `VOYAGE_API_KEY` as the embedding default); a brain with no `search.reranker.model` row reranks with it. Without the key, search fails open in RRF order: the gateway skips the HTTP call (`RerankError('no_key')`), writes ONE audit row per process, prints nothing, and stamps `reranker_skipped (no_key)` on the search meta — `gbrain search --explain` shows it, `gbrain search modes` prints a `Reranker:` readiness line, and `gbrain doctor`'s `reranker_health` names the fix (`export VOYAGE_API_KEY=…` or `gbrain config set search.reranker.enabled false`). Keyed installs without a Voyage key get reranking explicitly disabled at init. The retained query-cache key includes `reranker_model`; persisted result reuse is disabled until every response dependency can be verified. On a real-corpus benchmark across 20 queries, the cross-encoder reshuffled **60% of top-1 results** after the hybrid + RRF + graph stack (historical measurement on the retired hosted reranker, not Voyage; original identifiers are preserved at Git revision `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29`, retained on 2026-09-23). The Voyage default's paired LongMemEval numbers live in [`docs/eval-bench.md`](../eval-bench.md#public-benchmarks-longmemeval).
+The reranker is on for the `balanced` and `tokenmax` mode bundles, off for `conservative`. The mode-bundle default is Voyage `rerank-3-lite` (`DEFAULT_RERANKER_MODEL`, same `VOYAGE_API_KEY` as the embedding default); a brain with no `search.reranker.model` row reranks with it, and a brain with one keeps its own model. It replaced `rerank-2.5` after gbrain-evals #148 (v0.10.93) measured 60% lower rerank cost at 50 candidates × 1,400 tokens with quality within noise; `gbrain config set search.reranker.model voyage:rerank-2.5` switches a brain back. Without the key, search fails open in RRF order: the gateway skips the HTTP call (`RerankError('no_key')`), writes ONE audit row per process, prints nothing, and stamps `reranker_skipped (no_key)` on the search meta — `gbrain search --explain` shows it, `gbrain search modes` prints a `Reranker:` readiness line, and `gbrain doctor`'s `reranker_health` names the fix (`export VOYAGE_API_KEY=…` or `gbrain config set search.reranker.enabled false`). Keyed installs without a Voyage key get reranking explicitly disabled at init. The retained query-cache key includes `reranker_model`; persisted result reuse is disabled until every response dependency can be verified. On a real-corpus benchmark across 20 queries, the cross-encoder reshuffled **60% of top-1 results** after the hybrid + RRF + graph stack (historical measurement on the retired hosted reranker, not Voyage; original identifiers are preserved at Git revision `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29`, retained on 2026-09-23). The Voyage default's paired LongMemEval numbers live in [`docs/eval-bench.md`](../eval-bench.md#public-benchmarks-longmemeval).
 
 The mechanical reason: hybrid ranking is locally optimal per strategy but globally suboptimal. A cross-encoder reranker reads the query + each candidate document jointly, with full attention. It catches the cases where the vector + keyword + graph signals all agreed on a document that's semantically related but topically wrong.
 
@@ -69,7 +74,7 @@ Hybrid search applies a source-factor CASE expression at the SQL layer (lives in
 
 `archive/` is deliberately NOT hard-excluded: it holds high-signal historical content users expect to find, so it is demoted (`0.5x` in `DEFAULT_SOURCE_BOOSTS`), not hidden. The demote is a prior applied in the outer SQL re-rank; the cross-encoder reranker (balanced/tokenmax modes) can still PROMOTE an archive page that survives the demote into the rerank candidate window — it is not an unconditional suppression. `gbrain doctor`'s `hidden_by_search_policy` check reports how many chunked pages remain hidden by the surviving exclude prefixes.
 
-The boost map is configurable via the `GBRAIN_SOURCE_BOOST` env var. Hard exclusions are separate: the exclusion set is defaults ∪ `GBRAIN_SEARCH_EXCLUDE` (env, comma-separated prefixes) ∪ per-call `SearchOpts.exclude_slug_prefixes`. Temporal queries (`detail: 'high'`) bypass the boost so chat pages re-surface for time-sensitive lookups.
+The defaults fit one vault layout, so each brain can carry its own map: `gbrain config set search.source_boosts "wiki/:1.3,daily/:1.0"` overrides or extends the defaults per prefix, and a `none` entry (`"none,wiki/:1.3"`) drops them entirely. The `GBRAIN_SOURCE_BOOST` env var (same format) wins over the brain config for one process. Hard exclusions are separate: the exclusion set is defaults ∪ `GBRAIN_SEARCH_EXCLUDE` (env, comma-separated prefixes) ∪ per-call `SearchOpts.exclude_slug_prefixes`. Temporal queries (`detail: 'high'`) bypass the boost so chat pages re-surface for time-sensitive lookups.
 
 ## Named-thing retrieval (per-page pool + title + alias + evidence)
 
@@ -86,12 +91,26 @@ written up in [`RETRIEVAL_MAXPOOL_INCIDENT.md`](../incidents/RETRIEVAL_MAXPOOL_I
   chunks fill the inner candidate pool, the engines escalate the pool in a
   bounded loop (×4 per step, at most 3 escalations). SQL candidate limits and
   offsets are independent of `ef_search`; supported pgvector versions use
-  strict iterative scans with bounded visits. A filtered short pool is not
+  `relaxed_order` iterative scans with bounded visits (`ef_search` is still
+  sized to the candidate pool; each pooled attempt may visit 20,000 index
+  tuples, so a source or visibility filter covering a tenth of the brain fills
+  its candidate window instead of stopping at the first few hundred eligible
+  chunks). Relaxed order keeps a closer candidate the
+  scan finds after farther ones, which strict order drops, so a selective
+  source or visibility filter fills more of its true neighbours; output order
+  never reaches callers because the inner `ORDER BY distance` and the pooled
+  outer sort re-sort it. `search.hnsw_iterative_scan` (`relaxed_order` |
+  `strict_order` | `off`; env `GBRAIN_HNSW_ITERATIVE_SCAN` wins) restores the
+  older mode without a release; it is latched once per process, so restart
+  serve and autopilot after changing it. A filtered short pool is not
   proof that the corpus is exhausted. Postgres may make one exact fallback
   inside the remaining eight-second arm budget; PGLite does not pretend that
   a JavaScript timeout can cancel its WASM work. Unresolved shortfalls appear
   as `vector_candidates_incomplete` in `degraded`, with scoped
   `vector_pool_underfilled` details in the public retrieval metadata.
+  The content-freshness check runs after the HNSW candidate scan on indexed
+  columns (the planner cannot estimate it and would drop the index); doctor
+  `vector_plan` warns when the emitted statement still misses the index.
 - **Title-phrase boost** — when the normalized query is a contiguous token-run
   inside `page.title` (or an exact full-title match), a floor-ratio-gated,
   bounded multiplier fires (`applyTitleBoost`, `search.title_boost` knob). A
@@ -138,7 +157,7 @@ specific miss with `gbrain search diagnose "<q>" --target <slug>`.
 - **Entity** queries ("who works at X?") apply a higher graph-traversal weight.
 - **Temporal** queries ("what happened last week?") bypass source-boost so chat/daily pages surface.
 - **Event** queries ("Acme AI Series A") engage the timeline index.
-- **Concept** queries ("what is the ownership economy?", "find all the companies doing offshore wind" — definitional paraphrases and landscape/quantifier phrasings with no proper noun) rank vector-lean, so keyword-decoy pages stop outranking the page that actually explains the idea. Proper nouns, quoted phrases, and sub-3-word queries never classify as concept — they keep their existing routing.
+- **Concept** queries ("what is the ownership economy?", "find all the companies doing offshore wind" — definitional paraphrases and landscape/quantifier phrasings with no proper noun) rank vector-lean, so keyword-decoy pages don't outrank the page that actually explains the idea. Proper nouns, quoted phrases, and sub-3-word queries never classify as concept.
 - **General** queries hit the standard hybrid stack.
 
 The classifier is deterministic (no LLM call). Wrong classification degrades gracefully — the hybrid stack still works without it.
@@ -155,14 +174,15 @@ strict `recall_all@5` while hybrid plus equal-weight expansion scores 54.89%
 (paired +3 / -183 questions). Variant lists with the original's weight can
 outvote it on small-k retrieval.
 
-The fix is budget-normalized weighted RRF, composed in `src/core/search/fusion-lists.ts`. Every vector list is a role-tagged arm (`original` | `variant` | `clause` | `image`) — tagged objects, never a positional convention, so a failed arm or a fell-open image branch can't mis-tag a list. The `original` arm always fuses at weight 1; the non-empty `variant`/`clause` arms share ONE total weight budget, `search.expansion_variant_budget` (`weight_i = b / n_voting_arms`, each row scored `weight / (k + rank)`), so total expansion influence is exactly `b` however many variants the LLM produced. `null` — the default in all three mode bundles — is the legacy equal-weight fusion (every list weight 1, byte-identical). A budget in (0, 4] is set with `gbrain config set search.expansion_variant_budget <b>`, per call via `HybridSearchOpts.expansionVariantBudget`, or pinned per eval arm with `gbrain eval longmemeval --expansion-variant-budget <b>` (sweep it against frozen `--expansion-replay` variants so cells differ only in `b`). Arithmetic: two variants agreeing on a distractor at rank 0 tie the original's rank-0 vote exactly at `b = 1.0`; legacy with two variants is ≈ `b = 2.0`; `b = 0.5` subordinates them. The knob is a no-op when expansion is off and folds into the query-cache key (`evb=`). Outcome (ranker wave, 2026-09-06, recorded Haiku variants replayed at every budget): the mechanism is real — strict `recall_all@5` rises from 255/470 at the legacy weighting to 394/470 at budget 0.25 — but its pre-registered rule (≥ plain hybrid − 2 on the 430-question decision set, no type losing > 1) failed at every budget (0.25: −43; plain hybrid 439/470), so every bundle keeps `expansion_variant_budget: null` and the knob is an operator lever. The receipts point at a trigger rather than a weight (expand only when the original query's evidence is weak), filed as the next pre-registered mechanism.
+Budget-normalized weighted RRF, composed in `src/core/search/fusion-lists.ts`. Every vector list is a role-tagged arm (`original` | `variant` | `clause` | `image`) — tagged objects, never a positional convention, so a failed arm or a fell-open image branch can't mis-tag a list. The `original` arm always fuses at weight 1; the non-empty `variant`/`clause` arms share ONE total weight budget, `search.expansion_variant_budget` (`weight_i = b / n_voting_arms`, each row scored `weight / (k + rank)`), so total expansion influence is exactly `b` however many variants the LLM produced. `null`, the default in all three mode bundles, is equal-weight fusion (every list weight 1). A budget in (0, 4] is set with `gbrain config set search.expansion_variant_budget <b>`, per call via `HybridSearchOpts.expansionVariantBudget`, or pinned per eval arm with `gbrain eval longmemeval --expansion-variant-budget <b>` (sweep it against frozen `--expansion-replay` variants so cells differ only in `b`). Arithmetic: two variants agreeing on a distractor at rank 0 tie the original's rank-0 vote exactly at `b = 1.0`; equal weighting with two variants is ≈ `b = 2.0`; `b = 0.5` subordinates them. The knob is a no-op when expansion is off and folds into the query-cache key (`evb=`). Measured 2026-09-06 with recorded Haiku variants replayed at every budget: the mechanism is real — strict `recall_all@5` rises from 255/470 at equal weighting to 394/470 at budget 0.25 — but its pre-registered rule (≥ plain hybrid − 2 on the 430-question decision set, no type losing > 1) failed at every budget (0.25: −43; plain hybrid 439/470), so every bundle sets `expansion_variant_budget: null` and the knob is an operator lever. The receipts point at a trigger rather than a weight (expand only when the original query's evidence is weak) as the next mechanism to pre-register.
 
-The mode bundles retain a core-library `expansion` default (`tokenmax` true;
-`balanced` and `conservative` false). It applies only when a library caller
-leaves `expansion` unset and supplies an `expandFn`. Shipped operations set
-their own policy: `query` requests expansion in every mode, with
-`expand: false` / `--no-expand` as the explicit opt-out; `search` never
-expands. Neither inherits `search.expansion`. Keyless and image-only paths
+The mode bundles carry an `expansion` default, false in all three (`tokenmax`
+turned it off after the 2026-10-14 expansion-latency eval: `query` p50 fell
+from 2,022 to 227 ms with retrieval unchanged). It applies when a caller leaves
+`expansion` unset and supplies an `expandFn`. The `query` operation leaves it
+unset unless the caller passes `expand`, so `query` does not expand by default;
+`expand: true` / `--expand` forces it and `expand: false` / `--no-expand`
+skips it. `search` never expands; `search.expansion` overrides the mode default for `query` only. Keyless and image-only paths
 skip expansion, and `expansion_applied` reports actual variant use. The
 [search-mode guide](../guides/search-modes.md) is the authoritative rule for
 defaults, overrides and provider costs; `gbrain search modes` prints the
@@ -178,19 +198,22 @@ relational recall arm remains available.
 intent classify (query-intent.ts — deterministic, no LLM)
        │
        ▼
-expansion (query: requested by default in every mode; --no-expand opts out;
-           search: off; keyless and image-only paths skip it)
+expansion (query: the mode's default, off in all three; --expand forces,
+           --no-expand skips; search: off; keyless and image-only paths skip it)
        │
        ▼
 hybrid recall + fusion:
    ├── vector  (HNSW on chunk embeddings, per-page max-pool)
-   ├── keyword (BM25 via tsvector)
+   ├── keyword (BM25 via tsvector; text indexed through gbrain_fts_input)
    ├── title-phrase arm
-   ├── relational (typed-edge recall arm — relational queries only)
+   ├── relational (typed-edge recall arm — relational queries only; 2-3
+   │      relationship questions walk typed hop chains when
+   │      search.relational_planner is on)
    ├── source-aware re-rank (CASE in SQL)
    ├── role-tagged arms; variant/clause lists weighted by search.expansion_variant_budget INSIDE the fusion (fusion-lists.ts)
-   └── RRF fusion → cosine re-score → post-fusion boosts
-       (backlink / salience / recency / graph signals / exact-match;
+   └── page-grain RRF fusion → cosine re-score → post-fusion boosts
+       (backlink / salience / recency / graph signals / exact-match,
+        which also fires when a title, slug or alias is named in the query;
         the metadata boosts are skipped when the vector arm was the only
         voter — search.metadata_boost_gate=lexical, metadata-boost-gate.ts)
        │
@@ -198,10 +221,17 @@ hybrid recall + fusion:
 graph augment (optional two-pass structural expansion — walkDepth > 0)
        │
        ▼
-deduplication (4-layer: per-page cap, same-page Jaccard, type diversity)
+deduplication (4-layer: per-page cap, same-page Jaccard, type diversity;
+   with search.diverse_pool_depth N > 0, one row per session — off by default,
+   src/core/search/diverse-pool.ts)
        │
        ▼
-reranker (cross-encoder — balanced/tokenmax; fail-open)
+reranker (cross-encoder — balanced/tokenmax; fail-open; reads
+   reranker.top_n_in rows, at least N with search.diverse_pool_depth)
+       │
+       ▼
+feedback (use-attributed page weights × the ordering score, bounded ±λ;
+   no-op when no page was rated — src/core/search/feedback-boost.ts)
        │
        ▼
 relational re-pin (relational-arm rows back above the reranked text rows, in
@@ -209,7 +239,8 @@ relational re-pin (relational-arm rows back above the reranked text rows, in
    reordered — src/core/search/relational-rerank-pin.ts)
        │
        ▼
-alias hop (exact alias match injects/boosts the canonical page)
+alias hop (exact alias match injects/boosts the canonical page; like the
+   exact-lookup tier below it never re-sorts, so the reranked order holds)
        │
        ▼
 exact-lookup tier (lookup-shaped queries only: slug + exact-title probes
@@ -226,13 +257,24 @@ limit slice → token-budget enforcement (per mode bundle)
 results (+ retrieval-confidence grade in query-op meta — crag.ts)
 ```
 
+**CJK/Latin boundaries in the keyword index (#6370).** Postgres' default
+parser reads Han, Kana and Hangul as letters, so `升级PostgreSQL17后查询Redis7`
+would be one lexeme and an ASCII query for `Redis7` would miss it. Every
+indexing `to_tsvector` (both trigger functions, the page seal, the import seal
+and `reindex-search-vector`) and the title arm's `websearch_to_tsquery` read
+their text through `gbrain_fts_input()` (`src/core/fts-language.ts`), which
+inserts a space at each CJK↔ASCII-letter/digit boundary. It is a no-op on text
+without CJK, so non-CJK vectors are byte-identical. Pure-CJK queries still take
+the raw-text CJK keyword path. The `fts_cjk_boundary` migration rebuilds only
+the rows whose text holds such a boundary.
+
 Per-arm fail-open has one deliberate exception: when BOTH lexical arms
 (`searchKeyword` + `searchTitles`) come back empty because of an ACCESS-class
 failure (`isDbAccessFailure` in `src/core/pg-access-classify.ts` — the DB
 itself is unreachable, not a schema gap), `hybridSearch` rethrows the arm
 error instead of returning an empty result set. A dead database must surface
 as the classified `database_error` envelope, never as a silent "no results".
-Schema-class arm failures (pre-migration brains) keep the fail-open contract.
+Schema-class arm failures (pre-migration brains) fail open.
 
 The stage order is pinned by `hybridSearch` in `src/core/search/hybrid.ts`:
 dedup runs BEFORE the reranker (so the reranker sees a diverse candidate pool,
@@ -257,7 +299,13 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
 - **CRAG-style confidence gate.** `src/core/search/crag.ts` grades every
   `query` op result (`strong`/`moderate`/`weak`) from the already-stamped
   honesty signals — zero LLM, zero added latency — and attaches the grade to
-  response meta. Config-gated and default OFF: `search.crag_escalation=true`
+  response meta. An OR-relaxed keyword top (no chunk matched every query
+  term) grades `weak` (`keyword_relaxed_top`) unless the top five rows
+  corroborate it: at most one query content term appears in none of them,
+  that term is not a name, and one row holds every other matched term. Then
+  it grades `moderate` (`keyword_relaxed_corroborated`): the question used a
+  framing word the corpus never writes, not an attribute or entity the
+  evidence lacks. Config-gated and default OFF: `search.crag_escalation=true`
   re-runs a weak retrieval once at a higher ceiling (expansion + relational
   on, autocut off, limit = the caller's explicit `limit` or the mode-derived
   default — never a hardcoded row count — floored at 50) and keeps the
@@ -266,6 +314,52 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
   `crag.ts`), so default-shape callers never pay a second expansion call for
   a near-identical candidate set. `search.crag_think=true` (local callers)
   escalates a still-weak result to `think`.
+- **Entity-anchored retrieval (default off).** With `search.entity_anchoring=true`,
+  a `query` or `search` that asks for a current state ("now", "currently",
+  "latest" and similar) and names exactly one readable entity page by title
+  gets that page first, then the pages that link to it or name it, newest
+  first (`src/core/search/entity-anchor.ts`). The function is shared with
+  pinned-question refresh. Detection is deterministic, with no model call.
+  Added rows are re-authorized through `getChunkWindows`. The row count and
+  token budget stay what the caller asked for, and anchored rows take at most
+  half the rows. It is skipped with `offset`, type, date, language or symbol
+  filters. Verdict and gates: `docs/eval/decisions/entity-anchoring-query/`.
+- **Facts arm in `query` (default on).** `query` adds up to three active
+  saved facts that match the question (by the query embedding it already
+  computed, by shared terms or by a named entity) as fact rows in spare
+  capacity only: free slots under the caller's row count, and what the page
+  rows leave of the token budget. A page row is never displaced. It also marks
+  a page row `superseded_claim` when a newer fact covers its typed claim
+  (`src/core/search/facts-arm.ts`). A fact row is never page-shaped: it carries
+  `result_type: "fact"`, `fact_id` and a `follow_up` recall call, no `slug` or
+  `id`, and `page_slug` only when the caller can read the entity page. No model
+  call. In the B2 corrections suite
+  with correction-dated writes it lifted forget-then-remember from 92% to 100%
+  correct. `search.query_facts_arm=false` turns it off. Verdict and gates:
+  `docs/eval/decisions/query-facts-arm/`.
+- **Temporal fact reserve (default off).** With `search.temporal_fact_reserve=true`,
+  a `query` with a deterministic temporal cue (when, before, after, how long,
+  since, until, ordinal-time words, ISO dates, month names) and a token budget
+  (`token_budget`, or the one evidence delivery resolves) gives facts ranked by
+  the question (cosine + term share, +0.1 for a real date) up to 15% of the
+  budget and 30% of the rows. They render with their date header, oldest first
+  after the pages, in place of the facts arm. No model call. Gates:
+  `docs/eval/decisions/temporal-fact-reserve/`.
+
+### Use-attributed feedback
+
+Answers from `query`, `search`, `think`, `synthesize` and `recall` record the
+pages they used (with the revision read) and the typed edges on their
+relational paths. A rating (`rate_answer`, or a `think` citation for the brain
+owner) moves each element's weight `w` by `w + α·(r − w)`; the feedback stage
+then multiplies the ordering score by `1 + λ·2·(w − 0.5)`. It runs after the
+reranker, on the reranker's score when it reordered the list, because a boost
+applied before the cross-encoder would be erased; raw scores stay untouched,
+so autocut and evidence grading are unchanged. No retrieval path runs a
+query-language string: the relational arm
+and `traverse_graph` take only typed parameters into fixed SQL, and
+`test/raw-query-routing-guard.test.ts` pins that no op accepts query text as
+SQL or graph syntax. Guide: [retrieval feedback](../guides/retrieval-feedback.md).
 
 ### Relational re-pin: edge answers bypass reranker demotion
 
@@ -278,27 +372,106 @@ shipped `balanced` default, `voyage:rerank-2.5`,
 `scripts/r1-namedthing-rerank-ab.ts --relational`, paired per query): with
 the reranker on and no pin, hit@1 fell from 21/39 to 3/39 (19 paired losses)
 and hit@3 from 27/39 to 5/39 (22 paired losses), while the 11 non-relational
-core questions showed 0 losses. With the pin at its default 3 — measured with
-`--autocut on`, the shape that shipped before rule R2 turned autocut off — the
-same paired comparison shows 0 hit@1 and
-0 hit@3 losses (21/39 and 27/39, the reranker-off numbers) and the 11 core
-questions unchanged, which is why the balanced reranker stays on.
+core questions showed 0 losses. With the pin at its default 3 (measured with
+`--autocut on`; autocut is off by default) the same paired comparison shows
+0 hit@1 and 0 hit@3 losses (21/39 and 27/39, the reranker-off numbers) and the
+11 core questions unchanged, which is why the balanced reranker is on.
 `pinRelationalRows`
 (`src/core/search/relational-rerank-pin.ts`) runs immediately after the
 reranker and re-pins the arm's rows above the reranked text rows in their fused
 order, bounded by `search.relational_rerank_pin` (3 in every bundle; `0`/`off`
-restores the pre-pin ranking). It is a permutation of the pool (nothing added
+disables the pin). It is a permutation of the pool (nothing added
 or removed; one row per page; a relational row the reranker itself ranked
 higher keeps that position; ties go to the fused order), fires only when the
 reranker actually reordered (fail-open and reranker-off runs are untouched —
 the fused order already carries the arm), and is a pure no-op for
 non-relational queries. Pinned rows are stamped `relational_pinned` so autocut
-keeps them and leaves them out of its cliff math (text-row autocut is
-unchanged). The #3995 evidence slot still runs afterwards as the page-1
-guarantee for pin 0 / fail-open runs. The pin trusts the arm: a false-positive
-arm now puts up to `max` edge pages at the top instead of one at `limit` —
-turn it off per brain with `gbrain config set search.relational_rerank_pin off`.
+keeps them and leaves them out of its cliff math (text rows are cut as
+usual). The evidence slot runs afterwards as the page-1 guarantee for pin 0 /
+fail-open runs. The pin trusts the arm: a false-positive arm puts as many edge
+pages at the top as the pin allows, where an unpinned run would place one at
+`limit`. Turn it off per brain with `gbrain config set search.relational_rerank_pin off`.
 The knob folds into the query-cache key (`rrp=`).
+
+### Breadth-first graph walks
+
+Since v0.60.294.0 every graph walk (`traverse_graph`, `gbrain graph`, the graph
+context `think` gathers) is breadth-first. Each page is visited once, at its
+shortest distance from the start page, and each edge comes back once, one hop
+past its shallower walked endpoint. The old walk followed every possible route,
+so a densely linked cluster multiplied the work with every hop (a 12-page
+clique at depth 5 took 22 s before a 20,000-path cap bounded it) and returned
+the same page and edge again at every depth some route reached it.
+
+What that changes for you:
+
+- **Faster on the graphs that were slow.** On Postgres, a depth-5 walk over a
+  12-page clique dropped from 44–91 ms to 4–9 ms, and walks from a 400-spoke hub
+  got 1.8x to 4x faster (`scripts/bench-graph-walk.ts`, medians, against v0.60.292.0).
+- **Complete answers.** The old cap counted routes, so a busy neighbourhood
+  could stop the walk before it reached deeper pages. The new cap counts
+  visited pages (20,000, shallowest first), so a walk reaches every page within
+  its depth unless the brain itself is that large.
+- **Cleaner output.** No repeated pages or edges at deeper depths, so an
+  agent's context holds each relationship once and `gbrain graph` prints each
+  edge once.
+- **Same safety.** Soft delete, private pages and private link origins, source
+  scope, link type and temporal policy still apply at every hop: a page the
+  caller may not read never relays a walk (`test/traverse-bfs.test.ts`).
+
+The walk is one SQL statement on both engines: a recursive CTE whose rows are
+whole layers (`bfsWalkCtes` in `src/core/engine-sql/links.ts`). Walks that reach
+most of a large graph in both directions are still dominated by turning tens
+of thousands of edges into results before the 5,000-row cap, about half a
+second on a 10,000-page, 60,000-link graph; speeding that projection up is
+open work.
+
+### Multi-hop relationship chains
+
+A question that chains two or three relationships ("who founded the companies
+Alice invested in?") is planned by `parseRelationalPlan`
+(`src/core/search/relational-plan.ts`): a bounded lexer, a fixed relationship
+vocabulary, exactly one named entity, hops ordered from that entity outward
+(the main-clause verb is outermost), page types checked along the chain.
+Coordination, negation, time constraints, counting, quoted names and
+multi-entity questions are refused with a reason; single-relationship
+questions stay on `parseRelationalQuery`. With `search.relational_planner` on,
+the relational arm resolves the entity, runs `runRelationalChain`
+(`src/core/search/relational-chain.ts`) and emits answers first, then the
+intermediate and origin pages of every retained path, each row carrying a
+`relational` evidence field (role, seed, hop, path count, up to three edges).
+Up to `search.relational_chain_slots` (default 10) chain rows lead page 1.
+A chain that finds nothing falls back to the one-hop path; a refused question
+runs no relational arm. `meta.relational_plan` and a `relational_chain`
+notice report the outcome.
+
+Execution is one bounded query per hop (`BrainEngine.relationalChainHop`, SQL
+in `src/core/search/read-enrichment.ts`): at most 50 frontier pages, 100
+logical edges per page (lowest link id first) and 10 retained paths per page.
+Links are read by each relationship's page-type signature (`stored`,
+`flipped`, `uncertain` at half weight; canonical frontmatter, manual and
+attendance-section links keep stored direction), duplicate rows between a
+pair collapse into one logical edge, and every endpoint, origin and degree
+contributor passes the read policy before scoring. Path weight is the product
+of hub weights of the intermediate pages (`hubWeight`,
+`src/core/search/hub-dampening.ts`; degree saturates at 300 link rows);
+ties order by source and slug. The same executor serves `traverse_graph`
+`hops` and `gbrain graph-query --hop`.
+
+Chain evidence is page-level through fusion: whichever chunk of a page
+survives carries the page's `relational` field. Only answers count toward the
+relational re-pin and the page-1 evidence slot; intermediate and origin pages
+never claim them. The planner keys fold into the query-cache key only when on
+(`rp=1`, `ro=1`). Guide: [multi-hop relationship questions](../guides/multi-hop.md).
+
+### Link types that take no part in ranking
+
+Every reader that turns links into a ranking signal (backlink and adjacency
+boosts, relational fanout and chain hops, chain hub degree, enrich order,
+canonical entity picks, generated-page demotion, entity anchoring) skips the
+link types in `NON_RANKING_LINK_TYPES` (`src/core/link-ranking-policy.ts`):
+today `amends`. Those edges stay ordinary references in graph reads and cards.
+Guide: [amendments](../guides/temporal-edges.md#amendments-the-amends-link).
 
 ### Metadata boost gate: vector-only voters keep the vector order
 
@@ -306,8 +479,8 @@ The post-fusion metadata boosts (backlink, salience, recency + chronicle,
 graph signals, alias resolution) reward well-connected pages. That is right
 when a lexical arm agreed the page is about the query; it is wrong on
 paraphrase-style concept questions where nothing but the vector arm voted —
-there the boosts promoted hub pages (1.03–1.12x) over the gold concept page,
-which carried none. `decideMetadataBoosts`
+there the boosts promote hub pages (1.03–1.12x) over the gold concept page,
+which carries none. `decideMetadataBoosts`
 (`src/core/search/metadata-boost-gate.ts`) runs before `runPostFusionStages`
 and, under `search.metadata_boost_gate=lexical` (every bundle), skips those
 boosts when no strict keyword, title-phrase or relational row fused (relaxed
@@ -316,19 +489,19 @@ title-phrase boost, compiled-truth boost, cosine re-score, dedup, reranker
 and autocut are untouched either way. Receipt (Cat 13 conceptual recall,
 gbrain-evals): held-out nDCG@5 53.0 → 57.8 (bare vector 60.5 remains the
 stretch), NamedThingBench, BrainBench, the retrieval canary and the
-LongMemEval dev slice byte-identical. `always` restores the pre-wave
-pipeline; the decision is on `HybridSearchMeta.metadata_boost_gate`; the
+LongMemEval dev slice byte-identical. `always` applies the boosts whatever
+voted; the decision is on `HybridSearchMeta.metadata_boost_gate`; the
 knob folds into the query-cache key (`mbg=`). The companion
 `search.keyword_arm_confidence_floor` (`src/core/search/arm-confidence.ts`,
 off in every bundle) down-weights a weak keyword arm in the fusion; its
-pre-registered receipt did not move the held-out score, so it ships as an
+pre-registered receipt did not move the held-out score, so it is an
 operator knob only.
 
 ### Autocut: score-discontinuity result-sizing
 
-Off by default in every bundle. It shipped on for `balanced` and `tokenmax`
-until the ranker wave's pre-registered rule R2 measured it on LongMemEval from
-the shipped default's captured post-rerank pool: with the reranker on, the
+Off by default in every bundle. Pre-registered rule R2 measured it on
+LongMemEval from the default path's captured post-rerank pool: with the
+reranker on, the
 score cliff after the top session is the normal shape on multi-part questions,
 and the cut removed the second gold session — strict `recall_all@5` 449/470 →
 379/470 (−68 paired on the 430-question decision set), with no floor in the
@@ -338,7 +511,7 @@ autocut keeps the best session and drops the rest, which is a token saving
 (mean returned window 3256 → 1633 estimated tokens at 0.35) paid for with the
 questions that need more than one session. `gbrain config set search.autocut
 true` re-enables it with the knobs below; a session-aware cut (never below k
-distinct sessions) is the filed follow-up. `applyAutocut`
+distinct sessions) is a filed follow-up. `applyAutocut`
 (`src/core/search/autocut.ts`) cuts the ranked set at the largest
 cross-encoder rerank-score cliff, before the limit slice, first page only.
 Never-empty failsafe (`minKeep`), no-op when fewer than 2 results carry a
@@ -359,6 +532,34 @@ before any other cell is read.
 
 Each stage is testable in isolation. Each stage is replaceable. The whole pipeline is < 1ms of orchestration cost; the latency budget goes to the upstream HTTP calls (embedding, rerank) and the index scans.
 
+## Evidence delivery: whole evidence after ranking
+
+Ranking decides which pages matter; the reader still needs enough of each page
+to answer. `return_unit` (`chunk`, `window`, `section`, `page`, `auto`; default `auto`)
+adds a stage after ranking, cache and capture, and before output
+redaction and snippet capping, shared by `search`, `query`, `recall` and
+`think` (via `think.return_unit`). It groups the ranked hits by page, reads
+every needed neighbor chunk in ONE batched, page_id-keyed query that
+re-authorizes each page under the caller's current scope, sanitizes each
+page's complete body before slicing, locates the hit chunks in it (so chunk
+overlap never duplicates text), cuts the requested unit around the hits,
+and packs blocks by rank into the token budget with a per-page floor so lower
+ranked sessions keep their matching span. The strict protected-body sanitizer
+runs on the whole body first, so delivered evidence never contains more than
+`get_page` returns to the same caller. The default `auto` expands only
+conversation pages (by page type or `chat/` / `conversations/` slug) to the
+whole page and leaves every other hit its ranked chunk; with no conversation
+hit, or with `chunk`, the stage does not run and responses are byte-identical. The measured motivation: on 400 held-out
+LongMemEval questions whole sessions answered 361 against 253 for top-5
+chunks, while neighbor windows reached only 285–292, so `auto` gives
+conversations exactly the `page` unit. `auto` itself answered 445 of 500
+LongMemEval-S questions against 312 for chunks (development data), and the
+preregistered sealed check was inconclusive at a ceiling (149 against 147 of
+150); see `docs/evidence-delivery.md` for the numbers and the token cost. A lexical
+excerpt selector that failed its evaluation is recorded in
+`docs/eval/ANSWER_PACKET_RESULTS.md`. Contract, algorithms and latency:
+[`docs/evidence-delivery.md`](../evidence-delivery.md).
+
 ## How to verify on your own brain
 
 ```bash
@@ -377,10 +578,10 @@ gbrain eval export > before.ndjson
 gbrain eval replay --against before.ndjson
 
 # A/B retrieval strategies on a labeled fixture
-gbrain eval --qrels labels.tsv --config balanced.json
+gbrain eval --qrels qrels.json --config-a baseline.json --config-b balanced.json
 ```
 
-The current measured LongMemEval result (95.53% session-level `recall_all@5` on the release default path, 449/470, and 93.40% with the reranker off, 439/470; cleaned S split, 470 scored questions, k=5, measured 2026-09-06 by the in-repo harness), its per-type table, every arm of the ranker wave and the judged answer-accuracy row live in [`docs/eval-bench.md`](../eval-bench.md#public-benchmarks-longmemeval).
+The current measured LongMemEval result (95.53% session-level `recall_all@5` on the release default path, 449/470, and 93.40% with the reranker off, 439/470; cleaned S split, 470 scored questions, k=5, measured 2026-09-06 by the in-repo harness), its per-type table, every measured ranker arm and the judged answer-accuracy row live in [`docs/eval-bench.md`](../eval-bench.md#public-benchmarks-longmemeval).
 
 Methodology + metric glossary in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](../eval/SEARCH_MODE_METHODOLOGY.md).
 
@@ -389,9 +590,9 @@ Methodology + metric glossary in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](../eva
 Remote reads default to the `world` take holder when no grant is supplied; an
 explicit empty grant permits no takes. Counts and average weights use only
 permitted active takes. Stored emotional weight contributes zero because it
-combines all holders. Recent-salience inclusion uses `updated_at`, while the
-existing recency formula is retained; unrestricted local reads keep their
-existing formulas. Deleted, quarantined and archived contributors are excluded
+combines all holders. Recent-salience inclusion uses `updated_at` with the
+same recency formula as unrestricted local reads, which use their full
+formulas. Deleted, quarantined and archived contributors are excluded
 before ranking, limits and anomaly-baseline aggregation. Default remote page
 privacy also excludes private pages; its documented opt-outs do not widen
 take-holder permissions.
@@ -400,30 +601,49 @@ take-holder permissions.
 ## Chunk rebuilds after upgrading
 
 **Say to your agent:** *"Check whether my search index is ready, and repair
-code metadata without spending on embeddings."* Search and query now report
+code metadata without spending on embeddings."* Search and query report
 `projection_readiness` for empty and nonempty results. `projection_pending`
 means visible pages lack a current revision seal; `projection_status_unknown`
 means the diagnostic could not establish readiness. Neither is a clean miss.
+`projection_by_design` means the only unsealed pages in scope are
+protected-OCR images (or pages of an archived source), which stay out of the
+index by design: nothing is pending and no repair applies.
 The CLI names these states; `--json` retains its result-array format and sends
 incompleteness notices to stderr. MCP carries them in `_meta.retrieval`.
 
-The upgraded resident `gbrain serve` drains queued Markdown and code rebuilds
+A resident `gbrain serve` drains queued Markdown and code rebuilds
 without provider calls. Code repair can also run through the current owner:
 `gbrain reindex-code --force --no-embed`. Rebuilds preserve only exact,
-provenance-compatible vectors; remaining NULL vectors still need an explicitly
-authorized `gbrain embed --stale` run. A text-ready index is not a promise that
-every page has a vector. Diagnostics do not disclose private or foreign-source
-pending pages and never start repair themselves.
+provenance-compatible vectors: each vector records the embedding input it was
+built from (`content_chunks.embedding_input_hash`: column, model, dimensions,
+wrapping tier and wrapped text), and a rebuild keeps it only when the current
+page would produce the same input, so an unchanged contextual page keeps its
+vectors and a synopsis-mode body edit nulls every synopsis-tier chunk. Vectors
+written before that record existed are grandfathered on pages whose mode
+is still NULL; contextual-mode repair and reindex stamp compatible raw inputs
+when moving those pages to explicit `none`. An explicit `none` page may have
+inherited a title-wrapped vector, so a rebuild clears unstamped vectors there,
+and switching from title or synopsis to `none` clears active text vectors
+immediately. Genuine old raw vectors on explicit `none` pages may need a
+one-time re-embed; it never starts automatically. Remaining NULL vectors
+still need an explicitly authorized `gbrain embed --stale` run. A text-ready
+index is not a promise that every page has a vector. Diagnostics do not
+disclose private or foreign-source pending pages and never start repair
+themselves.
 
 Markdown chunk creation applies the strict protected-body sanitizer before
-splitting text. For remote reads, all existing chunks are withheld until a
-successful rebuild records the current chunker version. Public pages require
-this rebuild too; trusted local chunk reads remain available. Body or chunk changes
-invalidate that record until the next successful rebuild. While pages are withheld,
-remote `search` / `query` report `degraded: [safe_index_pending]` (the MCP
-empty-result block names it) instead of a clean miss, and `gbrain doctor` counts
-the withheld pages and points at the `gbrain reindex --markdown` fix. Direct page reads
-continue to use current source and visibility policy plus body sanitization.
+splitting text. For remote reads, all existing chunks of every page kind are
+withheld until a successful rebuild records the current chunker version. Public
+pages require this rebuild too; trusted local chunk reads remain available. Body or
+chunk changes invalidate that record until the next successful rebuild. Re-importing
+unchanged content (`gbrain sync --full`, `gbrain import`) re-seals such a page
+without a page write or journal admission. While pages are withheld, remote
+`search` / `query` report `degraded: [safe_index_pending]` on empty and partial
+results alike (the MCP empty-result block names it) instead of a clean or complete
+answer, and `gbrain doctor` counts the withheld markdown and code pages and points
+at `gbrain repair safe-chunks`, which re-seals them on any brain, managed included.
+Direct page reads continue to use current source and visibility policy plus body
+sanitization.
 
 Run rebuild commands from a local installation on the brain host; thin clients
 cannot rebuild the host's indexes.

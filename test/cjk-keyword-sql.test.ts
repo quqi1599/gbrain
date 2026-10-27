@@ -4,8 +4,21 @@
  * DATABASE_URL-gated block in test/e2e/engine-parity.test.ts.
  */
 import { describe, test, expect } from 'bun:test';
-import { buildCJKKeywordSql, type CjkKeywordCtx } from '../src/core/search/cjk-keyword-sql.ts';
-import { searchKeywordCJK as searchKeywordCJKPg } from '../src/core/postgres-engine/cjk-search.ts';
+import { buildKeywordMatch } from '../src/core/search/keyword-statement.ts';
+import { buildCJKKeywordSql, buildCJKCandidateSql, type CjkKeywordCtx } from '../src/core/search/cjk-keyword-sql.ts';
+import { searchKeywordCJK, type ScopedReadRunner } from '../src/core/engine-sql/cjk-search.ts';
+import { scopedRead } from '../src/core/engine-sql/brands.ts';
+import type { SqlExecutor } from '../src/core/engine-sql/executor.ts';
+
+/**
+ * Refactor wave 1 C14 (A10 re-point): the executor seam moved from a
+ * `(sql, params) => rows` runner to engine-sql's scoped-read hook; this adapts
+ * a runner of the old shape so the assertions below stay unchanged.
+ */
+function runnerScope(run: (sql: string, params: unknown[]) => Promise<Record<string, unknown>[]>): ScopedReadRunner {
+  const exec = { unsafe: async (sql: string, params: readonly unknown[]) => ({ rows: await run(sql, [...params]), affectedRows: 0 }) } as unknown as SqlExecutor;
+  return (read) => read(scopedRead(exec));
+}
 
 function ctx(overrides: Partial<CjkKeywordCtx> = {}): CjkKeywordCtx {
   return {
@@ -122,11 +135,11 @@ describe('buildCJKKeywordSql (#3986)', () => {
   });
 });
 
-describe('postgres-engine searchKeywordCJK executor (#3986)', () => {
+describe('engine-sql searchKeywordCJK executor (#3986)', () => {
   test('runs the built SQL through the runner and maps rows to SearchResult', async () => {
     const calls: Array<{ sql: string; params: unknown[] }> = [];
-    const results = await searchKeywordCJKPg(
-      async (sql, params) => {
+    const results = await searchKeywordCJK(
+      runnerScope(async (sql, params) => {
         calls.push({ sql, params });
         return [{
           slug: 'notes/tokyo', page_id: 1, title: '東京', type: 'note', source_id: 'default',
@@ -135,7 +148,7 @@ describe('postgres-engine searchKeywordCJK executor (#3986)', () => {
           chunk_id: 10, chunk_index: 0, chunk_text: '東京の会議', chunk_source: 'compiled_truth',
           score: 1.5, stale: false,
         }];
-      },
+      }),
       '東京 会議',
       ctx(),
     );
@@ -149,8 +162,25 @@ describe('postgres-engine searchKeywordCJK executor (#3986)', () => {
 
   test('empty query never touches the runner', async () => {
     let called = false;
-    const results = await searchKeywordCJKPg(async () => { called = true; return []; }, '', ctx());
+    const results = await searchKeywordCJK(runnerScope(async () => { called = true; return []; }), '', ctx());
     expect(results).toEqual([]);
     expect(called).toBe(false);
+  });
+});
+
+describe('Korean particles in the CJK builders (#6666)', () => {
+  const likes = (params: unknown[]) => params.filter(p => typeof p === 'string' && p.startsWith('%'));
+  test('the scoring query matches and scores the stem, not the inflected form', () => {
+    const { params } = buildCJKKeywordSql('혈당에서', ctx())!;
+    expect(likes(params)).toEqual(['%혈당%']);
+    expect(params.filter(p => typeof p === 'string' && !p.startsWith('%'))).toEqual(['혈당', '혈당에서']);
+  });
+
+  test('the capped candidate stage matches the stem too', () => {
+    expect(likes(buildCJKCandidateSql('혈당에서', ctx(), { match: 'all', cap: 50 })!.params)).toEqual(['%혈당%']);
+  });
+
+  test('the keyword count and pages match the stem', () => {
+    expect(likes(buildKeywordMatch('혈당에서 검진을', undefined)!.params)).toEqual(['%혈당%', '%검진%']);
   });
 });

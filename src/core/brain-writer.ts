@@ -18,6 +18,7 @@ import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts'
  */
 
 import { createHash } from 'crypto';
+import { loadBoundedYaml as yamlLoad } from './data-frontmatter.ts';
 import { existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
 import { join, relative, resolve, dirname, basename, isAbsolute } from 'path';
 import type { BrainEngine } from './engine.ts';
@@ -25,29 +26,69 @@ import type { ProgressReporter } from './progress.ts';
 import { gbrainPath } from './config.ts';
 import { collectGitVisibleFiles } from './git-visible-files.ts';
 import {
+  classifyImportHold,
   parseMarkdown,
   type ParseValidationCode,
   type ParseValidationError,
+  type ParseWarningCode,
+  yamlAliasesWithinLimit,
+  yamlBlockError,
 } from './markdown.ts';
-import { isMarkdownFilePath, isSyncable, pruneDir, slugifyPath } from './sync.ts';
+import { DEFAULT_METAFILE_PAGES_MODE, isMarkdownFilePath, isSyncable, pruneDir, readMetafilePagesMode, slugifyPath, type MetafilePagesMode } from './sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from './sync-metafile-pages.ts';
 
 export type { ParseValidationCode };
 
 /** Frontmatter validation is defined only for Markdown page files. */
-export function isFrontmatterScannablePath(path: string): boolean {
-  return isMarkdownFilePath(path) && isSyncable(path, { strategy: 'markdown' });
+export function isFrontmatterScannablePath(path: string, metafilePage?: (path: string) => boolean): boolean {
+  return isMarkdownFilePath(path) && isSyncable(path, { strategy: 'markdown', metafilePage });
+}
+
+/** GBRA-150: `isFrontmatterScannablePath` for paths relative to `root`, where a typed nested metafile is a page under `mode`. */
+export function frontmatterScannableUnder(root: string, mode: MetafilePagesMode = DEFAULT_METAFILE_PAGES_MODE): (path: string) => boolean {
+  const metafilePage = metafilePagePredicate(mode, diskMetafileHeads(root));
+  return path => isFrontmatterScannablePath(path, metafilePage);
 }
 
 export interface AuditFix {
-  code: ParseValidationCode;
+  code: ParseValidationCode | ParseWarningCode;
   description: string;
 }
+
+/**
+ * #5988: per code, how many findings ingestion imports anyway (`recoverable`:
+ * e.g. YAML it reads by quoting a value) versus how many make the file a held
+ * import (`unrecoverable`: YAML it cannot read safely, a conflicting slug, a
+ * protected key in an unclosed fence).
+ */
+export type RecoverabilityByCode = Partial<Record<ParseValidationCode, { recoverable: number; unrecoverable: number }>>;
+
+/**
+ * #5988: files `gbrain repair frontmatter` can fix, by the cause it fixes:
+ * recoverable `YAML_PARSE`, `needs_interpretation` (the held reading needs a
+ * fold or a duplicate-key choice), a `#`-leading value YAML read as a comment
+ * (`FRONTMATTER_COMMENT_VALUE` on title/name/description/summary),
+ * `NESTED_QUOTES`, `NULL_BYTES`, `MISSING_CLOSE`, `SLUG_MISMATCH`. A file
+ * counts once in `files` and once per cause in `by_code`.
+ */
+export interface RepairableReport {
+  files: number;
+  by_code: Partial<Record<RepairableCause, number>>;
+  sample: string[];
+}
+
+export type RepairableCause = 'YAML_PARSE' | 'needs_interpretation' | 'FRONTMATTER_COMMENT_VALUE' | 'NESTED_QUOTES' | 'NULL_BYTES' | 'MISSING_CLOSE' | 'SLUG_MISMATCH';
+
+const REPAIRABLE_ERRORS: ReadonlySet<string> = new Set(['NESTED_QUOTES', 'NULL_BYTES', 'MISSING_CLOSE', 'SLUG_MISMATCH']);
+const RESCUE_KEYS: ReadonlySet<string> = new Set(['title', 'name', 'description', 'summary']);
 
 export interface PerSourceReport {
   source_id: string;
   source_path: string;
   total: number;
   errors_by_code: Partial<Record<ParseValidationCode, number>>;
+  recoverability_by_code?: RecoverabilityByCode;
+  repairable?: RepairableReport;
   sample: { path: string; codes: ParseValidationCode[] }[];
   ignoredMissingOpen: number;
   /** Did this source finish the walk, get interrupted, or never start?
@@ -68,6 +109,7 @@ export interface AuditReport {
   ok: boolean;
   total: number;
   errors_by_code: Partial<Record<ParseValidationCode, number>>;
+  recoverability_by_code?: RecoverabilityByCode;
   per_source: PerSourceReport[];
   scanned_at: string;
   ignored_missing_open?: number;
@@ -120,12 +162,36 @@ export function createFrontmatterBackup(filePath: string, opts: FrontmatterBacku
 // ---------------------------------------------------------------------------
 
 /**
+ * A cosmetic line rewrite is kept only when it reads back as the same value
+ * (#6157). A line that does not parse on its own is a repair target, so the
+ * rewrite is allowed. A line over the alias limit is never rewritten: its
+ * value could expand exponentially when compared.
+ */
+function rewriteKeepsYamlValue(before: string, after: string): boolean {
+  if (!yamlAliasesWithinLimit(before)) return false;
+  let original: unknown;
+  try {
+    original = yamlLoad(before);
+  } catch {
+    return true;
+  }
+  try {
+    return JSON.stringify(yamlLoad(after)) === JSON.stringify(original);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Mechanical auto-repair for the fixable subset of validation codes:
  *   - NULL_BYTES        — strip \x00 characters
  *   - NESTED_QUOTES     — rewrite `"... "inner" ..."` to single-quoted outer
  *   - MISSING_CLOSE     — insert `---` before the first heading found inside
  *                          the YAML zone
  *   - SLUG_MISMATCH     — remove `slug:` line (gbrain derives slug from path)
+ *                          when `opts.filePath` is given. It must be the path
+ *                          the slug derives from (relative to the brain or
+ *                          source root, #5053), never an absolute path.
  *
  * Idempotent: running twice is a no-op on already-clean input. Any error class
  * not in the list above is left untouched (e.g. EMPTY_FRONTMATTER, YAML_PARSE,
@@ -248,7 +314,9 @@ export function autoFixFrontmatter(
           if (!clean) return "''";
           return clean.includes("'") ? `"${clean}"` : `'${clean}'`;
         });
-        lines[i] = `${prefix}[${reQuoted.join(', ')}]`;
+        const rewritten = `${prefix}[${reQuoted.join(', ')}]`;
+        if (!rewriteKeepsYamlValue(lines[i], rewritten)) continue;
+        lines[i] = rewritten;
         fixedAny = true;
       }
       if (fixedAny) {
@@ -264,7 +332,9 @@ export function autoFixFrontmatter(
 
   // 3. NESTED_QUOTES — rewrite `key: "...inner..."` lines that have 3+ unescaped
   //    double-quotes by switching the outer wrapper to single quotes and
-  //    leaving inner quotes alone.
+  //    leaving inner quotes alone. Only when the closed block fails to parse
+  //    (#6157): valid YAML, such as a block-scalar continuation line shaped
+  //    like `Key: "a", then "b"`, is never rewritten.
   {
     const lines = working.split('\n');
     let firstNonEmpty = -1;
@@ -276,8 +346,10 @@ export function autoFixFrontmatter(
       for (let i = firstNonEmpty + 1; i < lines.length; i++) {
         if (lines[i].trim() === '---') { closeIdx = i; break; }
       }
+      const block = lines.slice(firstNonEmpty + 1, closeIdx).join('\n');
+      const blockParses = closeIdx < lines.length && yamlBlockError(block) === null && yamlAliasesWithinLimit(block);
       let fixedAny = false;
-      for (let i = firstNonEmpty + 1; i < closeIdx; i++) {
+      for (let i = firstNonEmpty + 1; !blockParses && i < closeIdx; i++) {
         const m = lines[i].match(/^(\s*[A-Za-z_][\w-]*\s*:\s*)"(.*)"\s*(.*)$/);
         if (!m) continue;
         const [, prefix, inner, trailing] = m;
@@ -334,6 +406,109 @@ export function autoFixFrontmatter(
   return { content: working, fixes };
 }
 
+/** Keys whose `#`-leading value is rescued (quoted) under `includeAmbiguous`. */
+const COMMENT_RESCUE_KEYS: ReadonlySet<string> = new Set(['title', 'name', 'description', 'summary']);
+
+/** What ingestion reads from content: the values a safe repair must keep. */
+function ingestedReading(content: string): string {
+  const parsed = parseMarkdown(content, undefined, { validate: true });
+  if (parsed.errors?.some(error => error.code === 'YAML_PARSE' && !error.recoverable)) return '';
+  return JSON.stringify([parsed.frontmatter, parsed.title, parsed.type, parsed.tags]);
+}
+
+/** Parses with no YAML error at all (strict, no recovery needed) and earns no import hold. */
+function strictlyReadable(candidate: string): boolean {
+  const parsed = parseMarkdown(candidate, undefined, { validate: true });
+  return !parsed.errors?.some(error => error.code === 'YAML_PARSE') && classifyImportHold(parsed) === null;
+}
+
+/**
+ * Swap the YAML block between the fences for `block` (as `recoverFrontmatter`
+ * returns it: rows joined by `\n`, each keeping its own `\r`, a trailing empty
+ * row). Every line outside the block stays byte-identical, BOM included.
+ */
+function replaceFrontmatterBlock(content: string, block: string): string | null {
+  const lines = content.split('\n');
+  const open = lines.findIndex(line => line.trim().length > 0);
+  if (open < 0 || !/^---[ \t]*(?:ya?ml)?[ \t]*$/i.test(lines[open]!.replace(/^\uFEFF/, '').replace(/\r$/, ''))) return null;
+  const close = lines.findIndex((line, i) => i > open && /^---[\t ]*\r?$/.test(line));
+  const rows = block.split('\n');
+  if (close < 0 || rows.pop() !== '') return null;
+  return [...lines.slice(0, open + 1), ...rows, ...lines.slice(close)].join('\n');
+}
+
+/**
+ * #5988: rewrite frontmatter that ingestion can read but a strict YAML parser
+ * cannot. Safe by default: only the `quote` recoveries `parseMarkdown`
+ * applied, line by line (only recovered lines change; CRLF and BOM kept), and
+ * only when the rewritten file strict-parses to exactly the values ingestion
+ * read. `includeAmbiguous` adds the interpretive proposals (unquoted
+ * continuation lines folded into a value, a duplicated key resolved to the
+ * later line, an unclosed `[`/`{` quoted, a `#`-leading title quoted), each
+ * applied only when the result strict-parses with no hold.
+ */
+export function repairRecoverableFrontmatter(
+  content: string,
+  opts: { includeAmbiguous?: boolean } = {},
+): { content: string; fixes: AuditFix[] } {
+  const fixes: AuditFix[] = [];
+  let working = content;
+
+  const parsed = parseMarkdown(working, undefined, { validate: true });
+  const quotes = (parsed.warnings ?? []).filter(w => w.code === 'FRONTMATTER_RECOVERED' && w.kind === 'quote' && w.original !== undefined && w.replacement !== undefined);
+  if (quotes.length > 0) {
+    const lines = working.split('\n');
+    const applied = quotes.every(w => {
+      const line = lines[w.line - 1];
+      if (line === undefined) return false;
+      const eol = line.endsWith('\r') ? '\r' : '';
+      if (line.slice(0, line.length - eol.length) !== w.original) return false;
+      lines[w.line - 1] = w.replacement + eol;
+      return true;
+    });
+    const candidate = lines.join('\n');
+    if (applied && strictlyReadable(candidate) && ingestedReading(candidate) === ingestedReading(working)) {
+      working = candidate;
+      for (const w of quotes) fixes.push({ code: 'YAML_PARSE', description: `Quoted the value of "${w.key}" at line ${w.line} (value unchanged)` });
+    }
+  }
+
+  if (!opts.includeAmbiguous) return { content: working, fixes };
+
+  const proposal = parseMarkdown(working, undefined, { validate: true }).recovery;
+  if (proposal?.status === 'needs_interpretation') {
+    const candidate = replaceFrontmatterBlock(working, proposal.block);
+    if (candidate !== null && strictlyReadable(candidate)) {
+      working = candidate;
+      for (const step of proposal.steps) {
+        fixes.push({ code: 'YAML_PARSE', description: step.kind === 'fold' ? `Folded the unquoted lines after "${step.key}" (line ${step.line}) into its value`
+          : step.kind === 'dup' ? `Kept the later "${step.key}" (line ${step.line}) and dropped the earlier one (line ${step.otherLine})`
+          : step.kind === 'unclosed' ? `Quoted the unclosed [ or { value of "${step.key}" at line ${step.line} as text`
+          : `Quoted the value of "${step.key}" at line ${step.line} (value unchanged)` });
+      }
+    }
+  }
+
+  const comments = (parseMarkdown(working, undefined, { validate: true }).warnings ?? [])
+    .filter(w => w.code === 'FRONTMATTER_COMMENT_VALUE' && COMMENT_RESCUE_KEYS.has(w.key));
+  if (comments.length > 0) {
+    const lines = working.split('\n');
+    for (const w of comments) {
+      const line = lines[w.line - 1]!;
+      const eol = line.endsWith('\r') ? '\r' : '';
+      const value = line.slice(0, line.length - eol.length).replace(/^[A-Za-z_][\w-]*:[ \t]+/, '').trimEnd();
+      lines[w.line - 1] = `${w.key}: ${JSON.stringify(value)}${eol}`;
+    }
+    const candidate = lines.join('\n');
+    if (strictlyReadable(candidate)) {
+      working = candidate;
+      for (const w of comments) fixes.push({ code: 'FRONTMATTER_COMMENT_VALUE', description: `Quoted the #-leading value of "${w.key}" at line ${w.line} so it is no longer read as a comment` });
+    }
+  }
+
+  return { content: working, fixes };
+}
+
 // ---------------------------------------------------------------------------
 // writeBrainPage — path-guarded write with centralized backup
 // ---------------------------------------------------------------------------
@@ -374,7 +549,7 @@ export function writeBrainPage(
   let toWrite = content;
   let fixes: AuditFix[] = [];
   if (opts.autoFix) {
-    const result = autoFixFrontmatter(content, { filePath });
+    const result = autoFixFrontmatter(content, { filePath: relative(resolvedSource, resolvedTarget) });
     toWrite = result.content;
     fixes = result.fixes;
   }
@@ -434,6 +609,34 @@ export interface ScanOpts {
    * (post-pruneDir). Production callers don't pass this; the regression
    * suite uses it to assert descent-time pruning directly. */
   visitDir?: (dirPath: string) => void;
+  /** Parse only each file's frontmatter head (`frontmatterScanHead`) when that
+   * provably yields the same findings; the doctor scan sets it. */
+  frontmatterOnly?: boolean;
+}
+
+/**
+ * The prefix of `content` through its closing frontmatter fence line, when
+ * validating that prefix yields exactly the errors, warnings, recovery and
+ * slug of the whole file; otherwise `content` itself. Proven only for the
+ * plain shape every frontmatter reader agrees on: the file starts with a
+ * `---` line (no BOM, blank lines or language selector), no line before the
+ * first `---` close starts with `---`, the close is a bare `---` line after
+ * at least one block line, and the file has no NUL byte (NULL_BYTES reads
+ * the whole file). Everything after the close is body, which the findings
+ * never read.
+ */
+export function frontmatterScanHead(content: string): string {
+  if (!content.startsWith('---') || content.includes('\0')) return content;
+  const first = content.indexOf('\n');
+  if (first < 0 || (first !== 3 && content.slice(0, first) !== '---\r')) return content;
+  for (let start = first + 1, line = 1; ; line++) {
+    const end = content.indexOf('\n', start);
+    if (end < 0) return content;
+    const text = content.slice(start, end);
+    if (text.trim() === '---') return line >= 2 && (text === '---' || text === '---\r') ? content.slice(0, end + 1) : content;
+    if (text.startsWith('---')) return content;
+    start = end + 1;
+  }
 }
 
 /** Timeout-arm winner for the COUNT-vs-deadline race in scanBrainSources.
@@ -446,7 +649,9 @@ export async function scanBrainSources(
   opts: ScanOpts = {},
 ): Promise<AuditReport> {
   const sources = await listSources(engine, opts.sourceId);
+  const metafilePages = await readMetafilePagesMode(engine);
   const totals: Partial<Record<ParseValidationCode, number>> = {};
+  const recoverabilityTotals: RecoverabilityByCode = {};
   const perSource: PerSourceReport[] = [];
   let grandTotal = 0;
   let ignoredMissingOpen = 0;
@@ -570,7 +775,7 @@ export async function scanBrainSources(
       break;
     }
 
-    const report = scanOneSource(src.id, src.local_path, opts);
+    const report = scanOneSource(src.id, src.local_path, opts, metafilePages);
     report.db_page_count = dbPageCount;
     perSource.push(report);
     grandTotal += report.total;
@@ -578,6 +783,11 @@ export async function scanBrainSources(
     for (const [code, n] of Object.entries(report.errors_by_code)) {
       const k = code as ParseValidationCode;
       totals[k] = (totals[k] ?? 0) + (n as number);
+    }
+    for (const [code, split] of Object.entries(report.recoverability_by_code ?? {})) {
+      const into = recoverabilityTotals[code as ParseValidationCode] ??= { recoverable: 0, unrecoverable: 0 };
+      into.recoverable += split.recoverable;
+      into.unrecoverable += split.unrecoverable;
     }
     if (report.status === 'partial' && abortedAtSource === null) {
       abortedAtSource = src.id;
@@ -593,6 +803,7 @@ export async function scanBrainSources(
     ok: grandTotal === 0 && !hasPartialOrSkipped,
     total: grandTotal,
     errors_by_code: totals,
+    recoverability_by_code: recoverabilityTotals,
     per_source: perSource,
     scanned_at: new Date().toISOString(),
     ignored_missing_open: ignoredMissingOpen || undefined,
@@ -605,10 +816,14 @@ function scanOneSource(
   sourceId: string,
   sourcePath: string,
   opts: ScanOpts,
+  metafilePages: MetafilePagesMode,
 ): PerSourceReport {
   const errorsByCode: Partial<Record<ParseValidationCode, number>> = {};
+  const recoverability: RecoverabilityByCode = {};
   const sample: PerSourceReport['sample'] = [];
+  const repairable: RepairableReport = { files: 0, by_code: {}, sample: [] };
   const rootResolved = resolve(sourcePath);
+  const scannable = frontmatterScannableUnder(rootResolved, metafilePages);
   let scanned = 0;
   let total = 0;
   let ignoredMissingOpen = 0;
@@ -632,7 +847,7 @@ function scanOneSource(
     // Frontmatter is a Markdown-only contract. Multimodal sync deliberately
     // admits images under the markdown strategy, but parsing JPEG/PNG bytes as
     // UTF-8 turns ordinary binary NULs into false NULL_BYTES findings.
-    if (!isFrontmatterScannablePath(relPath)) return true;
+    if (!scannable(relPath)) return true;
     scanned++;
     let content: string;
     try {
@@ -641,19 +856,38 @@ function scanOneSource(
       return true; // skip unreadable
     }
     const expectedSlug = slugifyPath(relPath);
-    const parsed = parseMarkdown(content, relPath, { validate: true, expectedSlug });
+    const parsed = parseMarkdown(opts.frontmatterOnly ? frontmatterScanHead(content) : content, relPath, { validate: true, expectedSlug });
     const errs = (parsed.errors ?? []).filter((e) => {
       if (e.code !== 'MISSING_OPEN') return true;
       if (opts.strictMissingOpen) return true;
       ignoredMissingOpen++;
       return false;
     });
+    const hold = classifyImportHold(parsed, { expectedSlug });
+    const causes = new Set<RepairableCause>();
+    for (const e of parsed.errors ?? []) {
+      if (e.code === 'YAML_PARSE' && e.recoverable) causes.add('YAML_PARSE');
+      else if (REPAIRABLE_ERRORS.has(e.code)) causes.add(e.code as RepairableCause);
+    }
+    if (hold?.reason === 'needs_interpretation') causes.add('needs_interpretation');
+    if ((parsed.warnings ?? []).some(w => w.code === 'FRONTMATTER_COMMENT_VALUE' && RESCUE_KEYS.has(w.key))) causes.add('FRONTMATTER_COMMENT_VALUE');
+    if (causes.size > 0) {
+      repairable.files++;
+      for (const cause of causes) repairable.by_code[cause] = (repairable.by_code[cause] ?? 0) + 1;
+      if (repairable.sample.length < SAMPLE_PER_SOURCE) repairable.sample.push(relPath);
+    }
     if (errs.length > 0) {
       total += errs.length;
       const codes: ParseValidationCode[] = [];
       for (const e of errs) {
         errorsByCode[e.code] = (errorsByCode[e.code] ?? 0) + 1;
         codes.push(e.code);
+        const held = e.code === 'YAML_PARSE' ? !e.recoverable
+          : e.code === 'SLUG_MISMATCH' ? hold?.code === 'frontmatter_slug_conflict'
+          : e.code === 'MISSING_CLOSE' && hold?.code === 'invalid_frontmatter';
+        const split = recoverability[e.code] ??= { recoverable: 0, unrecoverable: 0 };
+        if (held) split.unrecoverable++;
+        else split.recoverable++;
       }
       if (sample.length < SAMPLE_PER_SOURCE) {
         sample.push({ path: relPath, codes });
@@ -665,7 +899,7 @@ function scanOneSource(
     return true;
   };
 
-  const gitFiles = collectGitVisibleFiles(rootResolved, (rel) => isSyncable(rel, { strategy: 'markdown' }));
+  const gitFiles = collectGitVisibleFiles(rootResolved, scannable);
   if (gitFiles) {
     if (opts.visitDir) opts.visitDir(rootResolved);
     for (const absPath of gitFiles) {
@@ -684,6 +918,8 @@ function scanOneSource(
     source_path: sourcePath,
     total,
     errors_by_code: errorsByCode,
+    recoverability_by_code: recoverability,
+    repairable,
     sample,
     ignoredMissingOpen,
     status: interrupted ? 'partial' : 'scanned',

@@ -16,7 +16,7 @@
  * Synthetic data only — every person/email/company below is a placeholder.
  */
 
-import { describe, test, expect, beforeAll, afterAll, mock } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, mock, spyOn } from 'bun:test';
 
 // ── Gateway mock (must precede every import that can reach ai/gateway.ts) ──
 interface ChatReq {
@@ -50,15 +50,15 @@ mock.module('../src/core/ai/gateway.ts', () => ({
 }));
 
 const { PGLiteEngine } = await import('../src/core/pglite-engine.ts');
-const { runLoopsExtract, isLoopsExtractionEnabled } = await import(
+const { runLoopsExtract, isLoopsExtractionEnabled, LoopsExtractRetryableError } = await import(
   '../src/core/google/loops-extract.ts'
 );
 const { normalizeAlias } = await import('../src/core/search/alias-normalize.ts');
 const { MinionQueue } = await import('../src/core/minions/queue.ts');
 
 const SRC = 'g1';
-const EMAIL_SLUG = 'emails/2026/08/2026-08-20-test-thread-abcd1234.md';
-const SUPPRESSED_SLUG = 'emails/2026/08/2026-08-20-suppressed-thread-efab5678.md';
+const EMAIL_SLUG = 'emails/2026/08/2026-08-20-test-thread-abcd1234';
+const SUPPRESSED_SLUG = 'emails/2026/08/2026-08-20-suppressed-thread-efab5678';
 const THREAD_ID = 'thread-abcd1234';
 const SUPPRESSED_THREAD_ID = 'thread-efab5678';
 const PERSON_SLUG = 'people/alice-example';
@@ -225,7 +225,7 @@ describe('runLoopsExtract', () => {
     // the extraction sail through to the model. The rendered thread page
     // carries every SENDER (`senders`, the message authors); all of them
     // gate the lane.
-    const slug = 'emails/2026/08/2026-08-24-earlier-muted-77665544.md';
+    const slug = 'emails/2026/08/2026-08-24-earlier-muted-77665544';
     await engine.putPage(
       slug,
       {
@@ -277,7 +277,7 @@ describe('runLoopsExtract', () => {
     // thread she was CC'd on, and an outside sender could dodge extraction by
     // CC'ing a known-muted address. Only addresses that AUTHORED a message
     // count.
-    const slug = 'emails/2026/08/2026-08-25-muted-cc-only-88776655.md';
+    const slug = 'emails/2026/08/2026-08-25-muted-cc-only-88776655';
     await engine.putPage(
       slug,
       {
@@ -394,6 +394,63 @@ describe('runLoopsExtract', () => {
     expect(await countLoops()).toBe(0); // none of the failure paths wrote anything
   });
 
+  test('truncation escalates maxTokens once (2048 → 8192) and the escalated answer lands', async () => {
+    // A retry at the same cap truncates identically, so without the
+    // escalation a dense thread is dead after max_attempts with the revision
+    // never extracted.
+    const caps: number[] = [];
+    chatImpl = async () => {
+      caps.push(lastChatReq?.maxTokens ?? -1);
+      return caps.length === 1
+        ? { text: 'partial…', stopReason: 'length' }
+        : { text: '{"commitments":[],"decisions_pending":[]}', stopReason: 'end' };
+    };
+
+    const r = await runLoopsExtract(engine, { slug: EMAIL_SLUG, sourceId: SRC });
+
+    expect(caps).toEqual([2048, 8192]);
+    expect(r.status).toBe('extracted');
+    expect(await countLoops()).toBe(0);
+  });
+
+  test('still truncated at the 8192 ceiling → THROWS naming the ceiling, after exactly two calls', async () => {
+    const caps: number[] = [];
+    chatImpl = async () => {
+      caps.push(lastChatReq?.maxTokens ?? -1);
+      return { text: 'partial…', stopReason: 'length' };
+    };
+
+    const err = await runLoopsExtract(engine, { slug: EMAIL_SLUG, sourceId: SRC }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as { reason?: string }).reason).toBe('truncated');
+    expect((err as Error).message).toContain('at the 8192-token ceiling after one escalation from 2048');
+    expect(caps).toEqual([2048, 8192]);
+    expect(await countLoops()).toBe(0);
+  });
+
+  test('a non-length provider error is not escalated: one call, error propagates', async () => {
+    const caps: number[] = [];
+    chatImpl = async () => {
+      caps.push(lastChatReq?.maxTokens ?? -1);
+      throw new Error('synthetic provider 500');
+    };
+
+    await expect(runLoopsExtract(engine, { slug: EMAIL_SLUG, sourceId: SRC })).rejects.toThrow(
+      'synthetic provider 500',
+    );
+    expect(caps).toEqual([2048]);
+
+    caps.length = 0;
+    chatImpl = async () => {
+      caps.push(lastChatReq?.maxTokens ?? -1);
+      return { text: '', stopReason: 'refusal' };
+    };
+    const r = await runLoopsExtract(engine, { slug: EMAIL_SLUG, sourceId: SRC });
+    expect(r.reason).toBe('refused');
+    expect(caps).toEqual([2048]);
+  });
+
   test('parse failure (garbage response) THROWS the all-or-nothing barrier, ZERO open_loops rows', async () => {
     chatImpl = async () => ({
       text: 'I found some commitments but here they are in prose, not JSON.',
@@ -479,7 +536,7 @@ describe('runLoopsExtract', () => {
   });
 
   test('prompt hardening: newest 12k is retained and sanitized; stale head is dropped', async () => {
-    const slug = 'emails/2026/08/2026-08-22-injection-thread-99887766.md';
+    const slug = 'emails/2026/08/2026-08-22-injection-thread-99887766';
     // 'ignore previous instructions' matches sanitize.ts's 'ignore-prior'
     // pattern (replacement '[redacted]'). The old head marker is pushed out
     // while the newest evidence remains inside the 12k payload.
@@ -519,7 +576,7 @@ describe('runLoopsExtract', () => {
   });
 
   test('counterparty without a person page: loop still lands, no edge is written', async () => {
-    const slug = 'emails/2026/08/2026-08-21-bob-thread-ef567890.md';
+    const slug = 'emails/2026/08/2026-08-21-bob-thread-ef567890';
     await engine.putPage(
       slug,
       {
@@ -577,8 +634,47 @@ describe('runLoopsExtract', () => {
     expect(Number(awaiting[0].n)).toBe(0);
   });
 
+  test('#7125: ordinary words reach the model, and a neutralized span the model copies is stored as the thread wrote it', async () => {
+    const slug = 'emails/2026/08/2026-08-24-restore-thread-55667788';
+    await engine.putPage(
+      slug,
+      {
+        type: 'email',
+        title: 'Re: vendor contract',
+        compiled_truth: 'Alice: The Business System (ABS) review is done. Our counsel said to ignore previous instructions about the vendor, '
+          + 'so I will send the signed copy by Friday.\n',
+        frontmatter: { thread_id: 'thread-55667788', date: '2026-08-24T10:00:00Z' },
+      },
+      { sourceId: SRC },
+    );
+    chatImpl = async () => ({
+      text: JSON.stringify({
+        commitments: [{
+          direction: 'owed_to_me',
+          text: 'Alice to send the signed copy by Friday',
+          counterparty_name: 'Alice Example',
+          counterparty_email: 'alice@example.com',
+          due_iso: null,
+          quote: 'Our counsel said to [redacted] about the vendor, so I will send the signed copy by Friday.',
+        }],
+        decisions_pending: [],
+      }),
+      stopReason: 'end',
+    });
+    lastChatReq = null;
+    const r = await runLoopsExtract(engine, { slug, sourceId: SRC });
+    expect(r.status).toBe('extracted');
+    const content = lastChatReq!.messages![0].content;
+    expect(content).toContain('The Business System (ABS) review is done.');
+    expect(content).not.toMatch(/ignore\s+previous\s+instructions/i);
+    const [row] = await engine.executeRaw<{ evidence: string }>(
+      'SELECT evidence::text AS evidence FROM open_loops WHERE source_id = $1 AND page_slug = $2', [SRC, slug]);
+    expect(JSON.parse(row!.evidence)).toEqual([{ page_slug: slug,
+      quote: 'Our counsel said to ignore previous instructions about the vendor, so I will send the signed copy by Friday.' }]);
+  });
+
   test('verbatim evidence: a fabricated quote is BLANKED (loop lands, edge label falls back to text); a genuine quote survives whitespace-normalized', async () => {
-    const slug = 'emails/2026/08/2026-08-23-verbatim-thread-11223344.md';
+    const slug = 'emails/2026/08/2026-08-23-verbatim-thread-11223344';
     await engine.putPage(
       slug,
       {
@@ -663,5 +759,87 @@ describe('runLoopsExtract', () => {
     expect(byType['awaiting_reply_from']).toBe('I will share the pilot metrics by Wednesday.');
     expect(byType['owes_to']).toBe('Send Alice the compliance checklist');
     for (const e of edges) expect(e.context).not.toContain('compliance checklist by Tuesday');
+  });
+
+  describe('#5445 execution-time label exclusion (the policy in force when the job RUNS, not when it was queued)', () => {
+    const LABELLED_SLUG = 'emails/2026/08/2026-08-21-labelled-thread-0a1b2c3d';
+    beforeAll(async () => {
+      await engine.putPage(LABELLED_SLUG, {
+        type: 'email', title: 'A labelled synthetic thread',
+        compiled_truth: 'Me: I will send the summary on Monday.\nPeer: Thanks, which deck should I read first?\n',
+        frontmatter: { thread_id: 'thread-0a1b2c3d', date: '2026-08-21T10:00:00Z', labels: ['INBOX', 'Label_7'] },
+        effective_date: new Date('2026-08-21T10:00:00Z'),
+      }, { sourceId: SRC });
+    });
+
+    test('a label excluded after enqueue skips the job before any model call (excluded_label)', async () => {
+      const before = chatCalls;
+      await engine.setConfig('loops.extraction_exclude_labels', 'Label_7');
+      try {
+        const r = await runLoopsExtract(engine, { slug: LABELLED_SLUG, sourceId: SRC });
+        expect(r.status).toBe('skipped');
+        expect(r.reason).toBe('excluded_label');
+        expect(chatCalls).toBe(before);
+        const other = await runLoopsExtract(engine, { slug: EMAIL_SLUG, sourceId: SRC });
+        expect(other.status).not.toBe('skipped');
+        expect(chatCalls).toBe(before + 1);
+      } finally {
+        await engine.setConfig('loops.extraction_exclude_labels', '');
+      }
+    });
+
+    test('a name no sweep has resolved fails closed: retryable excluded_label_unresolved, zero model calls, for every page', async () => {
+      const before = chatCalls;
+      await engine.setConfig('loops.extraction_exclude_labels', 'Newsletters');
+      try {
+        for (const slug of [LABELLED_SLUG, EMAIL_SLUG]) {
+          const thrown = await runLoopsExtract(engine, { slug, sourceId: SRC }).then(() => null, (e: unknown) => e);
+          expect(thrown).toBeInstanceOf(LoopsExtractRetryableError);
+          expect((thrown as InstanceType<typeof LoopsExtractRetryableError>).reason).toBe('excluded_label_unresolved');
+          expect((thrown as Error).message).toContain('"Newsletters"');
+        }
+        expect(chatCalls).toBe(before);
+      } finally {
+        await engine.setConfig('loops.extraction_exclude_labels', '');
+      }
+    });
+  });
+});
+
+describe('#5586: fact projection failure', () => {
+  test('a failed facts write is logged with slug, source and error only; the loop row still lands', async () => {
+    const slug = 'emails/2026/08/2026-08-23-projection-thread-5586aaaa';
+    await engine.putPage(slug, {
+      type: 'email', title: 'Re: acme-example renewal',
+      compiled_truth: 'Me: I will send the acme-example renewal terms by Monday.\n',
+      frontmatter: { thread_id: 'thread-5586aaaa', date: '2026-08-23T10:00:00Z' },
+      effective_date: new Date('2026-08-23T10:00:00Z'),
+    }, { sourceId: SRC });
+    chatImpl = async () => ({ text: JSON.stringify({
+      commitments: [{ direction: 'owed_by_me', text: 'Send the acme-example renewal terms', counterparty_name: 'Alice Example',
+        counterparty_email: 'alice@example.com', due_iso: '2026-08-31', quote: 'I will send the acme-example renewal terms by Monday.' }],
+      decisions_pending: [],
+    }), stopReason: 'end' });
+    await engine.executeRaw(`CREATE OR REPLACE FUNCTION test_5586_refuse_fact() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'synthetic facts write failure'; END $$`);
+    await engine.executeRaw('CREATE TRIGGER test_5586_refuse_fact BEFORE INSERT ON facts FOR EACH ROW EXECUTE FUNCTION test_5586_refuse_fact()');
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const r = await runLoopsExtract(engine, { slug, sourceId: SRC });
+      expect(r.status).toBe('extracted');
+      const [loop] = await engine.executeRaw<{ fact_id: number | null }>(
+        'SELECT fact_id FROM open_loops WHERE source_id = $1 AND page_slug = $2', [SRC, slug]);
+      expect(loop).toBeDefined();
+      expect(loop!.fact_id).toBeNull();
+      const lines = warn.mock.calls.map((call) => String(call[0])).filter((line) => line.startsWith('[loops_extract] fact projection failed'));
+      expect(lines.length).toBe(1);
+      expect(lines[0]).toContain(`slug=${slug} source=${SRC}`);
+      expect(lines[0]).toContain('synthetic facts write failure');
+      expect(lines[0]).not.toContain('renewal terms');
+    } finally {
+      warn.mockRestore();
+      await engine.executeRaw('DROP TRIGGER test_5586_refuse_fact ON facts');
+      await engine.executeRaw('DROP FUNCTION test_5586_refuse_fact()');
+    }
   });
 });

@@ -159,6 +159,9 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
       expect(c.status).toBe('warn');
       expect(c.message).toContain('auth failure');
       expect(c.message).toContain('key present but rejected');
+      // #5432: audit-log history, not a live verdict.
+      expect(c.message).toContain('no live probe was run');
+      expect(c.details?.live_probe_performed).toBe(false);
     });
   });
 
@@ -199,6 +202,19 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
       const c = await checkRerankerHealth(engineWith({ 'search.reranker.enabled': 'false' }));
       expect(c.status).toBe('ok');
       expect(c.message).toContain('Reranker disabled');
+    });
+  });
+  test('Cat 40 R0: repeated unreachable rows (a stale reranker base URL) → warn naming the base-URL key, not a provider outage', async () => {
+    await inFreshAudit({ VOYAGE_API_KEY: 'pa-test' }, async () => {
+      for (let i = 0; i < 3; i++) {
+        logRerankFailure({ model: DEFAULT_RERANKER_MODEL, reason: 'unreachable', query_hash: `0000000${i}`, doc_count: 30, error_summary: 'rerank: Unable to connect' });
+      }
+      gw({ VOYAGE_API_KEY: 'pa-test' });
+      const c = await checkRerankerHealth(engineWith({}));
+      expect(c.status).toBe('warn');
+      expect(c.message).toContain('could not reach');
+      expect(c.message).toContain(`provider_base_urls.${DEFAULT_RERANKER_MODEL.split(':')[0]}`);
+      expect(c.message).not.toContain('status page');
     });
   });
 });

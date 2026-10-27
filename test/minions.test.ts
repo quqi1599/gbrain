@@ -403,6 +403,17 @@ describe('MinionQueue: #1737 per-handler default timeout', () => {
     expect(job.timeout_ms).toBe(10 * 60 * 1000);
   });
 
+  // #5761 — a brain-wide `extract --stale` pass (the remediation plan submits
+  // it without --timeout-ms) was dead-lettered by the null-default wall-clock.
+  test('extract gets its 30-min default from the handler map (#5761)', async () => {
+    const job = await queue.add('extract', { stale: true });
+    expect(job.timeout_ms).toBe(30 * 60 * 1000);
+    await engine.executeRaw(`UPDATE minion_jobs SET timeout_ms = NULL, timeout_at = NULL WHERE id = $1`, [job.id]);
+    const claimed = await queue.claim('tok-extract', 30_000, 'default', ['extract']);
+    expect(claimed!.id).toBe(job.id);
+    expect(claimed!.timeout_ms).toBe(30 * 60 * 1000);
+  });
+
   test('contextual per-chunk reindex gets the 60-min default', async () => {
     const job = await queue.add('contextual_reindex_per_chunk', { page_slug: 'large-transcript' }, undefined, {
       allowProtectedSubmit: true,
@@ -718,8 +729,9 @@ describe('MinionWorker', () => {
 
 describe('MinionQueue: Lock Management', () => {
   test('lock renewed during execution', async () => {
-    await queue.add('sync', {});
-    const claimed = await queue.claim('tok1', 30000, 'default', ['sync']);
+    // An unmapped name, so the claim takes the worker's 30s lease.
+    await queue.add('noop', {});
+    const claimed = await queue.claim('tok1', 30000, 'default', ['noop']);
     const originalLockUntil = claimed!.lock_until!.getTime();
 
     const renewed = await queue.renewLock(claimed!.id, 'tok1', 60000);
@@ -3418,6 +3430,19 @@ describe('MinionQueue: per-job lock lease (#4145)', () => {
     // lock_until derives from the 300s lease, NOT the worker's 30s default.
     expect(horizon).toBeGreaterThan(250_000);
     expect(horizon).toBeLessThan(360_000);
+  });
+
+  test('a sync job gets the 5-minute default lease while an unmapped job claimed the same way keeps 30s', async () => {
+    await queue.add('sync', { sourceId: 'default' });
+    await queue.add('lease-control', {});
+    const syncJob = await queue.claim('tok-sync', 30_000, 'default', ['sync']);
+    const control = await queue.claim('tok-control', 30_000, 'default', ['lease-control']);
+    expect(syncJob!.lock_duration_ms).toBe(5 * 60_000);
+    expect(control!.lock_duration_ms).toBeNull();
+    const syncHorizon = syncJob!.lock_until!.getTime() - syncJob!.started_at!.getTime();
+    const controlHorizon = control!.lock_until!.getTime() - control!.started_at!.getTime();
+    expect(syncHorizon).toBeGreaterThan(4 * 60_000);
+    expect(controlHorizon).toBeLessThan(60_000);
   });
 
   test('an unmapped handler keeps NULL lease → worker default horizon (legacy behavior)', async () => {

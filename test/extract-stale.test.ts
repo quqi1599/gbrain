@@ -96,8 +96,10 @@ describe('engine: stale-page extraction methods', () => {
   });
 
   test('markPagesExtractedBatch: empty input is a no-op', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
     await engine.markPagesExtractedBatch([], new Date().toISOString());
-    expect(true).toBe(true); // no throw
+    expect(await stampOf('people/alice')).toBeNull();
+    expect(await engine.countStalePagesForExtraction()).toBe(1);
   });
 });
 
@@ -323,6 +325,34 @@ describe('gbrain extract --stale', () => {
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
   });
 
+  test('S4 (#6228): pages extracted before an aborting page keep their stamp; the failing page and later ones stay stale', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('notes/first', { type: 'note', title: 'First', compiled_truth: 'Met [Alice](people/alice).', timeline: '- **2026-01-02** | call — First call' });
+    await engine.putPage('notes/boom', { type: 'note', title: 'Boom', compiled_truth: 'Met [Alice](people/alice) again.', timeline: '' });
+    await engine.putPage('notes/after', { type: 'note', title: 'After', compiled_truth: 'Later.', timeline: '' });
+    const origBatch = engine.replaceDerivedLinks.bind(engine);
+    (engine as unknown as { replaceDerivedLinks: unknown }).replaceDerivedLinks = async (origin: { slug: string }, ...rest: unknown[]) => {
+      if (origin.slug === 'notes/boom') throw new Error('__page_boom__');
+      return (origBatch as (...a: unknown[]) => unknown)(origin, ...rest);
+    };
+    let threw = false;
+    try {
+      await extractStaleFromDB(engine, { dryRun: false, jsonMode: true, quiet: true, catchUp: true });
+    } catch (e) {
+      if ((e as Error).message === '__page_boom__') threw = true; else throw e;
+    } finally {
+      (engine as unknown as { replaceDerivedLinks: unknown }).replaceDerivedLinks = origBatch;
+    }
+    expect(threw).toBe(true);
+    expect(await stampOf('people/alice')).not.toBeNull();
+    expect(await stampOf('notes/first')).not.toBeNull();
+    expect(await engine.executeRaw(`SELECT t.summary FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.slug = 'notes/first'`))
+      .toEqual([{ summary: 'First call' }]);
+    expect(await stampOf('notes/boom')).toBeNull();
+    expect(await stampOf('notes/after')).toBeNull();
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
+  });
+
   test('D4 race: a concurrent edit landing during the sweep is NOT masked', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) backs [Acme](companies/acme).'));
@@ -357,21 +387,11 @@ describe('gbrain extract --stale', () => {
   });
 
   test('--source fs is rejected (DB-source only)', async () => {
-    const origErr = console.error;
-    const origExit = process.exit;
-    let exited = false; let msg = '';
-    console.error = (m?: unknown) => { msg += String(m); };
-    process.exit = ((_code?: number) => { exited = true; throw new Error('__exit__'); }) as unknown as typeof process.exit;
-    try {
-      await runExtract(engine, ['--stale', '--source', 'fs']);
-    } catch (e) {
-      if ((e as Error).message !== '__exit__') throw e;
-    } finally {
-      console.error = origErr;
-      process.exit = origExit;
-    }
-    expect(exited).toBe(true);
-    expect(msg).toContain('DB-source only');
+    // #6803 (D2): the refusal is a typed invalid_params (exit 2) instead of a bare process.exit(1).
+    let refusal: unknown;
+    try { await runExtract(engine, ['--stale', '--source', 'fs']); } catch (e) { refusal = e; }
+    expect((refusal as { code?: string }).code).toBe('invalid_params');
+    expect((refusal as Error).message).toContain('DB-source only');
   });
 
   // ─── #2576 bug 1: --stale must run the same resolver passes as
@@ -430,13 +450,17 @@ describe('gbrain extract --stale', () => {
       timeBudgetMs: 0,
     });
     expect(r.pagesProcessed).toBe(25);
-    expect(r.staleRemaining).toBe(1);
+    // staleRemaining counts link-stale pages plus mention-due pages (the
+    // mention pass shares the exhausted budget, so all 26 are still due).
+    expect(r.mentions?.remaining).toBe(26);
+    expect(r.staleRemaining).toBe(1 + 26);
 
     // Default budget (~30 min) finishes the remainder.
     const r2 = await extractStaleFromDB(engine, {
       dryRun: false, jsonMode: true, includeFrontmatter: false, catchUp: false,
     });
     expect(r2.pagesProcessed).toBe(1);
+    expect(r2.mentions?.remaining).toBe(0);
     expect(r2.staleRemaining).toBe(0);
   });
 

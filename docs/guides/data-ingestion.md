@@ -15,6 +15,17 @@ Page writes return durable receipts. Replacements require the revision you read 
 
 **Ambient memory writeback (opt-in, personal brains).** Stop having to say "remember this": once enabled, your agents save durable facts you state in passing — preferences, decisions, commitments — with provenance, and transient facts (a cold, a trip) expire when saved with an explicit TTL. Off by default; on a personal brain gbrain asks you once at init/upgrade; company brains are never nudged. **Say to your agent:** *"Turn on ambient memory writeback"* — your agent runs `gbrain config set memory.auto_writeback salient` and `gbrain bootstrap harness --yes`. Full mechanics, privacy posture, and per-harness limitations: [`docs/guides/ambient-writeback.md`](ambient-writeback.md).
 
+**Credentials you save stay in the brain, but retrieval withholds them.** What
+you capture or `remember` is stored as written. When a search, query or memory
+read returns text containing a credential-shaped value (an API key, a password
+assignment, a URL with a password, a private key), the value comes back as
+`<REDACTED:pattern>`. A credential you ask the brain to remember is withheld
+from remote recall by design: every MCP caller, including stdio MCP, and a
+thin-client install count as remote. On the brain host, `gbrain recall` shows
+remembered facts as written. Full page reads (`get_page`) are not redacted;
+they follow page visibility. Details and the full list of what stays raw:
+[secret scan refusals and redaction](write-refusals.md#secret-scan-refusals-and-redaction).
+
 For webhook ingestion (Zapier / IFTTT / Apple Shortcuts):
 
 ```bash
@@ -52,8 +63,11 @@ parses agent session logs (Claude Code, Codex, OpenClaw, Hermes, Grok Build) and
 consumer chat exports (ChatGPT / Claude.ai `conversations.json`) into readable
 conversation pages with provenance back to the exact session file. Pattern-based redaction runs over message bodies, titles, speakers, and session
 metadata before anything is written — vendor key prefixes, JWTs, cloud/API key
-shapes, `Bearer` headers, connection-string credentials, and high-entropy
-`KEY=`/`TOKEN=` assignments become `<REDACTED:…>` placeholders (preview with
+shapes, `Bearer` and `Authorization: Basic` headers, database and `http(s)`
+URLs carrying a password, private keys (also when an excerpt cut off the
+`BEGIN` or `END` line), high-entropy `KEY=`/`TOKEN=`/`password=`
+assignments (quoted values may contain punctuation), and typed passwords
+after a credential label (see [Credential redaction](#credential-redaction)) become `<REDACTED:…>` placeholders (preview with
 `--dry-run`; no pattern set is complete, so if a secret still lands see
 ["If a secret reached the brain"](../../SECURITY.md#if-a-secret-reached-the-brain):
 rotate it, then `gbrain delete <slug> --purge`). Embedding is off by default
@@ -68,6 +82,75 @@ gbrain transcripts status                    # found vs imported, per harness
 ```
 
 **Say to your agent:** *"Import my conversations from my chatgpt export at ~/Downloads/conversations.json"* — *"Archive my session transcripts"* — and later, *"When did I first discuss agent memory?"* (the archive answers origin questions with dated quotes).
+
+Codex sessions imported before gbrain read codex 0.153+ rollouts lost their
+user turns (#5163): the pages hold the assistant side only, and `--since last`
+never re-reads them. `gbrain transcripts recover codex` lists those sessions,
+re-reads the rollouts still on disk (`~/.codex/sessions` and the archived
+store, or the rollouts you name) and says which it can restore and which it
+cannot because the rollout is gone. `--apply` re-imports the recoverable ones
+in place; a rerun finds nothing to do. It extracts no facts and leaves the
+watermark alone; for facts from a restored session, run
+`gbrain transcripts ingest <rollout> --facts --max-cost-usd <n>`.
+
+**Say to your agent:** *"Restore the codex sessions that lost my side of the conversation"* (your agent runs the preview, shows you the counts, and applies after you agree).
+
+### Credential redaction
+
+Transcript pages also redact a password typed after a credential label,
+even when it is short and low-entropy (`labeled_credential`). Two label
+forms are recognized, with bare, quoted or backticked values:
+
+- a single label, `password`, `passwd`, `passcode`, `passphrase` or `pwd`
+  (also behind a prefix such as `DB_` and as a JSON key), followed by `:`,
+  `=` or the full-width `：` — `password: hunter2`, `**Password:** …`,
+  `{"password": "…"}`;
+- a pair label, `login`, `log-in`, `credentials`, `creds`, `user/pass` or
+  `username/password`, followed by `:`, `=`, `：`, ` - ` or nothing, then
+  `user / pass` or `user:pass` — `login alice / hunter2`,
+  `creds: alice:hunter2`. Only the password half is redacted. A pair whose
+  password starts the next line is redacted too;
+- a command-line flag with its value after a space, `--password hunter2`,
+  `--pass "two words"` (`--password-file` and other suffixed flags are not
+  labels);
+- an environment name with more after the label, `PASSWORD_DB=…`,
+  `FOO_PASSWORD_BAR=…`, unless the suffix names a setting (`_FILE`, `_PATH`,
+  `_MIN_LENGTH`, `_HINT`, `_POLICY` and similar);
+- a single label that ends its line, with the value alone on the next line
+  (`password:` then `hunter2`);
+- Markdown table cells: every cell under a column headed `Password`, `pwd`,
+  `DB password` and the like, and the value in a `| password | … |` row,
+  including rows without outer pipes, escaped `\|` pipes and tables with
+  several credential columns.
+
+To keep prose and code intact, a value is never redacted when it is a
+placeholder (`<…>`, `${…}`, `$VAR`), a mask (`****`), a URL, a path, a
+function call, a dotted reference (`req.body.password`), a code identifier
+(`hashedPassword`), or one of the stoplisted words (`n/a`, `none`, `string`,
+`required`, `changed`, `reset`, `flow`, `email`, `await` and similar; the
+list is `LABELED_STOPLIST` in `src/core/secret-scan-labeled.ts`). A pair's
+password must also be 4+ characters with a letter and a digit or symbol, so
+`login: Google/GitHub SSO` and `credentials: docs/auth.md` stay. Known
+misses: an unquoted multi-word passphrase, a label with no delimiter
+(`the password is …`), a short flag joined to its value (`mysql -phunter2`),
+and a meeting link's `?pwd=` passcode. A redacted
+value of 8+ characters that is not a stoplisted word is also scrubbed where
+the session repeats it bare.
+
+Pages imported before this detector (or a later widening of it) shipped are
+not rewritten automatically, so run the audit again after upgrading. `gbrain transcripts audit-secrets --json` (read-only; all
+sources, or one with `--source-id`) lists the conversation pages that still
+carry a credential: slug, source, hit count per pattern and line numbers,
+never the text. The doctor check `transcript_secret_exposure` reads the
+audit's cached summary (it never scans pages itself) and says when no audit
+has run or what the last one found and how long ago. Review, edit and
+removal are separate steps: `gbrain get <slug>`, then `gbrain put <slug> <
+edited.md` to remove the credential, or `gbrain delete <slug> --purge` after
+asking the user. Rotate any real credential that reached a page (see
+["If a secret reached the brain"](../../SECURITY.md#if-a-secret-reached-the-brain)),
+then re-run the audit.
+
+**Say to your agent:** *"Check my imported transcripts for passwords"* (your agent runs the audit, lists the pages by slug and asks before changing any).
 
 Or connect the account and skip the manual export entirely. `gbrain connectors`
 syncs your ChatGPT and Claude conversation history live, using your own browser

@@ -154,12 +154,13 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     for (let i = 0; i < 30; i++) files[`p${i}.md`] = pageMd(`P${i}`);
     const c1 = commitPages(repoPath, files, 'thirty pages');
 
-    // Abort once the checkpoint shows at least one banked path.
+    // Abort once the checkpoint shows at least one banked path, while the import loop still runs (all 30 banked means the
+    // loop is done, and an abort then lands in the bookmark window, which this test does not cover).
     const ac = new AbortController();
     const fp = syncFingerprint({ lastCommit: c0 });
     const poll = setInterval(() => {
       loadOpCheckpoint(engine, { op: 'sync', fingerprint: fp })
-        .then((paths) => { if (paths.length >= 1 && !ac.signal.aborted) ac.abort(); })
+        .then((paths) => { if (paths.length >= 1 && paths.length < 30 && !ac.signal.aborted) ac.abort(); })
         .catch(() => {});
     }, 1);
     const aborted = await performSync(engine, { repoPath, noPull: true, noEmbed: true, signal: ac.signal });
@@ -274,7 +275,10 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     );
     execSync('git add -A && git commit -m "good + bad"', { cwd: repoPath, stdio: 'pipe' });
 
+    // #5988: content refusals are held by default; sync.holds=fail keeps the fail-closed gate this test exercises.
+    await engine.setConfig('sync.holds', 'fail');
     const res = await performSync(engine, { repoPath, sourceId: sid, noPull: true, noEmbed: true });
+    await engine.setConfig('sync.holds', 'hold');
     expect(res.status).toBe('blocked_by_failures');
 
     // Codex #2: blocked path writes neither last_commit NOR last_sync_at.

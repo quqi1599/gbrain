@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, expect, test, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { runGitHubSync, type GitHubSourceConfig } from '../src/core/github-source.ts';
+import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
 let engine: PGLiteEngine;
 
@@ -371,7 +372,7 @@ describe('github-source materialize', () => {
         expect(initial.failedFiles ?? 0).toBe(0);
         expect(JSON.parse(readFileSync(join(dir, '.github-source.json'), 'utf-8')).last_sweep_at).toBe('2026-08-02T00:00:00Z');
         const oldPage = readFileSync(join(dir, 'gh', REPO, '3.md'), 'utf-8');
-        fx.items.get(3)!.body = 'x'.repeat(5_000_001);
+        fx.items.get(3)!.body = 'x'.repeat(PAGE_MAX_BYTES + 1);
         fx.items.get(3)!.updated_at = '2026-08-07T00:00:00Z';
         const res = await runGitHubSync(
           engine,
@@ -382,6 +383,9 @@ describe('github-source materialize', () => {
         );
         expect(res.status).toBe('partial');
         expect(res.failedFiles).toBeGreaterThan(0);
+        // #5012: the partial names its real cause, never the git path's timeout default.
+        expect(res.reason).toBe('connector_item_failures');
+        expect(res.filesImported).toBe(res.added + res.modified);
         expect(readFileSync(join(dir, 'gh', REPO, '3.md'), 'utf-8')).toBe(oldPage);
         const state = JSON.parse(readFileSync(join(dir, '.github-source.json'), 'utf-8')) as { last_sweep_at: string };
         expect(state.last_sweep_at).toBe('2026-08-02T00:00:00Z');
@@ -400,7 +404,7 @@ describe('github-source materialize', () => {
       await withEnv({ GH_TOKEN: 'test-token' }, async () => {
         await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
         const oldPage = readFileSync(join(dir, 'gh', REPO, '3.md'), 'utf-8');
-        fx.items.get(3)!.body = 'x'.repeat(5_000_001);
+        fx.items.get(3)!.body = 'x'.repeat(PAGE_MAX_BYTES + 1);
         await expect(runGitHubSync(
           engine,
           'ghsrc',
@@ -564,10 +568,17 @@ describe('github-source materialize', () => {
         expect(before.length).toBe(4);
         // The repo's issue list now fails; a full reconcile must NOT purge its pages.
         fx.failIssuesList = true;
-        const res = await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
-        expect(res.status).toBe('partial');
-        expect(res.deleted).toBe(0);
-        expect(await pageSlugs(engine)).toEqual(before);
+        const errors = spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          const res = await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
+          expect(res.status).toBe('partial');
+          expect(res.deleted).toBe(0);
+          expect(await pageSlugs(engine)).toEqual(before);
+          expect(errors).toHaveBeenCalledWith(expect.stringContaining(
+            `[github] repo ${REPO} failed: GitHub API HTTP 404 on /repos/${REPO}/issues`));
+        } finally {
+          errors.mockRestore();
+        }
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -583,9 +594,16 @@ describe('github-source materialize', () => {
       await withEnv({ GH_TOKEN: 'test-token' }, async () => {
         // Item 1's detail fetch fails during bootstrap.
         fx.failDetailItems.add(1);
-        const partial = await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
-        expect(partial.status).toBe('partial');
-        expect(partial.failedFiles).toBeGreaterThan(0);
+        const errors = spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          const partial = await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
+          expect(partial.status).toBe('partial');
+          expect(partial.failedFiles).toBeGreaterThan(0);
+          expect(errors).toHaveBeenCalledWith(
+            `[github] item ${REPO}#1 failed: GitHub API HTTP 404 on /repos/${REPO}/issues/1`);
+        } finally {
+          errors.mockRestore();
+        }
         // Pass 1 still materialized a list page for item 1 (fast path);
         // the failed detail fetch leaves it marked detail_fetched: false.
         expect(existsSync(join(dir, 'gh', REPO, '1.md'))).toBe(true);
@@ -609,6 +627,33 @@ describe('github-source materialize', () => {
         expect(readFileSync(join(dir, 'gh', REPO, '1.md'), 'utf-8')).toContain('detail_fetched: true');
         const state2 = JSON.parse(readFileSync(join(dir, '.github-source.json'), 'utf-8')) as { last_sweep_at?: string };
         expect(state2.last_sweep_at).toBe('2026-08-02T00:00:00Z');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a partial sweep does not stamp sources.last_sync_at (sync_freshness must not see it as fresh)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ghsrc-freshness-'));
+    const fx = makeFixture();
+    const fetchImpl = buildFetch(fx);
+    const lastSync = async () => (await engine.executeRaw<{ last_sync_at: string | null }>(
+      `SELECT last_sync_at FROM sources WHERE id = 'ghsrc'`,
+    ))[0]!.last_sync_at;
+    try {
+      await insertSource(engine, dir);
+      await withEnv({ GH_TOKEN: 'test-token' }, async () => {
+        // Item 1 fails on every run, so no sweep ever completes.
+        fx.failDetailItems.add(1);
+        const partial = await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
+        expect(partial.status).toBe('partial');
+        expect(await lastSync()).toBeNull();
+
+        // A sweep that fully succeeds does stamp it.
+        fx.failDetailItems.delete(1);
+        const ok = await runGitHubSync(engine, 'ghsrc', makeCfg(dir), { sourceId: 'ghsrc', full: true }, fetchImpl);
+        expect(ok.status).not.toBe('partial');
+        expect(await lastSync()).not.toBeNull();
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });

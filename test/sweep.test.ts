@@ -27,6 +27,8 @@ import { _resetStdoutRedirectForTests } from '../src/core/console-prefix.ts';
 import type { CapabilityReport } from '../src/core/capability.ts';
 import { __setChatTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
 import { runServe, type ServeOptions } from '../src/commands/serve.ts';
+import { beginForegroundRequest, _resetForegroundActivityForTests } from '../src/core/foreground-activity.ts';
+import { spoolPath } from './helpers/corpus-spool.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { runExtract } from '../src/commands/extract.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
@@ -381,7 +383,7 @@ describe('runMaintenanceSweep — watermark progress + link reconciliation (#419
 
 describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
   test('keyless: skipped with reason keyless, sidecar NOT written', async () => {
-    writeFileSync(join(corpusDir, 'session-1.txt'), 'User said something notable.\n');
+    writeFileSync(spoolPath(corpusDir, 'session-1.txt'), 'User said something notable.\n');
 
     const r = await runMaintenanceSweep(engine, {
       sourceId: 'default',
@@ -389,7 +391,7 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
     });
     expect(r.corpusIngested).toBe(0);
     expect(r.skipped).toContainEqual({ reason: 'keyless', count: 1 });
-    expect(existsSync(join(corpusDir, 'session-1.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'session-1.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
   });
 
   test('keyed: transcript runs through the real pipeline; sidecar written AFTER success; exactly-once', async () => {
@@ -397,7 +399,7 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
     // operator-set default inside the shared pipeline.
     await engine.setConfig('facts.default_visibility', 'world');
     writeFileSync(
-      join(corpusDir, 'fresh.txt'),
+      spoolPath(corpusDir, 'fresh.txt'),
       'Alice committed to shipping the beta in March.\n',
     );
 
@@ -429,7 +431,7 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
       });
       expect(r1.corpusIngested).toBe(1);
       expect(chatCalls).toBe(1);
-      expect(existsSync(join(corpusDir, 'fresh.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+      expect(existsSync(spoolPath(corpusDir, 'fresh.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
 
       const facts = await engine.executeRaw<{ fact: string; visibility: string; source: string }>(
         `SELECT fact, visibility, source FROM facts WHERE source = 'sweep:corpus'`,
@@ -452,8 +454,8 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
   });
 
   test('pre-existing sidecar marker → file never touches the pipeline', async () => {
-    writeFileSync(join(corpusDir, 'done.txt'), 'Already processed content.\n');
-    writeFileSync(join(corpusDir, 'done.txt' + CORPUS_INGESTED_SUFFIX), '{}\n');
+    writeFileSync(spoolPath(corpusDir, 'done.txt'), 'Already processed content.\n');
+    writeFileSync(spoolPath(corpusDir, 'done.txt' + CORPUS_INGESTED_SUFFIX), '{}\n');
 
     let chatCalls = 0;
     __setChatTransportForTests(async (): Promise<ChatResult> => {
@@ -470,17 +472,59 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
     expect(r.skipped).toContainEqual({ reason: 'already_ingested', count: 1 });
   });
 
+  test('a claude-cli self-capture is retired with a terminal sidecar and never extracted; a user session still is (#5413)', async () => {
+    const claudeHome = mkdtempSync(join(tmpdir(), 'gbrain-sweep-claude-'));
+    tmpDirs.push(claudeHome);
+    const selfId = '11111111-2222-4333-8444-555555555555';
+    const userId = '66666666-7777-4888-9999-000000000000';
+    const selfProject = join(claudeHome, 'projects', '-tmp-gbrain-claude-cli-cwd-4242');
+    const userProject = join(claudeHome, 'projects', '-home-user-app');
+    mkdirSync(selfProject, { recursive: true });
+    mkdirSync(userProject, { recursive: true });
+    writeFileSync(join(selfProject, `${selfId}.jsonl`), '{"type":"user"}\n');
+    writeFileSync(join(userProject, `${userId}.jsonl`), '{"type":"user"}\n');
+    const selfFiles = [`${selfId}.txt`, `${selfId}.seg-aaaaaaaaaaaa.txt`, `${selfId}.wb-bbbbbbbbbbbbbbbbbbbbbbbb.txt`];
+    for (const f of selfFiles) writeFileSync(spoolPath(corpusDir, f), 'User: <turn>extract facts from this page</turn>\n');
+    writeFileSync(spoolPath(corpusDir, `${userId}.txt`), 'Alice committed to shipping the beta in March.\n');
+
+    let chatCalls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      chatCalls += 1;
+      return {
+        text: JSON.stringify({ facts: [] }),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:test-stub',
+        providerId: 'anthropic',
+      };
+    });
+
+    const r1 = await withEnv({ CLAUDE_CONFIG_DIR: claudeHome }, () =>
+      runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED }));
+    expect(chatCalls).toBe(1);
+    expect(r1.corpusIngested).toBe(1);
+    expect(r1.skipped).toContainEqual({ reason: 'self_capture', count: 3 });
+    for (const f of selfFiles) expect(existsSync(spoolPath(corpusDir, f + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, `${userId}.txt` + CORPUS_INGESTED_SUFFIX))).toBe(true);
+
+    const r2 = await withEnv({ CLAUDE_CONFIG_DIR: claudeHome }, () =>
+      runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED }));
+    expect(chatCalls).toBe(1);
+    expect(r2.corpusIngested).toBe(0);
+  });
+
   test('extraction_enabled=false spend gate skips without sidecars', async () => {
     await engine.setConfig('facts.extraction_enabled', 'false');
     try {
-      writeFileSync(join(corpusDir, 'gated.txt'), 'Gated content.\n');
+      writeFileSync(spoolPath(corpusDir, 'gated.txt'), 'Gated content.\n');
       const r = await runMaintenanceSweep(engine, {
         sourceId: 'default',
         capabilities: KEYED,
       });
       expect(r.corpusIngested).toBe(0);
       expect(r.skipped).toContainEqual({ reason: 'extraction_disabled', count: 1 });
-      expect(existsSync(join(corpusDir, 'gated.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+      expect(existsSync(spoolPath(corpusDir, 'gated.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
     } finally {
       await engine.setConfig('facts.extraction_enabled', 'true');
     }
@@ -500,8 +544,8 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
   });
 
   test('two concurrent sweeps on one corpus dir ingest each file exactly once', async () => {
-    writeFileSync(join(corpusDir, 'race-a.txt'), 'Alice will demo the widget on Monday.\n');
-    writeFileSync(join(corpusDir, 'race-b.txt'), 'Bob owns the acme-example follow-up.\n');
+    writeFileSync(spoolPath(corpusDir, 'race-a.txt'), 'Alice will demo the widget on Monday.\n');
+    writeFileSync(spoolPath(corpusDir, 'race-b.txt'), 'Bob owns the acme-example follow-up.\n');
 
     let chatCalls = 0;
     __setChatTransportForTests(async (): Promise<ChatResult> => {
@@ -519,16 +563,16 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     // The whole point: one LLM call per FILE, never per (file × sweep).
     expect(chatCalls).toBe(2);
     expect(r1.corpusIngested + r2.corpusIngested).toBe(2);
-    expect(existsSync(join(corpusDir, 'race-a.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
-    expect(existsSync(join(corpusDir, 'race-b.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, 'race-a.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, 'race-b.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
     // No claim leftovers — success replaces the claim with the .ingested sidecar.
-    expect(existsSync(join(corpusDir, 'race-a.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
-    expect(existsSync(join(corpusDir, 'race-b.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'race-a.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'race-b.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
   });
 
   test('a fresh claim held by another sweep skips the file — zero LLM spend, claim untouched', async () => {
-    writeFileSync(join(corpusDir, 'claimed.txt'), 'Claimed elsewhere.\n');
-    const claim = join(corpusDir, 'claimed.txt' + CORPUS_CLAIM_SUFFIX);
+    writeFileSync(spoolPath(corpusDir, 'claimed.txt'), 'Claimed elsewhere.\n');
+    const claim = spoolPath(corpusDir, 'claimed.txt' + CORPUS_CLAIM_SUFFIX);
     writeFileSync(claim, '{}\n');
 
     let chatCalls = 0;
@@ -543,12 +587,12 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     expect(r.skipped).toContainEqual({ reason: 'corpus_in_progress', count: 1 });
     // The live claim belongs to the other sweep — this run must not release it.
     expect(existsSync(claim)).toBe(true);
-    expect(existsSync(join(corpusDir, 'claimed.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'claimed.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
   });
 
   test('a stale claim (>1h, dead sweep) is reclaimed and the file ingested', async () => {
-    writeFileSync(join(corpusDir, 'stale-claim.txt'), 'Left behind by a crashed sweep.\n');
-    const claim = join(corpusDir, 'stale-claim.txt' + CORPUS_CLAIM_SUFFIX);
+    writeFileSync(spoolPath(corpusDir, 'stale-claim.txt'), 'Left behind by a crashed sweep.\n');
+    const claim = spoolPath(corpusDir, 'stale-claim.txt' + CORPUS_CLAIM_SUFFIX);
     writeFileSync(claim, '{}\n');
     const old = (Date.now() - 2 * 3600 * 1000) / 1000;
     utimesSync(claim, old, old);
@@ -562,7 +606,7 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     const r = await runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED });
     expect(r.corpusIngested).toBe(1);
     expect(chatCalls).toBe(1);
-    expect(existsSync(join(corpusDir, 'stale-claim.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, 'stale-claim.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
     expect(existsSync(claim)).toBe(false);
   });
 
@@ -570,7 +614,7 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     // A directory named like a corpus file: readFile throws EISDIR after the
     // claim is acquired — a deterministic mid-ingest failure (runFactsPipeline
     // itself absorbs provider errors, so a throwing transport won't do).
-    mkdirSync(join(corpusDir, 'flaky.txt'));
+    mkdirSync(spoolPath(corpusDir, 'flaky.txt'));
     __setChatTransportForTests(async (): Promise<ChatResult> => {
       throw new Error('must not be reached');
     });
@@ -579,8 +623,8 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     expect(r.corpusIngested).toBe(0);
     expect(r.skipped).toContainEqual({ reason: 'corpus_file_error', count: 1 });
     // Neither sidecar remains: no .ingested (it failed), no claim (released).
-    expect(existsSync(join(corpusDir, 'flaky.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
-    expect(existsSync(join(corpusDir, 'flaky.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'flaky.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'flaky.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
   });
 });
 
@@ -628,15 +672,24 @@ describe('runMaintenanceSweep — bounded link resolution (no listAllPageRefs)',
       ['# TL', '', '## Timeline', '', '- **2026-03-04** | timeline only entry', ''].join('\n'),
     );
     const log: string[] = [];
-    const r = await runMaintenanceSweep(loggingEngine(engine, log), {
+    // A fresh GBRAIN_HOME holds no local CLI registration. Snapshot brains in
+    // one test process share a brain_id, so a registration another file wrote
+    // into the shared test home would add its verification query here.
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-sweep-home-'));
+    tmpDirs.push(home);
+    const r = await withEnv({ GBRAIN_HOME: home }, () => runMaintenanceSweep(loggingEngine(engine, log), {
       sourceId: 'default',
       capabilities: KEYLESS,
-    });
+    }));
     expect(r.timelineExtracted).toBe(1);
     expect(log).not.toContain('listAllPageRefs');
-    // Exactly two raw queries: the pass-1 fence scan and the pass-2 recency
-    // scan. No candidates ⇒ no third (ref-lookup) query.
-    expect(log.filter((m) => m === 'executeRaw').length).toBe(2);
+    // Exactly four raw queries: the pass-1 fence scan, the pass-2 recency
+    // scan, the managed-brain check that picks the timeline write path (a
+    // managed brain publishes per page through the coordinator) and the
+    // maintenance principal's brain_id lookup the attributed timeline batch
+    // makes (an installation with a CLI registration adds one query that
+    // verifies it, once per engine). No candidates ⇒ no ref-lookup query.
+    expect(log.filter((m) => m === 'executeRaw').length).toBe(4);
   });
 });
 
@@ -682,6 +735,7 @@ describe('runMaintenanceSweep — budget + never-throw', () => {
       linksExtracted: 1,
       linksRemoved: 0,
       timelineExtracted: 0,
+      corpus_files: [],
       skipped: [{ reason: 'budget_exhausted:corpus', count: 2 }],
       durationMs: 10,
     };
@@ -796,6 +850,35 @@ describe('serve.ts idle sweep wiring [ENG-5]', () => {
     const code = await h.exited;
     expect(code).toBe(0);
     expect(h.timers.cleared).toContain(handle);
+  });
+
+  test('a warm CLI socket request (foreground-activity.ts) counts as activity: a tick after one, or during one, skips the sweep', async () => {
+    _resetForegroundActivityForTests();
+    const sweepCalls: BrainEngine[] = [];
+    const h = makeServeHarness({ sweepEnabled: true, sweep: async (e) => { sweepCalls.push(e); } });
+    await runServe(h.engineStub, [], h.serveOpts);
+    const { fn } = h.timers.registered[0];
+    fn(); // attach listener
+    await new Promise(r => setTimeout(r, 5));
+    beginForegroundRequest()();
+    fn();
+    await settle();
+    expect(sweepCalls.length).toBe(0);
+    const finish = beginForegroundRequest();
+    await new Promise(r => setTimeout(r, 5));
+    fn();
+    await settle();
+    expect(sweepCalls.length).toBe(0);
+    finish();
+    await new Promise(r => setTimeout(r, 5));
+    fn(); // the window still saw the request finish
+    await settle();
+    expect(sweepCalls.length).toBe(0);
+    fn(); // a quiet window
+    await settle();
+    expect(sweepCalls.length).toBe(1);
+    h.stdin.emit('end');
+    expect(await h.exited).toBe(0);
   });
 
   test('a rejecting sweep never kills the serve', async () => {
@@ -920,7 +1003,7 @@ describe('runSweep CLI arg parsing [CX2-5]', () => {
       console.log = origLog;
       console.error = origErr;
       _resetCliExitVerdictForTests();
-      process.exitCode = savedExitCode; // setCliExitVerdict mirrors here — undo
+      process.exitCode = savedExitCode ?? 0; // setCliExitVerdict mirrors here — undo
     }
   }
 

@@ -10,13 +10,17 @@
  * status call when its DB is down anyway.
  *
  * Zero round-trips without --probe. With --probe: a SINGLE bounded connect
- * (the driver's built-in `connect_timeout: 10` in db.ts — never a custom
- * race) + SELECT 1; failures come back as a classified PgAccessDiagnosis,
+ * (bounded by the pool's own connect timer: `connect_timeout` from
+ * `database_url`, else 10s; never a custom race) + SELECT 1; failures come
+ * back as a classified PgAccessDiagnosis,
  * not a raw error. On PGLite the probe is LOCK-AWARE: a live `gbrain serve`
  * holding the single-writer lock reports `locked_by_serve` (healthy-with-
  * note) instead of hanging ~30s on the lock and misreporting a broken brain.
  */
 
+import { inspectGraduationPath } from '../core/persistence/graduation-custody.ts';
+import { readGraduationManifestSummary } from '../core/persistence/graduation-serve-guard.ts';
+import type { GraduationPathState } from '../core/persistence/engine-graduation.types.ts';
 import { existsSync } from 'node:fs';
 
 import {
@@ -123,8 +127,39 @@ interface EngineStatusReport {
     direct_pool_size: number | null;
   };
   pglite_lock?: { held: boolean; serve?: boolean; pid?: number; subcommand?: string };
+  /** Engine graduation (file reads only): path state, manifest state, marker, tombstone, redacted target. */
+  graduation?: GraduationStatusBlock;
   config_diagnosis?: PgAccessDiagnosis;
   probe?: ProbeResult;
+}
+
+interface GraduationStatusBlock {
+  state: GraduationPathState['state'];
+  data_dir: string;
+  run_id: string | null;
+  manifest_state: string | null;
+  marker: { state: string; pid: number; updated_at: string } | null;
+  tombstone: { moved_to: string; graduated_at: string } | null;
+  target: string | null;
+}
+
+/** Null on a brain that never graduated (no manifest, marker or tombstone). */
+function graduationBlock(dataDir: string | null): GraduationStatusBlock | null {
+  const manifest = readGraduationManifestSummary();
+  const dir = manifest?.dataDir ?? dataDir;
+  if (!dir) return null;
+  const path = inspectGraduationPath(dir);
+  if (!manifest && path.state === 'none' && !path.marker) return null;
+  const t = manifest?.target ?? path.tombstone?.target ?? path.marker?.target;
+  return {
+    state: path.state,
+    data_dir: dir,
+    run_id: manifest?.runId ?? path.marker?.runId ?? path.tombstone?.runId ?? null,
+    manifest_state: manifest?.state ?? null,
+    marker: path.marker ? { state: path.marker.state, pid: path.marker.pid, updated_at: path.marker.updatedAt } : null,
+    tombstone: path.tombstone ? { moved_to: path.tombstone.movedTo, graduated_at: path.tombstone.graduatedAt } : null,
+    target: path.tombstone?.targetDisplayUrl ?? (t ? `postgresql://${t.host}:${t.port}/${t.database}` : null),
+  };
 }
 
 function fileEngine(fileCfg: GBrainConfig | null): 'postgres' | 'pglite' | null {
@@ -298,6 +333,8 @@ export async function runEngineStatus(args: string[]): Promise<number> {
       const lock = inspectLockHolder(dataDir ?? undefined);
       report.pglite_lock = { held: lock.held, serve: lock.serve, pid: lock.pid, subcommand: lock.subcommand };
     }
+    const graduation = graduationBlock(cfg?.engine === 'pglite' ? dataDir : null);
+    if (graduation) report.graduation = graduation;
 
     if (!cfg && !thin) {
       report.config_diagnosis = diagnoseDbConfig({ source, envShadowed: shadowed, brainId }) ?? undefined;
@@ -356,6 +393,9 @@ function printHuman(r: EngineStatusReport): void {
   }
   if (r.pglite_lock?.held) {
     lines.push(`Lock:    held by live ${r.pglite_lock.serve ? 'serve' : r.pglite_lock.subcommand ?? 'process'} (pid ${r.pglite_lock.pid ?? '?'})`);
+  }
+  if (r.graduation) {
+    lines.push(`Graduation: ${r.graduation.state}${r.graduation.manifest_state ? ` (run ${r.graduation.run_id}, ${r.graduation.manifest_state})` : ''}${r.graduation.target ? ` -> ${r.graduation.target}` : ''}`);
   }
   if (r.config_diagnosis) {
     lines.push(`Status:  ${r.config_diagnosis.reason} — ${r.config_diagnosis.remediation}`);

@@ -27,7 +27,7 @@ describe('mutation preconditions', () => {
   });
 
   test.each([
-    { request_id: 'not-a-uuid' }, { request_id: null }, { expected_revision: '' },
+    { request_id: 'two words' }, { request_id: null }, { expected_revision: '' },
     { expected_revision: 42 }, { force: 'true' }, { expected_revision: REQUEST_ID, force: true },
   ])('rejects invalid preconditions before mutation: %j', (params) => {
     expect(() => parseMutationPrecondition(params)).toThrow(OperationError);
@@ -100,7 +100,7 @@ describe('public write receipts', () => {
 
   test('non-write errors retain the existing wire shape', () => {
     expect(JSON.parse(JSON.stringify(new OperationError('invalid_params', 'Bad input.'))))
-      .toEqual({ error: 'invalid_params', message: 'Bad input.' });
+      .toEqual({ error: 'invalid_params', code: 'invalid_params', message: 'Bad input.' });
   });
 
   test('receipt parsing refuses invented completion states and unsafe polling intervals', () => {

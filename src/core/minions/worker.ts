@@ -13,13 +13,14 @@ import { assertNoUnreviewedJobs, authorizeJobExecution, withSubmissionAuthority 
  */
 
 import { existsSync } from 'fs';
-import { autopilotPausedMarkerPath } from '../autopilot-paths.ts';
+import { autopilotOperatorPauseMarkerPath, autopilotPausedMarkerPath } from '../autopilot-paths.ts';
 import type { BrainEngine } from '../engine.ts';
 import type {
   MinionJob, MinionJobContext, MinionHandler, MinionWorkerOpts,
   MinionQueueOpts, TokenUpdate,
 } from './types.ts';
 import {
+  JobDeferredError,
   UnrecoverableError,
   ABORT_REASON_LOCK_RENEWAL_FAILED,
   ABORT_REASON_LOCK_LOST,
@@ -42,12 +43,14 @@ import {
 import { clampLockDurationMs } from './handler-timeouts.ts';
 import {
   runDbProbe,
+  assertWorkerDbReadiness,
   getConnectionRouting,
   DIRECT_PROBE_TIMEOUT_MS,
   type DbProbeResult,
   type PoolDiagnostics,
 } from './db-probe.ts';
 import { buildJobContext } from './job-context.ts';
+import { runWithJobSpend } from './spend-authorization.ts';
 import {
   runJobInChild,
   ChildSpawnInfraError,
@@ -59,6 +62,7 @@ import { loadavg, cpus } from 'os';
 import { monitorEventLoopDelay } from 'perf_hooks';
 import { isRetryableConnError } from '../retry-matcher.ts';
 import { reconnectAfterConnectionError as reconnectEngineAfterConnError } from './reconnect.ts';
+import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 
 /**
  * Abort reasons that signal infrastructure failure (PgBouncer outage,
@@ -82,34 +86,16 @@ export const INFRASTRUCTURE_ABORT_REASONS = new Set<string>([
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { evaluateQuietHours, type QuietHoursConfig } from './quiet-hours.ts';
+import { endedByShutdown, releaseUndrainedClaims, settleShutdownInterruptedJob } from './worker-shutdown.ts';
+import { isWatchdogSuspect, settleWatchdogAbort } from './watchdog-attribution.ts';
+import { IdleWaiter } from './idle-wait.ts';
+import { jobOutcomeResult, jobResultOutcome } from './job-outcome.ts';
+import { DEFAULT_LONG_JOB_NAMES, DEFAULT_SHORT_JOB_RESERVED_SLOTS, claimExclusions } from './lanes.ts';
+import { jobRefusal, refusedJobResult } from './refusal.ts';
 import { readFileSync } from 'fs';
+import { parseRssFromProcStatus } from './proc-rss.ts';
 
-/**
- * Pure parser for /proc/self/status RSS fields. Returns bytes of
- * RssAnon + RssShmem when either field is present, or null when the
- * status text is from a kernel that doesn't expose those fields
- * (kernels older than 4.5) or the values are malformed. Exported so
- * the test suite can unit-test the field-presence + malformed-value
- * edge cases without mocking the filesystem.
- *
- * M1 fix: field-presence check, not value-presence check. The earlier
- * `if (anonKb > 0)` form conflated "field exists with value 0" with
- * "field missing", which mis-routed to VmRSS fallback in the legitimate
- * shmem-only worker case (RssAnon: 0 + RssShmem: 512).
- */
-export function parseRssFromProcStatus(status: string): number | null {
-  const anonMatch = status.match(/^RssAnon:\s+(\d+)/m);
-  const shmemMatch = status.match(/^RssShmem:\s+(\d+)/m);
-  if (anonMatch === null && shmemMatch === null) {
-    return null;
-  }
-  const anonKb = parseInt(anonMatch?.[1] ?? '0', 10);
-  const shmemKb = parseInt(shmemMatch?.[1] ?? '0', 10);
-  if (isNaN(anonKb) || isNaN(shmemKb)) {
-    return null;
-  }
-  return (anonKb + shmemKb) * 1024; // bytes
-}
+export { parseRssFromProcStatus };
 
 /**
  * Read accurate RSS from /proc/self/status (RssAnon + RssShmem).
@@ -152,6 +138,7 @@ export function getAccurateRss(
  *  unreachable server so operators stop debugging the wrong layer; absent on
  *  engines without the probe's disambiguation lane. */
 export type UnhealthyReason =
+  | { reason: 'client_misconfigured'; error: LocalConfigurationError }
   | {
       reason: 'db_dead';
       consecutiveFailures: number;
@@ -179,10 +166,28 @@ interface InFlightJob {
   lockTimer: ReturnType<typeof setInterval>;
   abort: AbortController;
   promise: Promise<void>;
+  /** Another job ran beside it, or it registered after a drain began: an RSS watchdog drain requeues it uncharged and marked (watchdog-attribution.ts). */
+  shared: boolean;
+}
+
+export interface ConfigurationReleaseResult {
+  jobId: number | null;
+  lockToken: string;
+  outcome: 'released' | 'no_op' | 'unconfirmed';
+}
+
+interface OwnedExecution {
+  job: MinionJob;
+  lockToken: string;
+  stopped: boolean;
+  abort?: AbortController;
+  promise?: Promise<void>;
 }
 
 /** Type-safe `on('unhealthy', ...)` for callers. */
 export interface MinionWorker {
+  on(event: 'ready', listener: () => void): this;
+  emit(event: 'ready'): boolean;
   on(event: 'unhealthy', listener: (info: UnhealthyReason) => void): this;
   emit(event: 'unhealthy', info: UnhealthyReason): boolean;
 }
@@ -193,7 +198,16 @@ export class MinionWorker extends EventEmitter {
   private running = false;
   /** Log the pause/resume transition once each, not every poll. */
   private pausedByMarkerAnnounced = false;
+  /** The idle poll wait a sync-queue wake ends early (minions/idle-wait.ts). */
+  readonly idleWaiter = new IdleWaiter();
   private inFlight = new Map<number, InFlightJob>();
+  private executions = new Map<string, OwnedExecution>();
+  private pendingClaim: { lockToken: string; promise: Promise<MinionJob | null> } | null = null;
+  private _configurationError: LocalConfigurationError | null = null;
+  private configurationDeadline = 0;
+  private configurationDrainFinished = false;
+  private configurationBlocked = new AbortController();
+  private _configurationReleaseResults: ConfigurationReleaseResult[] = [];
   private workerId = randomUUID();
 
   /** Fires only on worker process SIGTERM/SIGINT. Handlers that need to run
@@ -205,8 +219,10 @@ export class MinionWorker extends EventEmitter {
 
   /** Cumulative jobs that finished (success or failure). Used in watchdog log lines. */
   private jobsCompleted = 0;
-  /** Idempotency latch for gracefulShutdown — per-job and periodic check sites can race. */
-  private gracefulShutdownFired = false;
+  /** Idempotency latch for gracefulShutdown — per-job and periodic check sites can race.
+   *  Holds the reason so launchJob can abort a claim that committed before the shutdown fired. */
+  private gracefulShutdownReason: string | null = null;
+  drainForced = false; // #5062: the shutdown drain expired and running claims were handed back (`jobs work` exits 17)
   /**
    * Set true when the RSS watchdog (not a normal SIGTERM) initiated the
    * drain. The CLI handler (src/commands/jobs.ts case 'work') reads this
@@ -294,6 +310,9 @@ export class MinionWorker extends EventEmitter {
       jobIsolation: opts?.jobIsolation ?? 'inline',
       childCliInvocation: opts?.childCliInvocation ?? null,
       childTiniPath: opts?.childTiniPath ?? '',
+      longJobNames: opts?.longJobNames ?? DEFAULT_LONG_JOB_NAMES,
+      shortJobReservedSlots: opts?.shortJobReservedSlots ?? DEFAULT_SHORT_JOB_RESERVED_SLOTS,
+      onJobSettled: opts?.onJobSettled ?? (() => {}),
     };
     // Process isolation contract: 'process' without a resolved child CLI
     // invocation would silently execute handlers INLINE while the evict path
@@ -351,6 +370,91 @@ export class MinionWorker extends EventEmitter {
     return this._rssWatchdogTriggered;
   }
 
+  get configurationError(): LocalConfigurationError | null {
+    return this._configurationError;
+  }
+
+  get configurationReleaseResults(): readonly ConfigurationReleaseResult[] {
+    return this._configurationReleaseResults;
+  }
+
+  private probeDatabase(): Promise<DbProbeResult> {
+    const dualPool = getConnectionRouting(this.engine)?.isDualPoolActive?.() === true;
+    const getDiag = (this.engine as { getPoolDiagnostics?: () => PoolDiagnostics | null }).getPoolDiagnostics;
+    return runDbProbe({
+      probeRead: async signal => { await this.engine.executeRaw('SELECT 1', undefined, { signal }); },
+      ...(dualPool ? {
+        probeDirect: async (signal: AbortSignal) => { await this.engine.executeRawDirect('SELECT 1', undefined, { signal }); },
+      } : {}),
+      ...(typeof getDiag === 'function' ? { getDiagnostics: () => getDiag.call(this.engine) } : {}),
+      timeoutMs: this.opts.dbProbeTimeoutMs,
+      directTimeoutMs: DIRECT_PROBE_TIMEOUT_MS,
+    });
+  }
+
+  blockForConfiguration(error: LocalConfigurationError): void {
+    if (this._configurationError) return;
+    this._configurationError = error;
+    this.configurationDeadline = performance.now() + 30_000;
+    this.running = false;
+    this.configurationBlocked.abort(error);
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort(error);
+    for (const execution of this.executions.values()) execution.abort?.abort(error);
+    this.emit('unhealthy', { reason: 'client_misconfigured', error });
+  }
+
+  private async drainConfiguration(): Promise<void> {
+    const controller = new AbortController();
+    const remaining = Math.max(0, this.configurationDeadline - performance.now());
+    if (remaining === 0) controller.abort();
+    const timer = setTimeout(() => controller.abort(), remaining);
+    const pending = new Map(this.executions);
+    const releasing = new Set<string>();
+    let claimDone = !this.pendingClaim;
+    const claim = this.pendingClaim;
+    const collectClaim = claim?.promise.then(job => {
+      claimDone = true;
+      if (job) {
+        const execution = this.executions.get(claim.lockToken);
+        if (execution) pending.set(claim.lockToken, execution);
+      }
+    }, () => {
+      claimDone = true;
+      if (!this.configurationDrainFinished) {
+        this._configurationReleaseResults.push({ jobId: null, lockToken: claim.lockToken, outcome: 'unconfirmed' });
+      }
+    });
+    try {
+      while (!controller.signal.aborted && (pending.size > 0 || !claimDone)) {
+        for (const [token, execution] of pending) {
+          if (!execution.stopped || releasing.has(token)) continue;
+          if (releasing.size >= 4) break;
+          releasing.add(token);
+          void this.queue.releaseConfigurationJob(execution.job.id, token, controller.signal).then(outcome => {
+            if (this.configurationDrainFinished) return;
+            this._configurationReleaseResults.push({ jobId: execution.job.id, lockToken: token, outcome });
+            pending.delete(token);
+            releasing.delete(token);
+            this.executions.delete(token);
+          });
+        }
+        if (pending.size > 0 || !claimDone) {
+          await new Promise(resolve => setTimeout(resolve, Math.min(10, Math.max(0, this.configurationDeadline - performance.now()))));
+        }
+      }
+      for (const [token, execution] of pending) {
+        this._configurationReleaseResults.push({ jobId: execution.job.id, lockToken: token, outcome: 'unconfirmed' });
+      }
+      if (!claimDone && claim) this._configurationReleaseResults.push({ jobId: null, lockToken: claim.lockToken, outcome: 'unconfirmed' });
+      void collectClaim;
+    } finally {
+      this.configurationDrainFinished = true;
+      controller.abort();
+      clearTimeout(timer);
+      for (const entry of this.inFlight.values()) clearInterval(entry.lockTimer);
+    }
+  }
+
   /** Emit 'unhealthy' with a no-listener fallback. The default contract is
    *  fail-stop: pre-EventEmitter-refactor behavior was process.exit(1) inside
    *  the timer; the refactor moved that responsibility to the CLI subscriber.
@@ -360,6 +464,11 @@ export class MinionWorker extends EventEmitter {
    *  ourselves so the worker dies and the PM restarts it. Subscribers
    *  override this default by adding a listener before start(). */
   private emitUnhealthy(info: UnhealthyReason): void {
+    if (info.reason === 'client_misconfigured') {
+      this.blockForConfiguration(info.error);
+      return;
+    }
+    if (this.configurationError) return;
     if (this.listenerCount('unhealthy') === 0) {
       const detail = info.reason === 'db_dead'
         ? `DB unreachable (${info.consecutiveFailures} probes): ${info.message}`
@@ -377,13 +486,42 @@ export class MinionWorker extends EventEmitter {
 
   /** Start the worker loop. Blocks until stopped. */
   async start(): Promise<void> {
+    if (this.configurationError) return;
     if (this.handlers.size === 0) {
       throw new Error('No handlers registered. Call worker.register(name, handler) before start().');
     }
 
-    await this.queue.ensureSchema();
-    await assertNoUnreviewedJobs(this.engine);
     this.running = true;
+    if (this.engine.kind === 'postgres') {
+      while (this.running) {
+        try {
+          await assertWorkerDbReadiness(this.engine);
+          break;
+        } catch (error) {
+          if (isLocalConfigurationError(error)) {
+            this.blockForConfiguration(error);
+            return;
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, Math.max(100, Math.min(1000, this.opts.pollInterval))));
+      }
+    }
+    if (!this.running) return;
+    try {
+      await this.queue.ensureSchema();
+      await assertNoUnreviewedJobs(this.engine);
+    } catch (error) {
+      if (!isLocalConfigurationError(error)) throw error;
+      this.blockForConfiguration(error);
+      return;
+    }
+    if (!this.running) return;
+    try {
+      this.emit('ready');
+    } catch (error) {
+      this.running = false;
+      throw error;
+    }
     // R2-9 lifecycle: (re-)enable the event-loop-delay histogram for this
     // run; stop() disables it so embedding hosts / test suites that cycle
     // start()/stop() don't leak a ~50Hz native sampling timer per instance.
@@ -393,13 +531,7 @@ export class MinionWorker extends EventEmitter {
     // `ctx.shutdownSignal` (currently: shell handler) can run their own cleanup
     // BEFORE the 30s cleanup race expires. Non-shell handlers ignore shutdown
     // and keep running — they get the full 30s window.
-    const shutdown = () => {
-      console.log('Minion worker shutting down...');
-      this.running = false;
-      if (!this.shutdownAbort.signal.aborted) {
-        this.shutdownAbort.abort(new Error('shutdown'));
-      }
-    };
+    const shutdown = () => this.requestShutdown();
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
 
@@ -407,6 +539,7 @@ export class MinionWorker extends EventEmitter {
     // so a stalled job (lock_until expired) gets requeued before handleTimeouts'
     // `lock_until > now()` guard would skip it. Stall → retry, timeout → dead.
     const stalledTimer = setInterval(async () => {
+      if (this.configurationError) return;
       // issue #1720: a dead pool used to spray "Stall detection error: write
       // CONNECTION_CLOSED ..." every tick forever — this interval was the only
       // background loop without the #1491-style reconnect. Rebuild the
@@ -415,6 +548,10 @@ export class MinionWorker extends EventEmitter {
       // back-to-back connect attempts would just add pooler pressure).
       let reconnectedThisTick = false;
       const recoverConnection = async (site: string, e: unknown): Promise<void> => {
+        if (isLocalConfigurationError(e)) {
+          this.blockForConfiguration(e);
+          return;
+        }
         if (reconnectedThisTick || !isRetryableConnError(e)) return;
         reconnectedThisTick = true;
         await this.reconnectAfterConnectionError(site, e);
@@ -427,6 +564,7 @@ export class MinionWorker extends EventEmitter {
         console.error('Stall detection error:', e instanceof Error ? e.message : String(e));
         await recoverConnection('handleStalled', e);
       }
+      if (this.configurationError) return;
       try {
         const timedOut = await this.queue.handleTimeouts();
         if (timedOut.length > 0) console.log(`Timeout detector: dead-lettered ${timedOut.length} jobs (timeout exceeded)`);
@@ -434,6 +572,7 @@ export class MinionWorker extends EventEmitter {
         console.error('Timeout detection error:', e instanceof Error ? e.message : String(e));
         await recoverConnection('handleTimeouts', e);
       }
+      if (this.configurationError) return;
       try {
         const wallClockTimedOut = await this.queue.handleWallClockTimeouts(this.opts.lockDuration);
         if (wallClockTimedOut.length > 0) {
@@ -443,6 +582,7 @@ export class MinionWorker extends EventEmitter {
         console.error('Wall-clock timeout detection error:', e instanceof Error ? e.message : String(e));
         await recoverConnection('handleWallClockTimeouts', e);
       }
+      if (this.configurationError) return;
       // 4th sweep: waiting-TTL (admission control). Warn-before-act (user
       // requirement D1A) lives in runWaitingTtlTick (admission.ts): the first
       // tick counts + stamps the notice timestamp, sweeping starts only after
@@ -529,37 +669,17 @@ export class MinionWorker extends EventEmitter {
       // never abandoned. The direct-lane probe runs ONLY when dual-pool is
       // genuinely active (a kill-switched executeRawDirect would probe the
       // same starved read pool twice and fake a verdict).
-      const runProbe = async (): Promise<DbProbeResult> => {
-        const cm = getConnectionRouting(this.engine);
-        const dualPool = cm?.isDualPoolActive?.() === true;
-        const getDiag = (this.engine as {
-          getPoolDiagnostics?: () => PoolDiagnostics | null;
-        }).getPoolDiagnostics;
-        return runDbProbe({
-          probeRead: async (signal) => {
-            await this.engine.executeRaw('SELECT 1', undefined, { signal });
-          },
-          ...(dualPool
-            ? {
-                probeDirect: async (signal: AbortSignal) => {
-                  await this.engine.executeRawDirect('SELECT 1', undefined, { signal });
-                },
-              }
-            : {}),
-          ...(typeof getDiag === 'function'
-            ? { getDiagnostics: () => getDiag.call(this.engine) }
-            : {}),
-          timeoutMs: this.opts.dbProbeTimeoutMs,
-          directTimeoutMs: DIRECT_PROBE_TIMEOUT_MS,
-        });
-      };
-
       const runHealthCheck = async (): Promise<void> => {
         if (healthRunning || !this.running || healthExited) return;
         healthRunning = true;
         try {
           // --- 1. DB liveness probe ---
-          const probe = await runProbe();
+          const probe = await this.probeDatabase();
+          if (this.configurationError) return;
+          if (!probe.ok && probe.verdict === 'client_misconfigured') {
+            this.blockForConfiguration(probe.configurationError);
+            return;
+          }
           if (probe.ok) {
             consecutiveDbFailures = 0;
           } else {
@@ -663,12 +783,16 @@ export class MinionWorker extends EventEmitter {
       healthTimer = setTimeout(runHealthCheck, this.opts.healthCheckInterval);
     }
 
-    try {
+    const runLoop = async () => {
       while (this.running) {
         // Promote delayed jobs
         try {
           await this.queue.promoteDelayed();
         } catch (e) {
+          if (isLocalConfigurationError(e)) {
+            this.blockForConfiguration(e);
+            break;
+          }
           const msg = e instanceof Error ? e.message : String(e);
           console.error('Promotion error:', msg);
           // issue #1491: a retryable pool/connection loss during promotion used
@@ -682,13 +806,15 @@ export class MinionWorker extends EventEmitter {
           }
         }
 
+        if (!this.running) break;
+
         // Claim jobs up to concurrency limit — unless the system-wide pause
         // marker is parked. `gbrain migrate` quiesces writers for the copy
         // window; the marker stops the autopilot dispatch loop, and gating
         // the CLAIM here extends that fence to queued jobs (an already
         // in-flight job finishes and is waited on by the migrate drain).
         // Checked at claim time only: one existsSync per poll tick.
-        if (existsSync(autopilotPausedMarkerPath())) {
+        if (existsSync(autopilotPausedMarkerPath()) || existsSync(autopilotOperatorPauseMarkerPath())) {
           if (!this.pausedByMarkerAnnounced) {
             console.log('[worker] pause marker present — not claiming new jobs until it clears.');
             this.pausedByMarkerAnnounced = true;
@@ -700,17 +826,38 @@ export class MinionWorker extends EventEmitter {
           console.log('[worker] pause marker cleared — resuming job claims.');
           this.pausedByMarkerAnnounced = false;
         }
-        if (this.inFlight.size < this.opts.concurrency) {
-          const lockToken = `${this.workerId}:${Date.now()}`;
+        if (this.inFlight.size < this.opts.concurrency && ![...this.inFlight.values()].some(f => isWatchdogSuspect(f.job))) {
+          const lockToken = `${this.workerId}:${randomUUID()}`;
+          this.idleWaiter.claimStarted();
           let job: MinionJob | null;
           try {
-            job = await this.queue.claim(
+            const claim = this.queue.claim(
               lockToken,
               this.opts.lockDuration,
               this.opts.queue,
               this.registeredNames,
-            );
+              { excludeWatchdogSuspects: this.inFlight.size > 0, excludeNames: claimExclusions(this.opts, [...this.inFlight.values()].map(f => f.job.name)) },
+            ).then(claimed => {
+              if (claimed) {
+                this.executions.set(lockToken, { job: claimed, lockToken, stopped: true });
+                if (this.configurationDrainFinished) {
+                  const previous = this._configurationReleaseResults.find(result => result.lockToken === lockToken);
+                  if (previous) previous.jobId = claimed.id;
+                  else this._configurationReleaseResults.push({ jobId: claimed.id, lockToken, outcome: 'unconfirmed' });
+                  this.executions.delete(lockToken);
+                }
+              }
+              return claimed;
+            });
+            this.pendingClaim = { lockToken, promise: claim };
+            job = await claim;
+            this.pendingClaim = null;
           } catch (e) {
+            if (isLocalConfigurationError(e)) {
+              this.blockForConfiguration(e);
+              break;
+            }
+            this.pendingClaim = null;
             // issue #1678 (Codex #1): a reaped pooler socket / nulled instance
             // pool throws a retryable conn error here. Blind-retrying claim is
             // UNSAFE — if the UPDATE...RETURNING committed but the connection
@@ -727,14 +874,16 @@ export class MinionWorker extends EventEmitter {
           }
 
           if (job) {
+            if (this.configurationError) break;
             // Post-claim fence re-check: the pre-claim marker check above
             // races migrate's marker write — this claim may have committed
             // after migrate's drain probe counted zero active jobs. A job
             // claimed into that window is released back (delayed, un-run)
             // instead of executed; the poll loop then parks on the marker.
-            if (existsSync(autopilotPausedMarkerPath())) {
+            if (existsSync(autopilotPausedMarkerPath()) || existsSync(autopilotOperatorPauseMarkerPath())) {
               console.log(`[worker] pause marker appeared after claim — releasing ${job.name} (id=${job.id}) un-run.`);
               await this.releaseClaimForPause(job, lockToken);
+              this.executions.delete(lockToken);
               continue;
             }
             // Quiet-hours gate: evaluated at claim time, not dispatch.
@@ -745,12 +894,13 @@ export class MinionWorker extends EventEmitter {
             const verdict = evaluateQuietHours(quietCfg);
             if (verdict !== 'allow') {
               await this.handleQuietHoursDefer(job, lockToken, verdict);
+              this.executions.delete(lockToken);
             } else {
               this.launchJob(job, lockToken);
             }
           } else if (this.inFlight.size === 0) {
-            // No jobs and nothing in flight, poll
-            await new Promise(resolve => setTimeout(resolve, this.opts.pollInterval));
+            // No jobs and nothing in flight, poll (a sync-queue wake ends the wait early)
+            await this.idleWaiter.wait(this.opts.pollInterval);
           } else {
             // Jobs are running but no new ones available, brief pause before re-checking
             await new Promise(resolve => setTimeout(resolve, 100));
@@ -760,6 +910,13 @@ export class MinionWorker extends EventEmitter {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
       }
+    };
+    const blocked = new Promise<void>(resolve => {
+      if (this.configurationBlocked.signal.aborted) resolve();
+      else this.configurationBlocked.signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+    try {
+      await Promise.race([runLoop(), blocked]);
     } finally {
       clearInterval(stalledTimer);
       if (rssTimer) clearInterval(rssTimer);
@@ -768,13 +925,17 @@ export class MinionWorker extends EventEmitter {
       process.removeListener('SIGINT', shutdown);
 
       // Graceful shutdown: wait for all in-flight jobs with timeout
-      if (this.inFlight.size > 0) {
-        console.log(`Waiting for ${this.inFlight.size} in-flight job(s) to finish (30s timeout)...`);
-        const pending = Array.from(this.inFlight.values()).map(f => f.promise);
+      if (this.configurationError) {
+        await this.drainConfiguration();
+      } else if (this.executions.size > 0) {
+        console.log(`Waiting for ${this.executions.size} in-flight job(s) to finish (30s timeout)...`);
+        const pending = Array.from(this.executions.values()).map(f => f.promise);
         await Promise.race([
           Promise.allSettled(pending),
           new Promise(resolve => setTimeout(resolve, 30000)),
         ]);
+        if (this.configurationError) await this.drainConfiguration();
+        else if (this.shutdownAbort.signal.aborted) this.drainForced = await releaseUndrainedClaims(this.engine, this.executions.values(), this.opts.jobIsolation === 'process');
       }
 
       // The worker does NOT disconnect the engine: it doesn't own the
@@ -871,9 +1032,18 @@ export class MinionWorker extends EventEmitter {
     }
   }
 
+  /** #5062: signal-driven shutdown entry (SIGTERM/SIGINT, or the `jobs work` signal owner). Idempotent. */
+  requestShutdown(): void {
+    if (this.running) console.log('Minion worker shutting down...');
+    this.running = false;
+    this.idleWaiter.wake('stop');
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort(new Error('shutdown'));
+  }
+
   /** Stop the worker gracefully. */
   stop(): void {
     this.running = false;
+    this.idleWaiter.wake('stop');
     try { this.eldHistogram?.disable(); } catch { /* fail-open */ }
   }
 
@@ -891,7 +1061,7 @@ export class MinionWorker extends EventEmitter {
   private checkMemoryLimit(source: 'post-job' | 'periodic'): void {
     if (this.opts.maxRssMb <= 0) return;
     if (!this.running) return;
-    if (this.gracefulShutdownFired) return;
+    if (this.gracefulShutdownReason !== null) return;
 
     let rss = 0;
     try {
@@ -944,10 +1114,11 @@ export class MinionWorker extends EventEmitter {
    *     waiting out the 30s drain.
    *  3. Main loop exits at the top of the next iteration.
    *  The existing 30s drain in start()'s finally then backstops genuinely
-   *  uninterruptible work. */
+   *  uninterruptible work. A claim whose UPDATE committed but whose result has
+   *  not reached the poll loop is not in `inFlight` yet; launchJob aborts it. */
   private gracefulShutdown(reason: string): void {
-    if (this.gracefulShutdownFired) return;
-    this.gracefulShutdownFired = true;
+    if (this.gracefulShutdownReason !== null) return;
+    this.gracefulShutdownReason = reason;
     if (!this.shutdownAbort.signal.aborted) {
       this.shutdownAbort.abort(new Error(reason));
     }
@@ -1028,7 +1199,10 @@ export class MinionWorker extends EventEmitter {
   }
 
   private launchJob(job: MinionJob, lockToken: string): void {
+    if (this.configurationError) return;
     const abort = new AbortController();
+    const execution: OwnedExecution = { job, lockToken, stopped: false, abort };
+    this.executions.set(lockToken, execution);
 
     // --- D1: cancellation flag for the in-flight renewal IIFE ---
     let cancelled = false;
@@ -1081,7 +1255,17 @@ export class MinionWorker extends EventEmitter {
     // and the tick keeps its legacy no-reconnect behavior.
     const engineReconnect = (this.engine as { reconnect?: (ctx?: { error?: unknown }) => Promise<void> }).reconnect;
     const renewalDeps: LockRenewalDeps = {
-      renewLock: (id, tok, dur, opts) => this.queue.renewLock(id, tok, dur, opts),
+      renewLock: async (id, tok, dur, opts) => {
+        try {
+          return await this.queue.renewLock(id, tok, dur, opts);
+        } catch (error) {
+          if (isLocalConfigurationError(error)) {
+            cancelled = true;
+            this.blockForConfiguration(error);
+          }
+          throw error;
+        }
+      },
       audit: lockRenewalAudit,
       // R2-4: monotonic — see monotonicNow above.
       now: monotonicNow,
@@ -1177,7 +1361,9 @@ export class MinionWorker extends EventEmitter {
           console.warn(
             `Job ${job.id} (${job.name}) did not exit within 30s of abort (reason: ${reason}).${meta} ` +
             `Force-evicting from inFlight to unblock worker. ` +
-            `The handler is still running but the worker will claim new jobs.` +
+            (this.configurationError
+              ? 'The handler is still running; configuration blocking prevents new claims.'
+              : 'The handler is still running but the worker will claim new jobs.') +
             this.formatEvictionTelemetry()
           );
           clearInterval(lockTimer);
@@ -1199,7 +1385,7 @@ export class MinionWorker extends EventEmitter {
           // also skip — the group SIGKILL already fired and executeJob's
           // own recording follows; a competing evict failJob('dead') could
           // dead-letter a job with attempts remaining (adversarial-review P3).
-          if (!INFRASTRUCTURE_ABORT_REASONS.has(reason) && this.opts.jobIsolation !== 'process') {
+          if (!this.configurationError && !INFRASTRUCTURE_ABORT_REASONS.has(reason) && this.opts.jobIsolation !== 'process') {
             this.queue.failJob(
               job.id,
               lockToken,
@@ -1232,6 +1418,10 @@ export class MinionWorker extends EventEmitter {
     }
 
     const promise = this.executeJob(job, lockToken, abort, lockTimer)
+      .catch(error => {
+        if (isLocalConfigurationError(error)) this.blockForConfiguration(error);
+        throw error;
+      })
       .finally(() => {
         // D1: signal in-flight IIFE to bail at its next checkpoint so
         // a renewLock resolution that lands after the job ended
@@ -1247,8 +1437,10 @@ export class MinionWorker extends EventEmitter {
         if (this.inFlight.get(job.id)?.lockToken === lockToken) {
           this.inFlight.delete(job.id);
         }
+        if (!this.configurationError || this.configurationDrainFinished) this.executions.delete(lockToken);
         this.jobsCompleted += 1;
         this.checkMemoryLimit('post-job');
+        try { this.opts.onJobSettled(job); } catch { /* the terminal hook never affects the job */ }
       })
       // D7 / codex C5: close the SECOND unhandledRejection vector. If
       // executeJob's catch path throws (e.g., failJob's executeRaw
@@ -1263,7 +1455,17 @@ export class MinionWorker extends EventEmitter {
         } catch { /* audit best-effort */ }
       });
 
-    this.inFlight.set(job.id, { job, lockToken, lockTimer, abort, promise });
+    for (const entry of this.inFlight.values()) entry.shared = true;
+    this.inFlight.set(job.id, { job, lockToken, lockTimer, abort, promise, shared: this.inFlight.size > 0 || this.gracefulShutdownReason !== null });
+    execution.promise = promise;
+    if (this.gracefulShutdownReason !== null && !abort.signal.aborted) abort.abort(new Error(this.gracefulShutdownReason));
+  }
+
+  /** A handler deferral (JobDeferredError): back to delayed, no attempt counted. */
+  private async deferJob(job: MinionJob, lockToken: string, err: JobDeferredError): Promise<void> {
+    const deferred = await this.queue.deferJob(job.id, lockToken, `deferred (${err.reason}): ${err.message}`, err.retryInMs);
+    if (!deferred) console.warn(`Job ${job.id} deferral dropped (lock token mismatch)`);
+    else console.log(`Job ${job.id} (${job.name}) deferred (${err.reason}) for ${Math.round(err.retryInMs / 1000)}s (no attempt burned)`);
   }
 
   private async executeJob(
@@ -1305,43 +1507,65 @@ export class MinionWorker extends EventEmitter {
           this.shutdownAbort.signal,
         );
 
+    let childExecutionStopped = false;
     try {
       const authority = await authorizeJobExecution(this.engine, job);
+      if (this.configurationError) {
+        const execution = this.executions.get(lockToken);
+        if (execution) execution.stopped = true;
+        return;
+      }
       const result = isolated
         ? await runJobInChild({
-            jobId: job.id,
+            jobId: job.id, spendAuthorized: job.spend_authorization != null,
             jobName: job.name,
             lockToken,
             abortSignal: abort.signal,
             shutdownSignal: this.shutdownAbort.signal,
             invocation: this.opts.childCliInvocation as { cmd: string; argsPrefix: string[] },
-            tiniPath: this.opts.childTiniPath,
+            tiniPath: this.opts.childTiniPath, maxRssMb: this.opts.maxRssMb,
+            onExecutionStopped: () => {
+              childExecutionStopped = true;
+              const execution = this.executions.get(lockToken);
+              if (execution) execution.stopped = true;
+            },
+            onConfigurationError: error => {
+              this.blockForConfiguration(error);
+            },
           })
         // #4218: attribute every gateway.chat() the handler makes to this
         // job so chat_usage_log rows carry `phase = 'job:<name>'`.
-        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => handler(context as MinionJobContext)), abort.signal);
+        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => runWithJobSpend(this.engine, job, context as MinionJobContext, handler)), abort.signal);
 
       // The child spawned and ran — the spawn path is healthy again.
       this._consecutiveChildSpawnFailures = 0;
 
       clearInterval(lockTimer);
 
-      // Complete the job (token-fenced)
-      const completed = await this.queue.completeJob(
-        job.id,
-        lockToken,
-        result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined,
-      );
+      const stored = result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined;
+      const verdict = jobResultOutcome(stored);
+      const completed = verdict.outcome === 'failed'
+        ? await this.queue.failJob(job.id, lockToken, verdict.reason!, 'failed', 0, jobOutcomeResult(stored, verdict))
+        : await this.queue.completeJob(job.id, lockToken, jobOutcomeResult(stored, verdict));
+      const execution = this.executions.get(lockToken);
+      if (execution) execution.stopped = true;
 
       if (!completed) {
         console.warn(`Job ${job.id} completion dropped (lock token mismatch, job was reclaimed)`);
         return;
       }
+      if (verdict.outcome === 'failed') console.log(`Job ${job.id} (${job.name}) finished failed: ${verdict.reason}`);
       // resolveParent is folded into queue.completeJob() (same transaction as
       // status flip + token rollup + child_done), so a process crash here can't
       // strand the parent in waiting-children.
     } catch (err) {
       clearInterval(lockTimer);
+      const execution = this.executions.get(lockToken);
+      if (execution) execution.stopped = err instanceof ChildWorkerShutdownError
+        ? err.executionStopped === true
+        : !isolated || childExecutionStopped;
+      if (isLocalConfigurationError(err)) this.blockForConfiguration(err);
+      if (this.configurationError) return;
 
       // If the per-job abort fired, derive the reason from signal.reason (set
       // by whichever site aborted: 'timeout' / 'cancel' / 'lock-lost'). We call
@@ -1350,8 +1574,7 @@ export class MinionWorker extends EventEmitter {
       // already flipped status, our call no-ops cleanly. The prior silent-return
       // left jobs stranded in 'active' until a secondary sweep, breaking
       // timeout/cancel contracts downstream callers rely on.
-      let errorText: string;
-      let abortReason: string | null = null;
+      let errorText: string, abortReason: string | null = null;
       if (abort.signal.aborted) {
         abortReason = abort.signal.reason instanceof Error
           ? abort.signal.reason.message
@@ -1360,6 +1583,7 @@ export class MinionWorker extends EventEmitter {
       } else {
         errorText = err instanceof Error ? err.message : String(err);
       }
+      if (abortReason === 'watchdog' && await settleWatchdogAbort(this.queue, this.engine, job, lockToken, this.inFlight.get(job.id)?.shared !== false, execution?.stopped !== false)) return;
 
       // v0.41.22.2 (D8a / codex C6): infrastructure aborts (lock-renewal-failed,
       // lock-lost) are NOT job defects — they're connection / coordination
@@ -1413,12 +1637,8 @@ export class MinionWorker extends EventEmitter {
         }
         return;
       }
-      if (err instanceof ChildWorkerShutdownError) {
-        console.log(
-          `Job ${job.id} (${job.name}) released after worker shutdown (${errorText}); ` +
-          `stall detector will requeue (no attempt burned)`,
-        );
-        return;
+      if (err instanceof ChildWorkerShutdownError || (!isolated && endedByShutdown(err, this.shutdownAbort.signal, abort.signal))) {
+        return settleShutdownInterruptedJob(this.engine, job, lockToken, errorText, !(err instanceof ChildWorkerShutdownError) || err.executionStopped === true);
       }
       if (err instanceof ChildNotClaimedError) {
         // The child proved the claim is gone (reclaimed/cancelled before the
@@ -1442,6 +1662,7 @@ export class MinionWorker extends EventEmitter {
       // `failJob` minus the `attempts_made` increment. Audit row to
       // `minion_lease_pressure_log` so operators see pressure live in
       // `gbrain doctor` + `gbrain jobs stats lease_pressure`.
+      if (err instanceof JobDeferredError) return this.deferJob(job, lockToken, err);
       const isLeaseFull = err instanceof RateLeaseUnavailableError;
       if (isLeaseFull) {
         const leaseErr = err as RateLeaseUnavailableError;
@@ -1482,7 +1703,7 @@ export class MinionWorker extends EventEmitter {
         return;
       }
 
-      const isUnrecoverable = err instanceof UnrecoverableError;
+      const refusal = jobRefusal(err), isUnrecoverable = refusal !== null || err instanceof UnrecoverableError; // #7239: refusals end now
       const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
 
       let newStatus: 'delayed' | 'failed' | 'dead';
@@ -1508,7 +1729,7 @@ export class MinionWorker extends EventEmitter {
       // so handleStalled requeues it cleanly on a live pool (the D8a path).
       let failed: MinionJob | null;
       try {
-        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined);
       } catch (recordErr) {
         const recordMsg = recordErr instanceof Error ? recordErr.message : String(recordErr);
         console.error(
@@ -1517,8 +1738,12 @@ export class MinionWorker extends EventEmitter {
         if (!isRetryableConnError(recordErr)) throw recordErr;
         await this.reconnectAfterConnectionError('failJob', recordErr);
         try {
-          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined);
         } catch (retryErr) {
+          if (isLocalConfigurationError(retryErr)) {
+            this.blockForConfiguration(retryErr);
+            return;
+          }
           console.error(
             `Job ${job.id} (${job.name}) failure-recording retry also failed ` +
             `(${retryErr instanceof Error ? retryErr.message : String(retryErr)}); ` +
@@ -1539,7 +1764,7 @@ export class MinionWorker extends EventEmitter {
       if (newStatus === 'delayed') {
         console.log(`Job ${job.id} (${job.name}) failed, retrying in ${Math.round(backoffMs)}ms (attempt ${job.attempts_made + 1}/${job.max_attempts})`);
       } else {
-        console.log(`Job ${job.id} (${job.name}) permanently failed: ${errorText}`);
+        console.log(`Job ${job.id} (${job.name}) ${refusal ? `refused (${refusal.code}), not retried` : 'permanently failed'}: ${errorText}`);
       }
     }
   }

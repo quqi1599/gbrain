@@ -23,6 +23,11 @@ export const voyage: Recipe = {
   name: 'Voyage AI',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'voyage-4-nano',
+  ],
   base_url_default: 'https://api.voyageai.com/v1',
   auth_env: {
     required: ['VOYAGE_API_KEY'],
@@ -66,20 +71,24 @@ export const voyage: Recipe = {
       multimodal_models: ['voyage-multimodal-3'],
     },
     reranker: {
-      // #4938: rerank-3 / rerank-3-lite are Voyage's preview generation on the
-      // same /rerank wire (path + top_param unchanged). default_model stays
-      // rerank-2.5 so an upgrade never moves an install; opt in with
-      // `gbrain config set search.reranker.model voyage:rerank-3`.
+      // rerank-3 / rerank-3-lite are Voyage's current generation (generally
+      // available; Voyage lists the 2.5 pair as older models, docs verified
+      // 2026-10-14) on the same /rerank wire (path + top_param unchanged).
+      // rerank-3-lite is the default since gbrain-evals #148 (v0.10.93): 60%
+      // cheaper than rerank-2.5 at 50 candidates x 1,400 tokens, quality
+      // within noise. A brain with an explicit `search.reranker.model` keeps
+      // it; roll back with `gbrain config set search.reranker.model voyage:rerank-2.5`.
       models: ['rerank-2.5', 'rerank-2.5-lite', 'rerank-3', 'rerank-3-lite'],
-      default_model: 'rerank-2.5',
+      default_model: 'rerank-3-lite',
       path: '/rerank',
       top_param: 'top_k',
-      // https://docs.voyageai.com/docs/pricing (2.5 pair verified 2026-08-15,
-      // rerank-3 pair 2026-09-06): rerank-2.5 / rerank-3 $0.05/M,
-      // rerank-2.5-lite / rerank-3-lite $0.02/M. Per-model billing math goes
-      // through src/core/embedding-pricing.ts; this scalar is a display hint.
-      cost_per_1m_tokens_usd: 0.05,
-      price_last_verified: '2026-09-06',
+      // https://docs.voyageai.com/docs/pricing (verified 2026-10-14):
+      // rerank-2.5 / rerank-3 $0.05/M, rerank-2.5-lite / rerank-3-lite
+      // $0.02/M. Per-model billing math goes through
+      // src/core/embedding-pricing.ts; this scalar is a display hint for the
+      // default model.
+      cost_per_1m_tokens_usd: 0.02,
+      price_last_verified: '2026-10-14',
       max_payload_bytes: 5_000_000,
     },
   },

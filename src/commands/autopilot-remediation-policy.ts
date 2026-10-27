@@ -1,7 +1,13 @@
+import type { RemediationStep } from '../core/remediation-step.ts';
+import { isManualOnlyStep } from '../core/remediation/manual-only.ts';
+
+export { isManualOnlyStep };
+
 export const AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES = 60;
 
 export interface AutopilotRemediationPlanShape {
-  score: number;
+  /** null: the tick's health read was degraded (#7236), so the score is unknown. */
+  score: number | null;
   planLength: number;
   estimatedSeconds: number;
   minutesSinceLastFull: number;
@@ -32,15 +38,22 @@ export function shouldRunAutopilotFullCycle({
   return minutesSinceLastFull >= AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES
     || planLength > 3
     || estimatedSeconds >= 300
-    || score < 70;
+    || (score !== null && score < 70);
 }
 
+/** An unknown (null) score never sleeps as healthy. */
 export function shouldSleepHealthyAutopilot(
-  score: number,
+  score: number | null,
   planLength: number,
   minutesSinceLastFull: number,
 ): boolean {
-  return score >= 95
+  return score !== null
+    && score >= 95
     && planLength === 0
     && minutesSinceLastFull < AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES;
+}
+
+/** The steps a targeted dispatch submits: never a manual-only step. */
+export function autopilotTargetedSteps<T extends Pick<RemediationStep, 'job'>>(plan: readonly T[]): T[] {
+  return plan.filter((step) => !isManualOnlyStep(step));
 }

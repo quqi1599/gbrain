@@ -79,6 +79,18 @@ async function captureOutput<T>(fn: () => Promise<T>): Promise<{ result: T; stdo
 }
 
 describe('gbrain reindex --markdown (v0.32.7)', () => {
+  // #5937 (absorbed in agent contract v1 D4)
+  test('rejects invalid --limit values before dispatching any reindex mode', () => {
+    for (const value of ['NaN', '0', '-1', '1.5', '1oops', '9007199254740992']) {
+      expect(validateReindexModeScope(['--multimodal', '--limit', value]), `multimodal ${value}`)
+        .toBe('invalid --limit: expected a positive integer');
+      expect(validateReindexModeScope(['--aliases', `--limit=${value}`]), `aliases ${value}`)
+        .toBe('invalid --limit: expected a positive integer');
+    }
+    expect(validateReindexModeScope(['--multimodal', '--limit', '3'])).toBeNull();
+    expect(validateReindexModeScope(['--aliases', '--limit=3'])).toBeNull();
+  });
+
   test('dry-run reports pending count and does not write', async () => {
     await seedLegacyPage('note-a', 'body a');
     await seedLegacyPage('note-b', 'body b');
@@ -109,9 +121,13 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
     expect(rows.every(r => Number(r.chunker_version) === MARKDOWN_CHUNKER_VERSION)).toBe(true);
   });
 
-  test('idempotent: --no-embed re-run ignores contextual mode drift it cannot repair', async () => {
+  test('idempotent: --no-embed stamps the contextual mode of the pages it re-chunks', async () => {
     await seedLegacyPage('note-e', 'body e');
     await runReindex(engine, ['--markdown', '--no-embed']);
+    const [stamped] = await engine.executeRaw<{ contextual_retrieval_mode: string | null }>(
+      `SELECT contextual_retrieval_mode FROM pages WHERE slug = 'note-e'`,
+    );
+    expect(stamped.contextual_retrieval_mode).toBe('title');
     const second = await runReindex(engine, ['--markdown', '--no-embed']);
     expect(second.pending).toBe(0);
     expect(second.reindexed).toBe(0);
@@ -455,7 +471,8 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
   test('source-file import errors are surfaced, counted, and fail the CLI', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'gbrain-reindex-'));
     try {
-      writeFileSync(join(repo, 'bad.md'), '---\ntype: note\ntitle: Re: invalid yaml\n---\nbody\n');
+      // #5988: `title: Re: ...` now imports by quoting; a mis-indented list cannot be read.
+      writeFileSync(join(repo, 'bad.md'), '---\ntype: note\ntags:\n  - a\n - b\n---\nbody\n');
       await seedLegacyPage('bad', 'old body', 'bad.md');
 
       const { result, stderr } = await captureOutput(() =>

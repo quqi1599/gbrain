@@ -44,7 +44,7 @@
 
 import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from './spawn.ts';
 import { createHash } from 'node:crypto';
 
 /**
@@ -156,8 +156,17 @@ export interface BinarySelfUpdateDeps {
 }
 
 async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  return fetchReleaseJson('https://api.github.com/repos/garrytan/gbrain/releases/latest');
+}
+
+/** GBRA-175: one named release (the stable channel's), in the same shape as the latest release. */
+export function fetchReleaseByTag(tag: string): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  return fetchReleaseJson(`https://api.github.com/repos/garrytan/gbrain/releases/tags/${encodeURIComponent(tag)}`);
+}
+
+async function fetchReleaseJson(url: string): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
   try {
-    const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
+    const res = await fetch(url, {
       headers: { 'User-Agent': 'gbrain-self-upgrade' },
       signal: AbortSignal.timeout(5_000),
     });
@@ -172,7 +181,7 @@ async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsse
   }
 }
 
-async function defaultDownload(url: string, destPath: string): Promise<void> {
+export async function defaultDownload(url: string, destPath: string): Promise<void> {
   const res = await fetch(url, {
     headers: { 'User-Agent': 'gbrain-self-upgrade' },
     redirect: 'follow',
@@ -181,10 +190,11 @@ async function defaultDownload(url: string, destPath: string): Promise<void> {
   if (!res.ok) throw new Error(`download HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length === 0) throw new Error('downloaded asset is empty');
-  writeFileSync(destPath, buf);
-  // fsync so a crash between write and rename can't leave a torn file.
-  const fd = openSync(destPath, 'r');
+  // fsync the descriptor that wrote the bytes, so a crash between write and
+  // rename can't leave a torn file. A read-only reopen fails on Windows (EPERM).
+  const fd = openSync(destPath, 'w');
   try {
+    writeFileSync(fd, buf);
     fsyncSync(fd);
   } finally {
     closeSync(fd);

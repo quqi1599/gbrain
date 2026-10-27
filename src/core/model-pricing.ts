@@ -8,8 +8,8 @@
  *   - eval-contradictions/cost-tracker.ts (silent-Haiku-fallback view)
  *   - cross-modal-eval/runner.ts    (multi-provider eval panel)
  *   - skillopt/preflight.ts         (Sonnet-fallback warn-only estimate)
- * The bare-keyed `ANTHROPIC_PRICING` view is itself consumed by budget/budget-tracker.ts,
- * minions/batch-projection.ts, and cycle/budget-meter.ts — so those inherit canonical too.
+ * The bare-keyed `ANTHROPIC_PRICING` view is itself consumed by budget/budget-tracker.ts
+ * and cycle/budget-meter.ts — so those inherit canonical too.
  *
  * The dollar amounts live HERE ONCE — update prices in this file only. Each
  * consumer keeps its own key allowlist and miss-handling policy (fail-closed
@@ -57,6 +57,53 @@ export interface ModelPricing {
    * absent (under-estimate for writes; documented, not silent).
    */
   cache_write?: number;
+  /**
+   * #6448 item 1 — long-prompt tier. Some providers bill the WHOLE request at
+   * higher rates once its prompt exceeds `threshold_tokens` input tokens
+   * (Anthropic's long-context pricing: Haiku 5.5 bills 5x on input, cache
+   * and output above 100K). `priceAtPromptSize()` selects this tier from the
+   * request's total input tokens (cache reads and writes included; they are
+   * part of the prompt). Absent when the provider publishes one flat rate.
+   */
+  long_prompt?: LongPromptTier;
+}
+
+/** The rates a request pays once its prompt exceeds `threshold_tokens` (strictly greater). */
+export interface LongPromptTier {
+  threshold_tokens: number;
+  input: number;
+  output: number;
+  cache_read?: number;
+  cache_write?: number;
+}
+
+/**
+ * Anthropic's long-context boundary: a prompt of MORE than 100,000 input
+ * tokens bills at the long-prompt tier (platform.claude.com/docs/en/about-claude/pricing,
+ * checked 2026-10-11). Exactly 100,000 is still the base tier.
+ */
+export const ANTHROPIC_LONG_PROMPT_THRESHOLD_TOKENS = 100_000;
+
+/**
+ * The flat rates a request of `inputTokens` prompt tokens pays: the
+ * `long_prompt` tier when the prompt exceeds its threshold, else the base
+ * row. Returns a tier-free `ModelPricing` so every consumer prices with one
+ * `input`/`output`/`cache_*` set and cannot apply the base rate to part of a
+ * long prompt. A missing or non-finite size prices at the base tier.
+ */
+export function priceAtPromptSize(pricing: ModelPricing, inputTokens: number | null | undefined): ModelPricing {
+  const tier = pricing.long_prompt;
+  if (!tier || typeof inputTokens !== 'number' || !Number.isFinite(inputTokens) || inputTokens <= tier.threshold_tokens) {
+    if (!tier) return pricing;
+    const { long_prompt: _omit, ...base } = pricing;
+    return base;
+  }
+  return {
+    input: tier.input,
+    output: tier.output,
+    ...(tier.cache_read !== undefined ? { cache_read: tier.cache_read } : {}),
+    ...(tier.cache_write !== undefined ? { cache_write: tier.cache_write } : {}),
+  };
 }
 
 /** Anthropic prompt-cache multipliers (verified 2026-08 against published
@@ -80,6 +127,9 @@ function anthro(input: number, output: number, cacheReadMult = ANTHROPIC_CACHE_R
 export const ANTHROPIC_CACHE_READ_MULT_OVERRIDES: Record<string, number> = {
   // Fable 5.1 bills cache hits at 0.025x base input ($0.25/MTok on $10).
   'anthropic:claude-fable-5-1': 0.025,
+  // Opus 5.5 bills cache hits at 0.05x base input ($0.20/MTok on $4),
+  // verified 2026-10-01 against the published Opus 5.5 price list.
+  'anthropic:claude-opus-5-5': 0.05,
 };
 
 /**
@@ -100,16 +150,31 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   'anthropic:claude-fable-5-1':           anthro(10.00, 50.00, ANTHROPIC_CACHE_READ_MULT_OVERRIDES['anthropic:claude-fable-5-1']),
   // Opus 4.x/5: $5 in / $25 out. Opus 5 (new generation) shares the same
   // per-token rate as 4.8 (released 2026-05-28) — closes gbrain#1819.
+  // Opus 5.5 (released 2026-09-22): $4 in / $20 out, cache writes 1.25x
+  // ($5). Fast mode ($8/$40) is not modeled. Closes gbrain#5359.
+  'anthropic:claude-opus-5-5':            anthro( 4.00, 20.00, ANTHROPIC_CACHE_READ_MULT_OVERRIDES['anthropic:claude-opus-5-5']),
   'anthropic:claude-opus-5':              anthro( 5.00, 25.00),
   'anthropic:claude-opus-4-8':            anthro( 5.00, 25.00),
   'anthropic:claude-opus-4-7':            anthro( 5.00, 25.00),
   'anthropic:claude-opus-4-6':            anthro( 5.00, 25.00),
-  // Sonnet 5 (released 2026-06-29): same $3/$15 sticker as 4.6. The launch
-  // intro discount ($2/$10 through 2026-08-31) is deliberately NOT modeled —
-  // the table carries standard rates so estimates stay conservative and
-  // don't need a time-bombed edit when the promo lapses.
-  'anthropic:claude-sonnet-5':            anthro( 3.00, 15.00),
+  // Sonnet 5 / 5.5: $2 in / $10 out. Anthropic made Sonnet 5's launch
+  // price the standard rate — the scheduled 2026-09-01 increase to $3/$15
+  // did not happen (pricing page footnote). Sonnet 5.5 (released
+  // 2026-09-28) ships at the same rate.
+  'anthropic:claude-sonnet-5-5':          anthro( 2.00, 10.00),
+  'anthropic:claude-sonnet-5':            anthro( 2.00, 10.00),
   'anthropic:claude-sonnet-4-6':          anthro( 3.00, 15.00),
+  // Haiku 5.5: $0.10 in / $0.50 out for prompts up to 100,000 tokens
+  // (platform.claude.com/docs/en/about-claude/pricing, checked 2026-10-11).
+  // Longer prompts bill 5x on every rate ($0.50 in / $0.625 5m cache write /
+  // $0.05 cache read / $2.50 out) — the `long_prompt` tier, selected per
+  // request by priceAtPromptSize() (#6448 item 1). The 1h cache-write rate
+  // ($0.20 / $1.00) stays unmodeled. The default facts extraction model on
+  // Anthropic-keyed installs.
+  'anthropic:claude-haiku-5-5':           {
+    ...anthro( 0.10,  0.50),
+    long_prompt: { threshold_tokens: ANTHROPIC_LONG_PROMPT_THRESHOLD_TOKENS, ...anthro( 0.50,  2.50) },
+  },
   // Haiku 4.5 — both the dateless canonical id and the dated snapshot.
   'anthropic:claude-haiku-4-5':           anthro( 1.00,  5.00),
   'anthropic:claude-haiku-4-5-20251001':  anthro( 1.00,  5.00),
@@ -136,6 +201,11 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   'openai:gpt-5.6-sol':                   { input:  5.00, output: 30.00 },
   'openai:gpt-5.6-terra':                 { input:  2.50, output: 15.00 },
   'openai:gpt-5.6-luna':                  { input:  0.20, output:  1.20 },
+  // gpt-6.1-sol: list rate from platform.openai.com/docs/models/gpt-6.1-sol
+  // (checked 2026-10-06; short-context standard tier). Priced so the fence
+  // repair default (#6188) meters exactly; it is NOT a tier default yet
+  // (openai-latest.ts METERED_ONLY keeps discovery on the gpt-5.6 family).
+  'openai:gpt-6.1-sol':                   { input:  2.00, output: 10.00 },
 
   // ── Google ─────────────────────────────────────────────────────────────
   // `gemini-1.5-pro` was retired by Google (#3510); kept so historical
@@ -158,9 +228,16 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // `deepseek-chat` was retired by DeepSeek 2026-07-24 (#1255); kept so
   // historical usage/audit rows still price. New calls use the v4 names.
   'deepseek:deepseek-chat':               { input:  0.14, output:  0.28 },
-  // DeepSeek v4 (verified 2026-07-27 at api-docs.deepseek.com): cache-miss rates.
-  'deepseek:deepseek-v4-flash':           { input:  0.14, output:  0.28 },
-  'deepseek:deepseek-v4-pro':             { input:  0.435, output: 0.87 },
+  // DeepSeek (verified 2026-10-05 at https://api-docs.deepseek.com/quick_start/pricing):
+  // PEAK cache-miss rates, an upper bound. DeepSeek bills half these rates
+  // off-peak (outside 01:00-04:00 and 06:00-10:00 UTC on weekdays); a static
+  // row cannot know the hour and a cap must bound the worst case, so caps
+  // and estimates use peak. `deepseek-flash` (DeepSeek-V4.1-Flash) is the
+  // current name; the legacy `deepseek-v4-flash` is served by the same model
+  // and billed at the Flash price, so the pair stays in lockstep.
+  'deepseek:deepseek-flash':              { input:  0.30, output:  1.20 },
+  'deepseek:deepseek-v4-flash':           { input:  0.30, output:  1.20 },
+  'deepseek:deepseek-v4-pro':             { input:  1.32, output:  3.96 },
   // ── Z.ai / GLM (via LiteLLM proxy) ───────────────────────────────────
   // GLM-5.2 from Z.ai: $1.40/M input, $4.40/M output (verified 2026-08-16
   // against OpenRouter provider listings — z.ai's own direct rates).
@@ -168,7 +245,7 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
 
   // ── OpenRouter (router-prefixed, own catalogue rate) ────────────────────
   // Static entries pulled from OpenRouter's published `/api/v1/models`
-  // catalogue (verified 2026-08-17), NOT aliased to the inner vendor's
+  // catalogue (verified 2026-08-17; re-checked 2026-10-05), NOT aliased to the inner vendor's
   // direct rate — a router bills its own spread, and canonicalLookup's
   // nested-id miss (see doc comment below) exists precisely to stop a
   // router-prefixed id from silently matching the vendor's key instead.
@@ -182,10 +259,11 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // live; see PR discussion on gbrain#3848 for why a dynamic fetch/cache
   // didn't merge (default-on network behavior, new pricing-source surface).
   //
-  // deepseek/deepseek-v4-flash-0731 matches deepseek:deepseek-v4-flash
-  // above to the cent — OpenRouter passing DeepSeek through at vendor
-  // rate, not a coincidence worth losing to an alias shortcut.
-  'openrouter:deepseek/deepseek-v4-flash-0731': { input: 0.14,  output: 0.28 },
+  // deepseek/deepseek-v4-flash-0731 re-verified 2026-10-05 against the
+  // catalogue's own rate ($0.0152 in / $1.28 out), which no longer matches
+  // the vendor row above: a router row is read from the router, never
+  // copied from the vendor.
+  'openrouter:deepseek/deepseek-v4-flash-0731': { input: 0.0152, output: 1.28 },
   'openrouter:qwen/qwen3.7-flash':              { input: 0.03,  output: 0.13 },
   'openrouter:qwen/qwen3.6-plus':               { input: 0.325, output: 1.95 },
 };

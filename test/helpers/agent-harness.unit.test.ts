@@ -8,9 +8,6 @@
  *   - hermeticChildEnv: drops CONDUCTOR_* / CLAUDE_* / GSTACK_* / MCP_* /
  *     GBRAIN_*, promotes GSTACK_ANTHROPIC_API_KEY, honors extraAllow, and lets
  *     overrides win.
- *   - resolveClaudeBinary / resolveCodexBinary SMOKE (whatever this machine
- *     has — assertion is only that the result is a string-or-null, plus a note
- *     printed when found).
  *
  * The env test mutates process.env and restores it in finally so it never
  * leaks into sibling tests.
@@ -27,9 +24,6 @@ import {
   hermesChildEnv,
   grokChildEnv,
   promotedEnv,
-  resolveClaudeBinary,
-  resolveCodexBinary,
-  resolveHermesBinary,
   resolveGrokBinary,
   hasHermesAuth,
   hasGrokAuth,
@@ -216,30 +210,6 @@ describe('hermeticChildEnv', () => {
         expect(scrubbed.CODEX_HOME).toBeUndefined();
       },
     );
-  });
-});
-
-describe('binary resolution SMOKE', () => {
-  test('resolveClaudeBinary returns a string or null', () => {
-    const bin = resolveClaudeBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] claude resolved at: ${bin}`);
-  });
-
-  test('resolveCodexBinary returns a string or null', () => {
-    const bin = resolveCodexBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] codex resolved at: ${bin}`);
-  });
-
-  test('resolveHermesBinary returns a string or null', () => {
-    const bin = resolveHermesBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] hermes resolved at: ${bin}`);
-  });
-
-  test('hasHermesAuth returns a boolean', () => {
-    expect(typeof hasHermesAuth()).toBe('boolean');
   });
 });
 
@@ -664,8 +634,27 @@ describe('parseOpencodeJsonl (pure — fixtures pinned to observed v1.18.18 shap
   });
 
   test('empty/garbage input → empty result, never throws', () => {
-    expect(parseOpencodeJsonl([])).toEqual({ finalText: '', toolCalls: [] });
-    expect(parseOpencodeJsonl(['{', 'null', '42'])).toEqual({ finalText: '', toolCalls: [] });
+    expect(parseOpencodeJsonl([])).toEqual({ finalText: '', toolCalls: [], errors: [] });
+    expect(parseOpencodeJsonl(['{', 'null', '42'])).toEqual({ finalText: '', toolCalls: [], errors: [] });
+  });
+
+  test('#6049: a provider error event is collected with its status, name and response error type', () => {
+    const line = JSON.stringify({ type: 'error', error: { name: 'APIError', data: {
+      message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+      statusCode: 403, isRetryable: false,
+      responseBody: JSON.stringify({ type: 'error', error: { type: 'FreeTierError', message: '...' } }),
+      metadata: { url: 'https://opencode.ai/zen/v1/chat/completions' },
+    } } });
+    const parsed = parseOpencodeJsonl([line]);
+    expect(parsed.finalText).toBe('');
+    expect(parsed.errors).toEqual(["APIError 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building."]);
+  });
+
+  test('#6049: an error event without data or with an unparsable response body still names what it can', () => {
+    expect(parseOpencodeJsonl([JSON.stringify({ type: 'error', error: { name: 'UnknownError' } })]).errors).toEqual(['UnknownError']);
+    expect(parseOpencodeJsonl([JSON.stringify({ type: 'error', error: { name: 'APIError', data: { message: 'upstream 502', statusCode: 502, responseBody: '<html>' } } })]).errors)
+      .toEqual(['APIError 502: upstream 502']);
+    expect(parseOpencodeJsonl([JSON.stringify({ type: 'error' })]).errors).toEqual(['error event without details']);
   });
 });
 

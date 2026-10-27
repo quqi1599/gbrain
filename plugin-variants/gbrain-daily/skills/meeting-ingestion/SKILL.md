@@ -41,6 +41,7 @@ upstream:
   - meeting-ingestion@fc834ee
   - meeting-gold-standard@fc834ee
   - chronology-guard@fc834ee
+when_to_use: "Use when the user asks: \"meeting transcript\", \"process this meeting\", \"meeting notes\", \"meeting recorder\", \"ingest this recording\"."
 ---
 
 # Meeting Ingestion Skill — Unified Pipeline
@@ -119,9 +120,14 @@ source_url: "..."              # link back to the source platform, if any
   from it into the brain.
 
 Retain the raw transcript when the source provides one: file it as a sidecar
-page (e.g. `meetings/YYYY-MM-DD-{slug}-transcript`) or keep the source file
-reachable, and link it from the meeting page. The transcript is the canonical
-evidence for every quote and claim check downstream.
+page with `type: source` at `sources/meetings/YYYY-MM-DD-{slug}-transcript`
+(the default pack files raw evidence as `source` under `sources/`; never
+invent `meeting-transcript`, and don't write the `transcript` alias) or keep
+the source file reachable, and link it from the meeting page. The transcript is the canonical
+evidence for every quote and claim check downstream. Put
+`facts_backstop: false` in the sidecar's frontmatter: automatic fact
+extraction would otherwise mine the raw transcript, garbles and banter
+included, beside the verified meeting page (Phase 5).
 
 **Redact before you retain.** A raw transcript routinely captures pasted
 secrets and PII (a read-aloud API key, a screen-shared token, a private phone
@@ -224,9 +230,15 @@ and sometimes confidently WRONG names. Resolve by evidence:
 ### Phase 5: Create meeting page
 
 ```markdown
+---
+type: meeting
+attendees: [{comma-separated slugs of the same people, e.g. people/alice-example}]
+facts_backstop: false
+---
+
 # {Meeting Title} — {Date}
 
-**Attendees:** {list with links to people pages}
+Attendees: {comma-separated links to the people pages of everyone in the room}
 **Date:** {YYYY-MM-DD}
 **Duration:** {if available}
 
@@ -247,6 +259,19 @@ If none: _No notable quotes — operational/logistics meeting._}
 {Structured notes by topic}
 ```
 
+The `Attendees:` line is the page's attendance record, and the link extractor
+reads it literally. Write it as one line that starts with `Attendees:` (no
+bold markup) and holds only links to people pages, one per person who was in
+the room, separated by commas (no "and"). Link a person only when the
+identification is high or medium confidence (Phase 4). Put a company, role,
+speaker confidence, a low-confidence guess, or an unresolved speaker such as
+`UNKNOWN_2` in Discussion Notes instead: any extra text on the line stops the
+extractor from reading it as the attendance record, and a line wrapped onto a
+second line loses everyone after the break. Leave people who were only
+invited or mentioned off the line. The `attendees:` frontmatter lists
+exactly the same people by slug; extraction reads it as a second attendance
+record, so the two must agree.
+
 The four required sections are Summary, Key Decisions, Action Items, and
 Notable Quotes — additional sections (Discussion Notes, a link to the
 transcript sidecar) are additive, never replacements. An empty section always
@@ -254,6 +279,29 @@ carries an explicit reason; a bare `- None.` is a dodge, not an answer.
 
 Quotes are VERBATIM. Write what was said the way it was said — a paraphrase in
 a blockquote is a fabricated quote.
+
+Timeline events (`life/events/`) are extracted from the saved meeting page in
+the background (Life Chronicle, on by default; one paid chat call per page).
+Check the write receipt: `chronicle_backstop.pending: "next_cycle"` means the
+next cycle extracts it (`gbrain dream --phase chronicle` runs it now, paid), and
+`chronicle_backstop.skipped` names the reason and its fix. Never hand-write
+`life/events/` pages; edit the meeting page and extraction updates its events.
+See `docs/guides/life-chronicle.md`.
+
+Facts (what `recall` returns) are also extracted from saved pages in the
+background, on by default, one paid chat call each time a page's body changes.
+Extraction files each fact on the entity page it names, so it reaches people
+and company pages without passing Phase 6, and it never takes back facts it
+filed from an earlier version of the page. That is why the template drafts
+the meeting page with `facts_backstop: false` (the receipt reads
+`facts_backstop: { skipped: "opted_out" }`): nothing is extracted while the
+page is still being corrected. When the verification checklist passes, save
+the page once more without that line; the receipt then reads
+`facts_backstop: { queued: true }`. Everything on the verified page is
+extraction input, so an uncertain note kept under the downgrade protocol
+becomes a lower-confidence fact. The transcript sidecar keeps its
+`facts_backstop: false`. Don't call `extract_facts` for the meeting or its
+transcript.
 
 ### Phase 6: Claim verification + consistency check (gate for every entity write)
 
@@ -294,13 +342,18 @@ it as an explicitly-uncertain note on the meeting page — never in an entity
 page's compiled truth or frontmatter.
 
 **Propagation rule:** a claim that fails verification must not fan out. Do not
-copy it to other entity pages or timeline entries. A false claim written to
+copy it to other entity pages or timeline entries, and keep it off the
+verified meeting page too: fact extraction carries that page's claims to entity
+pages (Phase 5). A false claim written to
 five pages costs five corrections.
 
 ### Phase 7: Attendee enrichment (MANDATORY)
 
 For EACH attendee:
-1. `gbrain search "{name}"` — does a people page exist?
+1. Does a people page exist? Only an exact match counts: one match from
+   `gbrain whois <email> --json`, else from `gbrain whois "<name>" --json`
+   ([identity rule](../conventions/brain-first.md#identity-exact-match)).
+   A search's top hit is a candidate to check, never the attendee.
 2. If NO → create via the enrich skill (`skills/enrich/SKILL.md`). Every
    person who was actually IN the meeting gets a page, even a thin one. Skip
    only ephemeral third-party mentions (a name invoked about someone not
@@ -316,9 +369,29 @@ garbled name or a low-confidence guess; a wrong backlink pollutes the graph
 worse than a missing one.
 
 **Note:** Once the meeting page is written via `gbrain put`, the auto-link
-post-hook automatically creates `attended` links from the meeting to each
-attendee whose page is referenced as `[Name](people/slug)`. You don't need to
-call `gbrain link` for attendees. You DO still need `gbrain timeline-add` for
+post-hook reads attendance from the page. Where the active schema pack does
+not override attendance (gbrain-base-v2, which `gbrain init` sets), each
+person on the `Attendees:` line and in `attendees:` frontmatter (Phase 5) gets a
+`person --attended--> meeting` edge, and people linked anywhere else on the
+page are not recorded as attendance; a pack that overrides attendance, such as
+the older `gbrain-base`, sets its own rule and direction. Leave attendance to
+auto-link rather than `gbrain link` or `add_link`: a hand-written `attended`
+edge can point the wrong way. Over MCP, `put_page` does not auto-link inline
+(the receipt says `auto_links.skipped: remote`). It queues plain `mentions`
+edges to pages that already exist (`auto_links.mention_links: queued`), but
+never the typed `attended` edges. Those come from a maintenance pass: a stdio
+`gbrain serve` runs it on its startup and idle sweeps; behind
+`gbrain serve --http` the host runs `gbrain sweep --once` or
+`gbrain extract links --source db`. No MCP tool runs that pass for you, so
+over HTTP ask the host operator, and don't hand-write `attended` with
+`add_link`.
+
+A missing `attended` edge has one of two causes. Either the attendee record
+breaks a Phase 5 rule, or it names a person whose page did not exist when the
+meeting page was written; auto-link then reports an error and writes none of
+the page's links. This skill creates new people pages in Phase 7, after the
+meeting page, so once Phase 7 is done run `gbrain extract --stale` (over MCP,
+the sweep above) to link the page. You DO still need `gbrain timeline-add` for
 dated events (auto-link only handles links, not timeline entries).
 
 ### Phase 8: Entity propagation + timeline merge (MANDATORY)
@@ -341,7 +414,17 @@ itself, chain into `skills/signal-detector/SKILL.md` after ingestion.
 
 ### Phase 9: Sync
 
-`gbrain sync` to update the index.
+The pages are already in the brain; this step catches the index up to the
+brain repo checkout. Use the form that matches the brain:
+
+- **Managed brain** (managed persistence on): `gbrain sync --source <id> --no-pull`.
+  A managed checkout moves only through `gbrain sources refresh <id>`, never
+  through sync, so a bare `gbrain sync` there would pull the checkout behind
+  the coordinator's back.
+- **Unmanaged brain:** `gbrain sync`.
+
+If you can't tell which, use `gbrain sync --source <id> --no-pull`: it is
+correct on both and never moves the checkout.
 
 ## Verify before declaring done (HARD GATE)
 
@@ -382,7 +465,7 @@ Phase 4. An unflagged anonymous label means speaker resolution was skipped.
   quote still shares a long contiguous run of content words, a fabricated one
   does not.
   ```bash
-  gbrain get meetings/{date}-{slug}-transcript   # then locate each quote span
+  gbrain get sources/meetings/{date}-{slug}-transcript   # then locate each quote span
   ```
 - **Prompt checklist (no transcript retained):** re-read the source notes and
   attest that each quote traces to them word-for-word.
@@ -441,13 +524,15 @@ failure axes, and V1–V5 never look at order. Verify the narrated sequence:
      in the report, don't block on it.
 
 **The loop:** fix → re-check → fix, until every item passes (or V6 is
-explicitly waived). Only then report.
+explicitly waived). Then save the meeting page without the draft
+`facts_backstop: false` line (Phase 5), and report.
 
 ## Sensitive meetings
 
 If the title or transcript signals legal or deeply personal content
 (deposition, attorney, counsel, privileged, health): keep the page minimal and
-factual, do not extract biographical color into other pages, and prefer
+factual, keep its `facts_backstop: false` unless the user agrees to fact
+extraction, do not extract biographical color into other pages, and prefer
 restraint on back-links. When in doubt about whether content should propagate,
 ask the user.
 
@@ -458,10 +543,20 @@ ingested: {N} attendees enriched, {N} entities updated, {N} action items
 captured. Verification: passed. Sequence: PASS." If the sequence check was
 waived, say so explicitly: "Sequence: WAIVED by user — {contradiction} stands
 (acknowledged, not resolved)." If the recording was split, report one line per
-resulting meeting page. If a claim was withheld or a contradiction flagged by
+resulting meeting page. Name the final meeting-page save's `facts_backstop`
+receipt: `queued`, or `opted_out` with the reason extraction stays off (a
+sensitive meeting the user did not clear). If a claim was withheld or a contradiction flagged by
 Phase 6, list each flag — the user resolves them, not silence. If any
 checklist item cannot be made to pass, report the meeting as NOT ingested and
 name the failing item.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A contradiction with an existing page blocks ingestion until the user fixes or waives it: show both sources and wait.
+- `add_link` / auto-link reports an error after the meeting page was written: the page is saved but the links are not; list the failed links and add them after fixing slugs.
+- `put_page` returns `revision_conflict` on an attendee page: re-read and merge; never overwrite a person page from an old read.
 
 ## Anti-Patterns
 

@@ -21,16 +21,17 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { safeLoad } from 'js-yaml';
+import { load } from 'js-yaml';
 
 import { KNOWN_CONFIG_KEYS } from '../src/core/config.ts';
 import { KNOWN_LINK_TYPES } from '../src/core/search/relational-intent.ts';
 import { operations } from '../src/core/operations.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
 const REPO = path.join(import.meta.dir, '..');
 
 describe('jobs.ts wiring', () => {
-  const src = fs.readFileSync(path.join(REPO, 'src', 'commands', 'jobs.ts'), 'utf8');
+  const src = surfaceFileSource('jobs', 'src/commands/jobs.ts');
 
   test("GATEWAY_REFRESH_JOB_NAMES contains 'loops_extract'", () => {
     const m = src.match(/const GATEWAY_REFRESH_JOB_NAMES = new Set\(\[([\s\S]*?)\]\);/);
@@ -66,7 +67,7 @@ describe('relational edge vocabulary', () => {
       path.join(REPO, 'src', 'core', 'schema-pack', 'base', 'gbrain-base-v2.yaml'),
       'utf8',
     );
-    const pack = safeLoad(raw) as { link_types?: Array<{ name: string }> };
+    const pack = load(raw) as { link_types?: Array<{ name: string }> };
     expect(Array.isArray(pack.link_types)).toBe(true);
     const names = pack.link_types!.map((lt) => lt.name);
     expect(names).toContain('owes_to');

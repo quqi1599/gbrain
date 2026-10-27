@@ -23,6 +23,8 @@ import {
 } from '../src/core/minions/handlers/subagent.ts';
 import type { ToolDef, MinionJobContext } from '../src/core/minions/types.ts';
 import type Anthropic from '@anthropic-ai/sdk';
+import { OperationError } from '../src/core/ops/contract.ts';
+import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
 
 let engine: PGLiteEngine;
 let queue: MinionQueue;
@@ -970,6 +972,39 @@ describe('write accounting (#4217)', () => {
     expect(result.pages_failed).toBe(0);
   });
 
+  test('allow_clean_zero_writes: a clean finish after a completed read completes; without it the job dead-letters (#5540)', async () => {
+    const searchTurn = {
+      content: [{ type: 'tool_use', id: 'tu_s', name: 'brain_search', input: { value: 'themes' } }] as any,
+      stop_reason: 'tool_use' as const,
+    };
+    const strict = makeSubagentHandler({
+      engine, client: new FakeMessagesClient([searchTurn, endTurn]),
+      toolRegistry: [makeEchoTool('brain_search'), makePutPageTool('ok')],
+    });
+    const strictCtx = await makeCtx({ prompt: 'find patterns', require_writes: true });
+    await expect(strict(strictCtx)).rejects.toThrow('zero required put_page writes');
+
+    const handler = makeSubagentHandler({
+      engine, client: new FakeMessagesClient([searchTurn, endTurn]),
+      toolRegistry: [makeEchoTool('brain_search'), makePutPageTool('ok')],
+    });
+    const ctx = await makeCtx({ prompt: 'find patterns', require_writes: true, allow_clean_zero_writes: true });
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.pages_attempted).toBe(0);
+    expect(result.pages_written).toBe(0);
+  });
+
+  test('allow_clean_zero_writes does not excuse a run whose only tool failed (#5540)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'tool_use', id: 'tu_b2', name: 'broken', input: {} }] as any, stop_reason: 'tool_use' },
+      endTurn,
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makeThrowingTool('broken')] });
+    const ctx = await makeCtx({ prompt: 'find patterns', require_writes: true, allow_clean_zero_writes: true });
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+  });
+
   test('non-put_page tool failures do not count toward write accounting', async () => {
     const client = new FakeMessagesClient([
       { content: [{ type: 'tool_use', id: 'tu_b', name: 'broken', input: {} }] as any, stop_reason: 'tool_use' },
@@ -1042,6 +1077,73 @@ describe('oneshot mode dispatch (#4216)', () => {
     expect(result.pages_failed).toBe(0);
     expect(client.calls.length).toBe(0);
     expect(await engine.getPage(SLUG_A)).not.toBeNull();
+  });
+
+  test('explicit oneshot skip under require_writes completes instead of dead-lettering (#5590)', async () => {
+    const client = new FakeMessagesClient([]);
+    const skip = JSON.stringify({ pages: [], skipped: true, skip_reason: 'verbatim paste of an existing page' });
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(skip) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    const result = await handler(ctx);
+    expect(result.synth_mode_used).toBe('oneshot');
+    expect(result.oneshot_skipped).toBe(true);
+    expect(result.pages_attempted).toBe(0);
+    expect(result.pages_written).toBe(0);
+    expect(client.calls.length).toBe(0);
+  });
+
+  test('a oneshot skip replayed after its transcript persisted still completes without another model call (#5590)', async () => {
+    const client = new FakeMessagesClient([]);
+    const skip = JSON.stringify({ pages: [], skipped: true, skip_reason: 'already captured' });
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(skip) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    expect((await handler(ctx)).oneshot_skipped).toBe(true);
+
+    let chatCalls = 0;
+    const spy = (async (...args: any[]) => { chatCalls++; return chatStub(skip)(...args); }) as any;
+    const replay = await makeSubagentHandler({ engine, client, _chat: spy })({ ...ctx, attempts_made: 1 });
+    expect(replay.synth_mode_used).toBe('oneshot');
+    expect(replay.oneshot_skipped).toBe(true);
+    expect(replay.pages_attempted).toBe(0);
+    expect(chatCalls).toBe(0);
+    expect(client.calls.length).toBe(0);
+  });
+
+  test('an agentic-fallback transcript that merely looks like a skip still dead-letters on replay (#5590)', async () => {
+    const client = new FakeMessagesClient([]);
+    let chatCalls = 0;
+    const spy = (async (...args: any[]) => { chatCalls++; return chatStub('{}')(...args); }) as any;
+    const handler = makeSubagentHandler({ engine, client, _chat: spy });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', '[{"type":"text","text":"synthesize"}]'::jsonb),
+              ($1, 1, 'assistant', $2::text::jsonb)`,
+      [ctx.id, JSON.stringify([{ type: 'text', text: JSON.stringify({ pages: [], skipped: true }) }])],
+    );
+    await expect(handler({ ...ctx, attempts_made: 1 })).rejects.toThrow('zero required put_page writes');
+    expect(chatCalls).toBe(0);
+  });
+
+  test('oneshot pages:[] without the skip flag still dead-letters when the fallback writes nothing (#5590)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'nothing met the bar' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(JSON.stringify({ pages: [], skipped: false })) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
   });
 
   test('invalid oneshot output falls back to the agentic loop IN THE SAME JOB', async () => {
@@ -1337,5 +1439,120 @@ describe('handler-entry capability gate on the resolved model', () => {
       await engine.unsetConfig('models.subagent');
       await engine.unsetConfig('agent.use_gateway_loop');
     }
+  });
+});
+
+describe('legacy loop: an accepted tool write that is still pending (#5474)', () => {
+  // A deadline this far out leaves a replay window well past every case below.
+  const farDeadline = () => Date.now() + 10 * 60_000;
+  /** A put_page whose write is pending for `pendingFor` dispatches, then lands in `settles`. */
+  function stagedWrite(pendingFor: number, opts: { throwPending?: boolean; settles?: 'committed' | 'failed'; retryAfterMs?: number } = {}) {
+    const requestIds: unknown[] = [];
+    const tool: ToolDef = { ...makeEchoTool('brain_put_page'), async execute(input) {
+      const request_id = (input as Record<string, unknown>).request_id; requestIds.push(request_id);
+      if (requestIds.length > pendingFor) return { request_id, state: opts.settles ?? 'committed', retry_after_ms: null };
+      const receipt = { request_id, state: 'queued', retry_after_ms: opts.retryAfterMs ?? 10 };
+      if (!opts.throwPending) return receipt;
+      const pending = new OperationError('write_pending', 'The write is accepted and is still pending.', 'Read its receipt.');
+      pending.writeRequest = receipt as never; pending.writeError = 'write_pending';
+      throw pending;
+    } };
+    return { tool, requestIds };
+  }
+  const oneWriteThenDone = () => new FakeMessagesClient([
+    { content: [{ type: 'tool_use', id: 'tu_w', name: 'brain_put_page', input: { slug: 'notes/staged-example', content: 'x' } } as any], stop_reason: 'tool_use' as any },
+    { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' },
+  ]);
+  const rowStatuses = async (jobId: number) =>
+    (await engine.executeRaw<{ status: string }>('SELECT status FROM subagent_tool_executions WHERE job_id = $1', [jobId])).map(r => r.status);
+
+  for (const throwPending of [false, true]) {
+    test(`a ${throwPending ? 'thrown write_pending' : 'returned queued receipt'} is replayed under one request id until it commits`, async () => {
+      const { tool, requestIds } = stagedWrite(4, { throwPending });
+      const client = oneWriteThenDone();
+      const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+      const result = await makeSubagentHandler({ engine, client, toolRegistry: [tool] })(ctx);
+      expect(result.stop_reason).toBe('end_turn');
+      expect(client.calls.length).toBe(2);
+      expect(requestIds).toHaveLength(5);
+      expect(new Set(requestIds).size).toBe(1);
+      expect(await rowStatuses(ctx.id)).toEqual(['complete']);
+    });
+  }
+
+  test('the replay window follows the job deadline, not the shorter maintenance wait', async () => {
+    const restore = __setMaintenanceWriteWaitForTests(0);
+    try {
+      const { tool, requestIds } = stagedWrite(3);
+      const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+      const result = await makeSubagentHandler({ engine, client: oneWriteThenDone(), toolRegistry: [tool] })(ctx);
+      expect(result.stop_reason).toBe('end_turn');
+      expect(requestIds).toHaveLength(4);
+    } finally { restore(); }
+  });
+
+  test('a job without a deadline replays only for the maintenance wait, then stays pending', async () => {
+    const restore = __setMaintenanceWriteWaitForTests(120);
+    try {
+      const { tool, requestIds } = stagedWrite(Number.MAX_SAFE_INTEGER);
+      const client = oneWriteThenDone();
+      const ctx = await makeCtx({ prompt: 'go' });
+      const started = Date.now();
+      const failure = await makeSubagentHandler({ engine, client, toolRegistry: [tool] })(ctx).then(() => null, (e: unknown) => e);
+      expect(failure).toMatchObject({ code: 'write_pending', writeRequest: { request_id: requestIds[0] } });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(requestIds.length).toBeGreaterThan(2);
+      expect(new Set(requestIds).size).toBe(1);
+      expect(client.calls.length).toBe(1);
+      expect(await rowStatuses(ctx.id)).toEqual(['pending']);
+    } finally { restore(); }
+  });
+
+  test('a job already inside its deadline reserve does not replay', async () => {
+    const { tool, requestIds } = stagedWrite(Number.MAX_SAFE_INTEGER);
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: Date.now() + 40_000 };
+    await expect(makeSubagentHandler({ engine, client: oneWriteThenDone(), toolRegistry: [tool] })(ctx)).rejects.toMatchObject({ code: 'write_pending' });
+    expect(requestIds).toHaveLength(1);
+    expect(await rowStatuses(ctx.id)).toEqual(['pending']);
+  });
+
+  test('cancelling the job ends a long pause with the pending receipt and dispatches nothing more', async () => {
+    const { tool, requestIds } = stagedWrite(Number.MAX_SAFE_INTEGER, { retryAfterMs: 20_000 });
+    const cancel = new AbortController();
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline(), signal: cancel.signal };
+    const started = Date.now();
+    const settled = makeSubagentHandler({ engine, client: oneWriteThenDone(), toolRegistry: [tool] })(ctx).then(() => null, (e: unknown) => e);
+    setTimeout(() => cancel.abort(new Error('example cancel')), 80);
+    expect(await settled).toMatchObject({ code: 'write_pending', writeRequest: { request_id: requestIds[0], state: 'queued' } });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(requestIds).toHaveLength(1);
+    expect(await rowStatuses(ctx.id)).toEqual(['pending']);
+  });
+
+  test('a write that ended failed is reported to the model, not replayed', async () => {
+    const { tool, requestIds } = stagedWrite(0, { settles: 'failed' });
+    const client = oneWriteThenDone();
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+    const result = await makeSubagentHandler({ engine, client, toolRegistry: [tool] })(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(requestIds).toHaveLength(1);
+    expect(client.calls.length).toBe(2);
+    expect(await rowStatuses(ctx.id)).toEqual(['failed']);
+  });
+
+  test('a tool that is not a journal mutation passes a queued-looking result straight through', async () => {
+    let dispatches = 0;
+    const lookalike: ToolDef = { ...makeEchoTool('brain_search'), async execute() {
+      dispatches++; return { request_id: '00000000-0000-4000-8000-000000000000', state: 'queued', retry_after_ms: 10 };
+    } };
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'tool_use', id: 'tu_s', name: 'brain_search', input: { query: 'x' } } as any], stop_reason: 'tool_use' as any },
+      { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+    expect((await makeSubagentHandler({ engine, client, toolRegistry: [lookalike] })(ctx)).stop_reason).toBe('end_turn');
+    expect(dispatches).toBe(1);
   });
 });

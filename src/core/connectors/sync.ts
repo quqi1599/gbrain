@@ -3,13 +3,28 @@
  *
  * Pipeline: resolve credential → build the real ConnectorClient → probe →
  * read the config-scalar watermark → list newest-first stopping at
- * (watermark − windowDays) → fetch each new conversation → spool in batches in
- * the provider's native-export shape → runTranscriptsIngest (reuses redaction,
- * slugging, splitting, idempotency) → advance the watermark ONLY on a fully
- * clean run → logIngest receipt → stamp last_sync_at → engine-branched embed
- * kickoff → prune the spool.
+ * (watermark − windowDays) → skip conversations whose `updatedAt` the source
+ * already ingested → fetch the rest → spool in batches in the provider's
+ * native-export shape → runTranscriptsIngest (reuses redaction, slugging,
+ * splitting, idempotency) → advance the watermark ONLY on a clean run →
+ * logIngest receipt → stamp last_sync_at → engine-branched embed kickoff →
+ * prune the spool.
  *
- * WATERMARK IS A CONFIG SCALAR (`connectors.<p>.watermark_iso`), NOT
+ * All progress is keyed by (provider, source): the watermark, last_sync_at,
+ * a `synced` ledger (conversation id → ingested updatedAt) that lets a capped
+ * `--limit` run move on to older conversations, and a `failed` ledger. A
+ * conversation that fails to fetch OR to ingest QUARANTINE_ATTEMPTS times at
+ * the same updatedAt is quarantined: it no longer holds the watermark back,
+ * but its entry stays until it imports and it is retried by id on a backoff
+ * even after the watermark passes it (#6387, see failed-ledger.ts). While any
+ * entry is unresolved the run reports `partial` with `unresolved`. An edit
+ * (new updatedAt) or `--full` retries it at once; a `--full` listing that no
+ * longer contains it drops it as `gone`. Aborts and auth stops never count as
+ * a conversation's failure. Ingest outcomes are attributed per conversation
+ * (session id = conversation id), so one failing conversation never blocks
+ * its batch.
+ *
+ * STATE LIVES IN CONFIG SCALARS (`connectors.<p>.source.<id>.*`), NOT
  * op_checkpoint: op_checkpoint stores a completed-KEY set with no scalar since,
  * and purgeStaleCheckpoints GCs rows after 7 days — which would wipe the
  * watermark on any >7-day gap and trigger a full re-fetch (the exact hammer
@@ -21,21 +36,33 @@ import { runTranscriptsIngest } from '../transcripts/ingest.ts';
 import type { TranscriptsIngestResult } from '../transcripts/ingest.ts';
 import { submitEmbedBackfill } from '../embed-backfill-submit.ts';
 import { runEmbedCore } from '../../commands/embed.ts';
-import { ConnectorAuthError, ConnectorClient, ConnectorForbiddenError } from './client.ts';
+import {
+  ConnectorAuthError,
+  ConnectorClient,
+  ConnectorCredentialFormatError,
+  ConnectorForbiddenError,
+  ConnectorHttpError,
+  ConnectorNetworkError,
+  ConnectorRateLimitedError,
+  ConnectorRunLimitError,
+} from './client.ts';
 import type { ConnectorFetch } from './client.ts';
 import { getConnectorProvider } from './registry.ts';
 import { resolveCredential } from './credentials.ts';
 import { CONNECTOR_SPOOL_BATCH, pruneSpool, removeSpool, writeSpool } from './spool.ts';
-import type { ChatHistoryProvider, ConnectorProviderName, ConversationStub } from './types.ts';
+import type { ChatHistoryProvider, ConnectorProviderName, ConversationStub, ProbeResult } from './types.ts';
+import { QUARANTINE_ATTEMPTS, fullSyncArgv, planConnectorFetch, readFailedLedger, recordFailedAttempt } from './failed-ledger.ts';
 import {
   authErrorAtKey,
+  connectorSourceKey,
   DEFAULT_EMBED_KICKOFF_MIN_PAGES,
   DEFAULT_WINDOW_DAYS,
-  lastSyncAtKey,
-  watermarkKey,
+  readConnectorState,
+  writeConnectorState,
 } from './config-keys.ts';
 
 export const CONNECTOR_SYNC_VERSION = 1;
+export { QUARANTINE_ATTEMPTS };
 
 export type ConnectorSyncStatus =
   | 'success'
@@ -43,6 +70,7 @@ export type ConnectorSyncStatus =
   | 'partial'
   | 'auth_required'
   | 'forbidden'
+  | 'rate_limited'
   | 'dry_run'
   | 'not_supported';
 
@@ -51,6 +79,7 @@ export type EmbedKickoffOutcome =
   | 'pglite_inline'
   | 'cooldown'
   | 'spend_capped'
+  | 'stalled'
   | 'no_worker_surface'
   | 'below_threshold'
   | 'none';
@@ -71,9 +100,55 @@ export interface ConnectorSyncResult {
     drift: boolean;
   };
   watermarkAdvancedTo?: string;
+  /** Listed conversations skipped because this source already ingested that updatedAt. */
+  skippedUnchanged: number;
+  /** Conversation ids quarantined after repeated fetch or ingest failures (retried by id on a backoff). */
+  quarantined: string[];
+  /** Conversation ids whose write was accepted and is still publishing: not synced, and they hold the watermark. */
+  pending: string[];
+  /** Conversations in the failed ledger after this run: not archived yet (#6387). */
+  unresolved: number;
+  /** Unresolved conversations that only a `--full` sync can retry (recorded before their org was). */
+  held: string[];
+  /** Failed conversations a complete `--full` listing no longer contains; dropped from the ledger. */
+  gone: string[];
   spoolPaths: string[];
   embedKickoff: EmbedKickoffOutcome;
+  /**
+   * Why the run stopped early: CONSECUTIVE_FETCH_FAILURE_LIMIT fetches failed in a row (#7482), or it reached its
+   * request ceiling or deadline (#7515: MAX_CONNECTOR_REQUESTS_PER_RUN, --max-requests, --deadline).
+   */
+  stopReason?: 'consecutive_fetch_failures' | 'max_requests' | 'deadline';
   hint?: string;
+}
+
+/**
+ * #7482: this many conversation fetches failing in a row on a provider-wide error (a 5xx or no response, each after
+ * its own bounded retries) stop the run. An item error such as a 404 says the provider is answering, so it resets the run.
+ */
+export const CONSECUTIVE_FETCH_FAILURE_LIMIT = 5;
+
+type TerminalStatus = 'auth_required' | 'forbidden' | 'rate_limited';
+
+/** Probe failures that end the run before listing; drift and network fall through to `partial`. */
+const PROBE_TERMINAL: Partial<Record<Exclude<ProbeResult, { ok: true }>['kind'], TerminalStatus>> = {
+  unauthorized: 'auth_required',
+  invalid_credential: 'auth_required',
+  forbidden_fingerprint: 'forbidden',
+  rate_limited: 'rate_limited',
+};
+
+/** What the user does about a run that ended on a terminal status. */
+function terminalHint(term: TerminalStatus, provider: ChatHistoryProvider): string {
+  if (term === 'rate_limited') {
+    return 'The provider is rate limiting this account; the sync stopped instead of retrying. Wait before the next ' +
+      'sync (an automatic schedule picks up where this run stopped).';
+  }
+  if (term === 'forbidden') {
+    return 'The provider blocked this request (bot/challenge). Use the cookie-capture lane or ' +
+      'the official export + `gbrain transcripts ingest`.';
+  }
+  return provider.sessionInstructions();
 }
 
 export interface ConnectorSyncDeps {
@@ -110,6 +185,10 @@ export interface ConnectorSyncOpts {
   windowDays?: number;
   /** Embed during ingest (default OFF — the kickoff catches up post-run). */
   embed?: boolean;
+  /** Request ceiling for this run, capped at MAX_CONNECTOR_REQUESTS_PER_RUN (#7515). */
+  maxRequests?: number;
+  /** Epoch ms after which the run starts no request (#7515). */
+  deadlineAt?: number;
   signal?: AbortSignal;
   onProgress?: (p: { phase: 'list' | 'fetch' | 'ingest'; listed: number; fetched: number; imported: number }) => void;
   deps?: ConnectorSyncDeps;
@@ -125,17 +204,17 @@ export function subtractDays(iso: string, days: number, now: () => number): stri
 function buildClient(
   provider: ChatHistoryProvider,
   cred: import('./types.ts').ConnectorCredential,
+  opts: ConnectorSyncOpts,
   deps: ConnectorSyncDeps,
 ): ConnectorClient {
   if (deps.client) return deps.client;
-  const fetchImpl = deps.fetchImpl;
   return new ConnectorClient({
     baseUrl: deps.baseUrlOverride ?? provider.baseUrl,
     headers: () => provider.authHeaders(cred),
-    refresh: provider.refreshAccessToken
-      ? () => provider.refreshAccessToken!(cred, fetchImpl ?? (fetch as unknown as ConnectorFetch))
-      : undefined,
-    fetchImpl,
+    refresh: provider.refreshAccessToken ? (client) => provider.refreshAccessToken!(cred, client) : undefined,
+    maxRequests: opts.maxRequests,
+    deadlineAt: opts.deadlineAt,
+    fetchImpl: deps.fetchImpl,
     sleep: deps.sleep,
     now: deps.now,
     log: deps.log,
@@ -164,6 +243,12 @@ export async function runConnectorSync(
     listed: 0,
     fetched: 0,
     fetchErrors: 0,
+    skippedUnchanged: 0,
+    quarantined: [],
+    pending: [],
+    unresolved: 0,
+    held: [],
+    gone: [],
     spoolPaths: [],
     embedKickoff: 'none',
   };
@@ -177,30 +262,28 @@ export async function runConnectorSync(
     return { ...base, status: 'auth_required', hint: provider.sessionInstructions() };
   }
 
-  const client = buildClient(provider, resolved.cred, deps);
+  const client = buildClient(provider, resolved.cred, opts, deps);
 
   // Probe first: a dead credential must not burn a full list+fetch.
   const probe = await provider.probe(client, opts.signal);
   if (!probe.ok) {
-    if (probe.kind === 'unauthorized') {
-      await stampAuthError(engine, opts.provider, now);
-      return { ...base, status: 'auth_required', hint: provider.sessionInstructions() };
-    }
-    if (probe.kind === 'forbidden_fingerprint') {
-      return {
-        ...base,
-        status: 'forbidden',
-        hint:
-          'The provider blocked this request (bot/challenge). Use the cookie-capture lane or ' +
-          'the official export + `gbrain transcripts ingest`.',
-      };
-    }
+    const term = PROBE_TERMINAL[probe.kind];
+    if (term === 'auth_required') await stampAuthError(engine, opts.provider, now);
+    if (term) return { ...base, status: term, hint: probe.kind === 'invalid_credential' ? probe.detail : terminalHint(term, provider) };
     // drift / network → surface as forbidden-ish partial with the detail.
     return { ...base, status: 'partial', hint: `probe failed: ${probe.detail}` };
   }
 
-  // Resolve the trailing-window since bound from the config-scalar watermark.
-  const watermark = opts.full ? '' : (await engine.getConfig(watermarkKey(opts.provider))) ?? '';
+  // Resolve the trailing-window since bound from this source's watermark.
+  const watermark = opts.full ? '' : (await readConnectorState(engine, opts.provider, sourceId, 'watermark_iso')) ?? '';
+  const syncedKey = connectorSourceKey(opts.provider, sourceId, 'synced');
+  const failedKey = connectorSourceKey(opts.provider, sourceId, 'failed');
+  const synced = await readLedger<string>(engine, syncedKey);
+  const failed = await readFailedLedger(engine, opts.provider, sourceId);
+  const saveLedgers = async () => {
+    await engine.setConfig(syncedKey, JSON.stringify(synced));
+    await engine.setConfig(failedKey, JSON.stringify(failed));
+  };
   const stopBefore = watermark ? subtractDays(watermark, windowDays, now) : undefined;
 
   // LIST (metadata) — collect stubs newer than the window bound, newest-first.
@@ -215,32 +298,55 @@ export async function runConnectorSync(
     }
   } catch (e) {
     listErrored = true;
+    if (e instanceof ConnectorRunLimitError) base.stopReason = e.reason;
     const term = classifyThrow(e);
     if (term) {
       if (term === 'auth_required') await stampAuthError(engine, opts.provider, now);
-      return { ...base, status: term, hint: provider.sessionInstructions() };
+      return { ...base, status: term, hint: terminalHint(term, provider) };
     }
     log(`[connector] list error: ${e instanceof Error ? e.message : String(e)}`);
   }
   base.listed = stubs.length;
 
-  if (stubs.length === 0 && !listErrored) {
-    await engine.setConfig(lastSyncAtKey(opts.provider), new Date(now()).toISOString());
+  // A complete --full listing is the provider's whole history: a failed
+  // conversation it no longer contains cannot be archived any more.
+  if (opts.full && !listErrored && !opts.dryRun) {
+    const listedIds = new Set(stubs.map(s => s.id));
+    for (const id of Object.keys(failed)) {
+      if (listedIds.has(id)) continue;
+      delete failed[id];
+      base.gone.push(id);
+    }
+    if (base.gone.length) await saveLedgers();
+  }
+
+  if (stubs.length === 0 && !listErrored && Object.keys(failed).length === 0) {
+    await writeConnectorState(engine, opts.provider, sourceId, 'last_sync_at', new Date(now()).toISOString());
     return { ...base, status: 'nothing_new' };
   }
 
-  // Apply the per-run fetch cap (a cap ⇒ NOT a clean run).
-  const capped = typeof opts.limit === 'number' && stubs.length > opts.limit;
-  const toFetch = capped ? stubs.slice(0, opts.limit) : stubs;
+  // Skip what this source already holds and what waits on its retry backoff,
+  // BEFORE the cap, so a capped run reaches conversations earlier runs did
+  // not; due retained failures get reserved slots under the cap (#6387).
+  const plan = planConnectorFetch({
+    stubs, synced, failed, full: !!opts.full, limit: opts.limit, nowMs: now(), routesByOrg: !!provider.routesByOrg,
+  });
+  const quarantined = [...plan.waiting];
+  base.skippedUnchanged = plan.skippedUnchanged;
+  base.held = plan.held;
+  const capped = plan.capped;
+  const retryIds = new Set(plan.retries.map(s => s.id));
+  const toFetch = [...plan.retries, ...plan.listed];
 
   if (opts.dryRun) {
-    return { ...base, status: 'dry_run', listed: stubs.length, hint: `${toFetch.length} conversation(s) would be fetched` };
+    return { ...base, status: 'dry_run', listed: stubs.length, unresolved: Object.keys(failed).length, hint: `${toFetch.length} conversation(s) would be fetched` };
   }
 
   // FETCH details + spool + ingest, in batches (memory-bounded; banks progress).
   const spoolPaths: string[] = [];
   let fetched = 0;
   let fetchErrors = 0;
+  let blockingFailures = 0;
   let importedTotal = 0;
   let skippedTotal = 0;
   let erroredTotal = 0;
@@ -248,35 +354,60 @@ export async function runConnectorSync(
   let partsDeletedTotal = 0;
   let allBatchesClean = true;
   let anyDrift = false;
+  let aborted = false;
+  let consecutiveFetchFailures = 0;
 
   const spoolFormat = provider.spoolFormat; // capture: nested closures lose narrowing
   const batches = chunk(toFetch, CONNECTOR_SPOOL_BATCH);
-  for (let bi = 0; bi < batches.length; bi++) {
+  for (let bi = 0; bi < batches.length && !aborted && !base.stopReason; bi++) {
     const batch = batches[bi];
     const convs: Array<Record<string, unknown>> = [];
+    const convStubs: ConversationStub[] = [];
     for (const stub of batch) {
       if (opts.signal?.aborted) break;
       try {
-        convs.push(await provider.fetchConversation(client, stub.id, { signal: opts.signal }));
+        convs.push(await provider.fetchConversation(client, stub.id, { signal: opts.signal, orgId: stub.orgId }));
+        convStubs.push(stub);
         fetched++;
+        consecutiveFetchFailures = 0;
         opts.onProgress?.({ phase: 'fetch', listed: stubs.length, fetched, imported: importedTotal });
       } catch (e) {
+        // A cancelled run, or one at its request ceiling or deadline, says nothing about the conversation: no strike.
+        if (opts.signal?.aborted) { aborted = true; break; }
+        if (e instanceof ConnectorRunLimitError) { base.stopReason = e.reason; break; }
         const term = classifyThrow(e);
-        if (term === 'auth_required') {
-          await stampAuthError(engine, opts.provider, now);
+        if (term) {
+          if (term === 'auth_required') await stampAuthError(engine, opts.provider, now);
           // Ingest whatever we already collected this batch before returning.
           if (convs.length) await ingestBatch();
-          return { ...base, status: 'auth_required', listed: stubs.length, fetched, fetchErrors, spoolPaths, hint: provider.sessionInstructions() };
-        }
-        if (term === 'forbidden') {
-          if (convs.length) await ingestBatch();
-          return { ...base, status: 'forbidden', listed: stubs.length, fetched, fetchErrors, spoolPaths };
+          await saveLedgers();
+          return { ...base, status: term, listed: stubs.length, fetched, fetchErrors, spoolPaths, hint: terminalHint(term, provider) };
         }
         fetchErrors++;
-        log(`[connector] fetch error for ${stub.id}: ${e instanceof Error ? e.message : String(e)}`);
+        const attempts = recordFailure(stub, null);
+        log(`[connector] fetch error for ${stub.id} (attempt ${attempts}): ${e instanceof Error ? e.message : String(e)}`);
+        const providerWide = e instanceof ConnectorNetworkError || (e instanceof ConnectorHttpError && e.status >= 500);
+        consecutiveFetchFailures = providerWide ? consecutiveFetchFailures + 1 : 0;
+        if (consecutiveFetchFailures >= CONSECUTIVE_FETCH_FAILURE_LIMIT) {
+          base.stopReason = 'consecutive_fetch_failures';
+          break;
+        }
       }
     }
     if (convs.length) await ingestBatch();
+    await saveLedgers();
+
+    /**
+     * Count one failure; quarantined conversations stop blocking the
+     * watermark, and a retry by id never blocked it (the watermark describes
+     * listed history).
+     */
+    function recordFailure(stub: ConversationStub, code: string | null): number {
+      const { attempts } = recordFailedAttempt(failed, stub, now(), code);
+      if (attempts >= QUARANTINE_ATTEMPTS) quarantined.push(stub.id);
+      else if (!retryIds.has(stub.id)) blockingFailures++;
+      return attempts;
+    }
 
     async function ingestBatch(): Promise<void> {
       const stamp = `${new Date(now()).toISOString().replace(/[:.]/g, '-')}-b${bi}`;
@@ -295,6 +426,28 @@ export async function runConnectorSync(
         redactionsTotal += r.redactions;
         partsDeletedTotal += r.partsDeleted;
         if (!r.cleanScan) allBatchesClean = false;
+        // A file-level problem (unreadable spool, drift, dropped lines) fails
+        // the whole batch; otherwise each conversation stands on its own
+        // session outcome. A conversation with no session had nothing to import.
+        const fileFailed = r.files.some(f => f.error || f.drift || f.truncated || f.skippedLines > 0);
+        const sessions = new Map(r.files.flatMap(f => f.sessions).map(s => [s.sessionId, s]));
+        for (const stub of convStubs) {
+          const session = sessions.get(stub.id);
+          if (fileFailed || session?.error) {
+            const attempts = recordFailure(stub, session?.code ?? null);
+            log(`[connector] ingest error for ${stub.id} (attempt ${attempts}): ${session?.error ?? 'spool file failed to ingest'}`);
+            continue;
+          }
+          // An accepted write still publishing is neither synced nor a failure: the next run waits on the same
+          // request (transcripts ingest derives its id), and until then the conversation holds the watermark.
+          if (session?.pending) {
+            base.pending.push(stub.id);
+            if (!retryIds.has(stub.id)) blockingFailures++;
+            continue;
+          }
+          if (stub.updatedAt) synced[stub.id] = stub.updatedAt;
+          delete failed[stub.id];
+        }
         if (r.driftFiles > 0) anyDrift = true;
         opts.onProgress?.({ phase: 'ingest', listed: stubs.length, fetched, imported: importedTotal });
       } finally {
@@ -316,12 +469,20 @@ export async function runConnectorSync(
     drift: anyDrift,
   };
 
-  const clean = !listErrored && fetchErrors === 0 && !capped && allBatchesClean && !opts.signal?.aborted;
+  base.quarantined = quarantined;
+  // Quarantined conversations no longer hold the watermark back.
+  const clean = !listErrored && blockingFailures === 0 && !capped && !opts.signal?.aborted && !base.stopReason;
 
-  // Advance the watermark ONLY on a fully clean run.
+  // Advance the watermark ONLY on a clean run.
   if (clean && maxUpdatedAt && maxUpdatedAt !== watermark) {
-    await engine.setConfig(watermarkKey(opts.provider), maxUpdatedAt);
+    await writeConnectorState(engine, opts.provider, sourceId, 'watermark_iso', maxUpdatedAt);
     base.watermarkAdvancedTo = maxUpdatedAt;
+    // Synced conversations older than the next run's list window are never
+    // listed again, so their entries are dead weight. Failed entries stay
+    // until they import (#6387): they are the only record of the omission.
+    const floor = subtractDays(maxUpdatedAt, windowDays, now);
+    for (const [id, updatedAt] of Object.entries(synced)) if (updatedAt < floor) delete synced[id];
+    await saveLedgers();
   }
 
   // Receipt (written by the orchestrator, NOT runTranscriptsIngest).
@@ -337,7 +498,7 @@ export async function runConnectorSync(
   });
 
   // Stamp last_sync_at (success + nothing_new both count as "we ran").
-  await engine.setConfig(lastSyncAtKey(opts.provider), new Date(now()).toISOString());
+  await writeConnectorState(engine, opts.provider, sourceId, 'last_sync_at', new Date(now()).toISOString());
   // Clear a stale auth_error stamp on a clean run.
   if (clean) await engine.setConfig(authErrorAtKey(opts.provider), '');
 
@@ -347,13 +508,42 @@ export async function runConnectorSync(
   // Prune the spool dir (belt-and-suspenders; batches already removed inline).
   pruneSpool(opts.provider, 0);
 
+  base.unresolved = Object.keys(failed).length;
+  base.hint = unresolvedHint(base, opts.provider, sourceId) ?? base.hint;
   base.status =
-    fetchErrors > 0 || capped || !allBatchesClean || listErrored
+    fetchErrors > 0 || capped || !allBatchesClean || listErrored || aborted || base.stopReason || base.unresolved > 0 || base.pending.length > 0
       ? 'partial'
       : importedTotal === 0
         ? 'nothing_new'
         : 'success';
   return base;
+}
+
+/** What the run left unarchived (failed or still publishing) and the command that shows it. */
+function unresolvedHint(base: ConnectorSyncResult, provider: ConnectorProviderName, sourceId: string): string | undefined {
+  const parts: string[] = [];
+  if (base.stopReason === 'consecutive_fetch_failures') {
+    parts.push(`Stopped after ${CONSECUTIVE_FETCH_FAILURE_LIMIT} conversation fetches failed in a row; the provider may be ` +
+      'throttling or down. The next sync resumes from the same place.');
+  } else if (base.stopReason) {
+    parts.push(`Stopped at the run's ${base.stopReason === 'deadline' ? 'deadline' : 'request limit'} before every ` +
+      `conversation was fetched. Run \`gbrain connectors sync ${provider}\` again (without --full) to continue: conversations ` +
+      'already imported are skipped.');
+  }
+  if (base.unresolved > 0) {
+    parts.push(
+      `${base.unresolved} conversation(s) not archived yet; sync retries them automatically ` +
+      `(\`gbrain connectors status ${provider} --json\` lists them).` +
+      (base.held.length
+        ? ` ${base.held.length} recorded before their organization was tracked need one full re-sync, which ` +
+          `re-downloads the whole history: ask the user, then run \`${fullSyncArgv(provider, sourceId).join(' ')}\`.`
+        : ''));
+  }
+  if (base.pending.length) {
+    parts.push(`${base.pending.length} conversation(s) were accepted and are still publishing; the next sync `
+      + `finishes them without a second write (\`gbrain sources writer status --source ${sourceId} --json\` shows the queue).`);
+  }
+  return parts.length ? parts.join(' ') : undefined;
 }
 
 export async function maybeKickoffEmbed(
@@ -376,6 +566,7 @@ export async function maybeKickoffEmbed(
       if (status === 'submitted') return 'postgres_submitted';
       if (status === 'cooldown') return 'cooldown';
       if (status === 'spend_capped') return 'spend_capped';
+      if (status === 'stalled') return 'stalled';
       if (status === 'no_worker_surface') return 'no_worker_surface';
       return 'none';
     } catch (e) {
@@ -396,6 +587,17 @@ export async function maybeKickoffEmbed(
   }
 }
 
+async function readLedger<T>(engine: BrainEngine, key: string): Promise<Record<string, T>> {
+  const raw = await engine.getConfig(key);
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, T> : {};
+  } catch {
+    return {};
+  }
+}
+
 async function readIntConfig(engine: BrainEngine, key: string, fallback: number): Promise<number> {
   const v = await engine.getConfig(key);
   if (v === null) return fallback;
@@ -408,9 +610,10 @@ async function stampAuthError(engine: BrainEngine, provider: ConnectorProviderNa
 }
 
 /** Map a thrown client error to a terminal sync status, or null if non-terminal. */
-function classifyThrow(e: unknown): 'auth_required' | 'forbidden' | null {
-  if (e instanceof ConnectorAuthError) return 'auth_required';
+function classifyThrow(e: unknown): TerminalStatus | null {
+  if (e instanceof ConnectorAuthError || e instanceof ConnectorCredentialFormatError) return 'auth_required';
   if (e instanceof ConnectorForbiddenError) return 'forbidden';
+  if (e instanceof ConnectorRateLimitedError) return 'rate_limited';
   return null;
 }
 

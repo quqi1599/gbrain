@@ -13,12 +13,16 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  asksQuestion,
   detectThreadLoop,
+  isAcknowledgementOnly,
   INBOUND_GRACE_HOURS,
   OUTBOUND_GRACE_HOURS,
   type ThreadLoopVerdict,
 } from '../src/core/google/loop-detect.ts';
 import type { SuppressionSet } from '../src/core/loops/loops-store.ts';
+import { BULK_CATEGORY_LABELS } from '../src/core/google/gmail-categories.ts';
+import { BULK_CATEGORY_LABELS as EXTRACT_LANE_BULK_CATEGORY_LABELS } from '../src/core/google/loops-extract.ts';
 import type { GmailMessageMeta, GmailThreadData } from '../src/core/google/types.ts';
 
 // Frozen clock — every age below is relative to this instant, so the corpus
@@ -42,8 +46,14 @@ interface MsgSpec {
   listUnsub?: boolean;
   /** iCalendar method — non-null marks Google Calendar system mail. */
   calendarMethod?: string | null;
+  /** RFC 3834 Auto-Submitted other than "no". */
+  autoSubmitted?: boolean;
   /** Explicit internalDateMs override (0 = the all-zero-date case). */
   dateMs?: number;
+  /** Extra Gmail label ids (categories) beside SENT/INBOX. */
+  labels?: string[];
+  /** #5012 automated-mail headers (fields a master mapper did not capture). */
+  headers?: { precedence?: string; listId?: boolean; replyTo?: string[] };
 }
 
 function msg(spec: MsgSpec): GmailMessageMeta {
@@ -61,9 +71,11 @@ function msg(spec: MsgSpec): GmailMessageMeta {
     dateIso: new Date(Math.max(internalDateMs, 0)).toISOString(),
     internalDateMs,
     calendarMethod: spec.calendarMethod ?? null,
-    labelIds: spec.sent ? ['SENT'] : ['INBOX'],
+    ...(spec.autoSubmitted !== undefined ? { autoSubmitted: spec.autoSubmitted } : {}),
+    labelIds: [spec.sent ? 'SENT' : 'INBOX', ...(spec.labels ?? [])],
     listUnsubscribe: spec.listUnsub ?? false,
     bodyText: spec.body ?? 'Can you review the plan?',
+    ...(spec.headers ?? {}),
   };
 }
 
@@ -396,6 +408,58 @@ const CASES: CorpusCase[] = [
     ],
     expect: null,
   },
+  // ── Grace runs from the oldest unanswered message (gbrain-evals N7-1) ─────
+  // First sight of a thread (backfill, sync gap): a fresh nudge must not
+  // restart the clock on a request that has waited past the window.
+  {
+    name: 'request 40h + nudge 5h, first sight → unanswered_inbound (clock starts at the request)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 5, body: 'Bumping this. Any news?' }),
+    ],
+    expect: { type: 'unanswered_inbound', counterparty: 'bob@example.com' },
+  },
+  {
+    name: 'my ask 100h + my follow-up 10h, first sight → unanswered_outbound (clock starts at the ask)',
+    messages: [
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Could you confirm the date?' }),
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 10, sent: true, body: 'Following up on this. Any update?' }),
+    ],
+    expect: { type: 'unanswered_outbound', counterparty: 'bob@example.com' },
+  },
+  {
+    name: 'fresh request 10h + nudge 2h → none (the whole run is inside grace)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 10 }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 2 }),
+    ],
+    expect: null,
+  },
+  {
+    name: 'inbound 40h, my reply 30h, their nudge 5h → none (the run starts after my reply)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40 }),
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Will do.' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 5 }),
+    ],
+    expect: null,
+  },
+  {
+    name: 'CC-only mail 40h + direct ask 5h → none (the reply is owed from the To: message)',
+    messages: [
+      msg({ from: 'bob@example.com', to: ['carol@example.com'], cc: ['me@example.com'], ageHours: 40 }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 5 }),
+    ],
+    expect: null,
+  },
+  {
+    name: 'my FYI 100h + my question 10h → none (the ask is fresh)',
+    messages: [
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Notes attached.' }),
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 10, sent: true, body: 'Can you review?' }),
+    ],
+    expect: null,
+  },
 ];
 
 describe('detectThreadLoop precision corpus', () => {
@@ -487,6 +551,106 @@ describe('detectThreadLoop precision corpus', () => {
       NOW,
     );
     expect(verdict.open[0].evidence[0].quote?.length).toBe(200);
+  });
+});
+
+// gbrain-evals N7 (2026-10-02 receipt, repros n7-2, n7-6, n7-7).
+describe('N7 open-loops wave regressions', () => {
+  test('N7-7: a question mark inside a link is not an ask', () => {
+    expect(asksQuestion('FYI, the doc: https://docs.example.com/view?id=42')).toBe(false);
+    expect(asksQuestion('See www.example.com/a?b=c for details.')).toBe(false);
+    expect(asksQuestion('Can you check https://docs.example.com/view?id=42 ?')).toBe(true);
+    const v = detectThreadLoop(
+      thread([msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'FYI, the doc: https://docs.example.com/view?id=42' })]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+  });
+
+  test('N7-2: "Thanks!" to a question neither closes nor restarts the reply-owed loop', () => {
+    const ask = msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' });
+    const v = detectThreadLoop(
+      thread([ask, msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' })]),
+      MY,
+      NOW,
+    );
+    expect(v.close).not.toContain('unanswered_inbound');
+    expect(v.open).toHaveLength(1);
+    expect(v.open[0].loopType).toBe('unanswered_inbound');
+    expect(v.open[0].openedMs).toBe(ask.internalDateMs);
+  });
+
+  test('N7-2: an acknowledgement of a message that asked nothing is still a reply', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Here is the deck.' }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('N7-2: a substantive reply still closes', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks! Attached is the deck.' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('acknowledgement detection is narrow', () => {
+    for (const t of ['Thanks!', 'thank you', 'Got it, thanks.', 'Thanks, Bob!', 'ok']) expect(isAcknowledgementOnly(t)).toBe(true);
+    for (const t of ['Yes', 'No, not this week.', 'Thanks! Attached.', 'Thanks, sending it tomorrow.', 'Will do.', '']) expect(isAcknowledgementOnly(t)).toBe(false);
+  });
+
+  test('N7-6: the loop opens at the oldest message that carries the obligation', () => {
+    const first = msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 720, body: 'Can you review this?' });
+    const v = detectThreadLoop(
+      thread([first, msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 30, body: 'Bumping this.' })]),
+      MY,
+      NOW,
+    );
+    expect(v.open[0].openedMs).toBe(first.internalDateMs);
+    const ask = msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 200, sent: true, body: 'Can you review?' });
+    const out = detectThreadLoop(
+      thread([ask, msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Any news?' })]),
+      MY,
+      NOW,
+    );
+    expect(out.open[0].openedMs).toBe(ask.internalDateMs);
+  });
+});
+
+describe('#5586: RFC 3834 auto-submitted mail', () => {
+  const detect = (messages: GmailMessageMeta[]): ThreadLoopVerdict =>
+    detectThreadLoop(thread(messages), MY, NOW);
+
+  test('a tracker notice addressed to me opens no inbound loop', () => {
+    const v = detect([msg({ from: 'tracker@acme-example.test', to: ['me@example.com'], ageHours: 100, autoSubmitted: true })]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('an auto-reply does NOT close my real outbound loop', () => {
+    const v = detect([
+      msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 200, sent: true, body: 'Can you confirm the budget?' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 100, body: 'I am out of office until Monday.', autoSubmitted: true }),
+    ]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_outbound']);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('the same sender writing by hand (Auto-Submitted: no) still opens a loop', () => {
+    const v = detect([msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 100, autoSubmitted: false })]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
   });
 });
 
@@ -705,5 +869,124 @@ describe('google calendar system mail', () => {
       }),
     ]);
     expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+});
+
+describe('#5103: Google system senders and bulk categories in the deterministic lane', () => {
+  const detect = (messages: GmailMessageMeta[]): ThreadLoopVerdict => detectThreadLoop(thread(messages), MY, NOW);
+
+  test('both lanes read one bulk-category constant', () => {
+    expect(EXTRACT_LANE_BULK_CATEGORY_LABELS).toBe(BULK_CATEGORY_LABELS);
+    expect([...BULK_CATEGORY_LABELS]).toEqual(['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL', 'CATEGORY_FORUMS']);
+  });
+
+  test('a Meet notes digest from gemini-notes@google.com opens no inbound loop', () => {
+    const v = detect([msg({ from: 'gemini-notes@google.com', to: ['me@example.com'], ageHours: 48, subject: 'Notes: weekly sync', body: 'Here are the notes. Any corrections?' })]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a lookalike address is matched by equality only, so it still opens a loop', () => {
+    const v = detect([msg({ from: 'gemini-notes@google.com.evil.example', to: ['me@example.com'], ageHours: 48 })]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  for (const label of BULK_CATEGORY_LABELS) {
+    test(`${label} inbound the owner never joined → no loop`, () => {
+      const v = detect([msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 48, labels: [label] })]);
+      expect(v.open).toEqual([]);
+    });
+  }
+
+  test('a PROMOTIONS thread the owner wrote a substantive message in still opens the reply-owed loop', () => {
+    const v = detect([
+      msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 200, labels: ['CATEGORY_PROMOTIONS'], body: 'Spring sale is on.' }),
+      msg({ from: 'me@example.com', to: ['deals@shop-example.test'], ageHours: 150, sent: true, labels: ['CATEGORY_PROMOTIONS'], body: 'Is the blue model still available in size 10?' }),
+      msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_PROMOTIONS'], body: 'Yes, could you confirm your shipping address?' }),
+    ]);
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'deals@shop-example.test']]);
+  });
+
+  test('CATEGORY_UPDATES without an owner reply still opens (invoices and document requests live there)', () => {
+    const v = detect([msg({ from: 'billing@vendor-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_UPDATES'], body: 'Could you approve the attached invoice?' })]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  test('a bulk category never fabricates a close: my reply still closes, and their reply still closes my outbound loop', () => {
+    const v = detect([
+      msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 100, labels: ['CATEGORY_PROMOTIONS'] }),
+      msg({ from: 'me@example.com', to: ['deals@shop-example.test'], ageHours: 2, sent: true, labels: ['CATEGORY_PROMOTIONS'], body: 'Done, thanks for the details.' }),
+    ]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a mixed thread: the system digest is ignored and the human message to me opens the loop', () => {
+    const v = detect([
+      msg({ from: 'gemini-notes@google.com', to: ['me@example.com'], ageHours: 60, subject: 'Notes: planning' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 48, subject: 'Re: planning', body: 'Can you send the budget sheet?' }),
+    ]);
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'bob@example.com']]);
+  });
+});
+
+describe('#5012 positively automated mail and the opt-in Updates reciprocity rule', () => {
+  const alert = (headers: MsgSpec['headers'], labels: string[] = []) =>
+    msg({ from: 'alerts@notify.bank-example.test', to: ['me@example.com'], ageHours: 48, labels, headers,
+      subject: 'Your balance alert', body: 'Your available balance is below the threshold you set. Review it?' });
+
+  const automatedHeaders: Array<[string, NonNullable<MsgSpec['headers']>]> = [
+    ['Precedence: bulk', { precedence: 'bulk' }],
+    ['Precedence: list', { precedence: 'list' }],
+    ['Precedence: junk', { precedence: 'junk' }],
+    ['a List-Id header', { listId: true }],
+    ['a no-reply Reply-To', { replyTo: ['no-reply@bank-example.test'] }],
+  ];
+  for (const [name, headers] of automatedHeaders) {
+    test(`a bank alert with ${name} opens no reply-owed loop and records why`, () => {
+      const v = detectThreadLoop(thread([alert(headers)]), MY, NOW, sup());
+      expect(v.open).toEqual([]);
+      expect(v.held).toBeUndefined();
+      expect(v.withheld).toEqual({ reason: 'automated_mail', counterpartyEmail: 'alerts@notify.bank-example.test' });
+    });
+  }
+
+  test('withholding never fabricates a close: my earlier outbound ask is still closed by their reply', () => {
+    const v = detectThreadLoop(thread([
+      msg({ from: 'me@example.com', to: ['alerts@notify.bank-example.test'], ageHours: 100, sent: true, body: 'Can you raise my limit?' }),
+      alert({ precedence: 'bulk' }),
+    ]), MY, NOW, sup());
+    expect(v.close).toEqual(['unanswered_outbound']);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a cold founder intro in Primary still opens a loop', () => {
+    const v = detectThreadLoop(thread([msg({ from: 'founder@startup-example.test', to: ['me@example.com'], ageHours: 48,
+      labels: ['CATEGORY_PERSONAL'], subject: 'Intro: seed round', body: 'Would you have 20 minutes next week to hear about what we are building?' })]), MY, NOW, sup());
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'founder@startup-example.test']]);
+    expect(v.withheld).toBeUndefined();
+  });
+
+  const updatesIntro = () => thread([msg({ from: 'founder@startup-example.test', to: ['me@example.com'], ageHours: 48,
+    labels: ['CATEGORY_UPDATES'], subject: 'Intro: seed round', body: 'Would you have 20 minutes next week?' })]);
+
+  test('a cold founder intro in Updates opens a loop by default (the category alone never withholds)', () => {
+    const v = detectThreadLoop(updatesIntro(), MY, NOW, sup());
+    expect(v.open.map((o) => o.counterpartyEmail)).toEqual(['founder@startup-example.test']);
+  });
+
+  test('with the reciprocity rule on, Updates mail opens only for a sender the owner wrote to', () => {
+    const off = detectThreadLoop(updatesIntro(), MY, NOW, sup(), { ownerWroteTo: new Set() });
+    expect(off.open).toEqual([]);
+    expect(off.withheld).toEqual({ reason: 'updates_without_reciprocity', counterpartyEmail: 'founder@startup-example.test' });
+    const known = detectThreadLoop(updatesIntro(), MY, NOW, sup(), { ownerWroteTo: new Set(['founder@startup-example.test']) });
+    expect(known.open.map((o) => o.counterpartyEmail)).toEqual(['founder@startup-example.test']);
+  });
+
+  test('with the reciprocity rule on, an Updates thread the owner already wrote in still opens', () => {
+    const v = detectThreadLoop(thread([
+      msg({ from: 'me@example.com', to: ['billing@vendor-example.test'], ageHours: 100, sent: true, labels: ['CATEGORY_UPDATES'], body: 'Please resend the invoice.' }),
+      msg({ from: 'billing@vendor-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_UPDATES'], body: 'Attached. Can you approve it?' }),
+    ]), MY, NOW, sup(), { ownerWroteTo: new Set() });
+    expect(v.open.map((o) => o.counterpartyEmail)).toEqual(['billing@vendor-example.test']);
   });
 });

@@ -11,8 +11,9 @@ proof that a whole brain could be restored.
 |---|---|---|
 | Source repos (every non-archived source with a `local_path`) | Local Git discovery, deduped by root and capped at 500 roots/run; trusted local read-only `git ls-remote` verifies clean HEAD against the remote | No configured origin, dirty/unpushed work, missing/mismatched remote HEAD, stale/unknown evidence, or failed push without newer matching readback cannot count as verified recovery. |
 | Bootstrap workspace (skills/, memory/, brain/, identity) | file plane: the install receipt's `repo_url` + the per-root push-status files | receipt without `repo_url` → warn; a failing background push → flagged row only (the push-failure banner owns that alarm) |
+| Google / GitHub connector sources | persistence mode and worktree binding | none on its own: a managed unbound source (`connector_database`) and an unmanaged source whose directory is missing or not a Git repo are `connector` info rows. A bound connector, or one whose directory is a Git repo, is checked as a source repo. |
 | DB-only brain (pages exist, nothing git-backed) | page count + absence of any git-backed asset | warn on PGLite (local disk loss risks these pages); info on Postgres (database placement and external backup are unverified) |
-| `db_only` storage-tier pages | `gbrain.yml` per source | info row — dump with `gbrain export --dir <backup-dir>` to somewhere OUTSIDE the gitignored dirs (`--restore-only` is the wrong direction for a backup) |
+| `db_only` storage-tier pages | `gbrain.yml` per source | info row: dump with `gbrain export --source <id> --dir BACKUP_DIR/<id>` (replace `BACKUP_DIR` with a durable backup directory) to somewhere OUTSIDE the gitignored dirs (`--restore-only` is the wrong direction for a backup) |
 | Harness-native skill dirs (e.g. the agent's installed skills) | skillpack bridge state | info only — these are installed COPIES; the originals live in repos |
 
 `configured_repos` records configuration; the legacy `recoverable_repos` field
@@ -105,14 +106,48 @@ payload includes `configured_repos`, per-asset `configured_remote` and
 
 Trusted local, non-quiet backup CLI and doctor may perform read-only remote
 probes: at most eight refs per sweep, within a shared eight-second probe budget
-and two-second subprocess timeouts, without prompts, pushes or fetches. Pending
+and two-second subprocess timeouts, without prompts, pushes or fetches. For a
+slow remote, `gbrain config set backup.remote_timeout_ms <ms>` (database
+setting; `GBRAIN_BACKUP_REMOTE_TIMEOUT_MS` wins) sets each remote probe's slot,
+clamped to 500-30000 ms; the sweep budget grows to four slots when that is more
+than eight seconds. A probe that runs out of its slot is counted in
+`totals.remote_timeouts` and shown as "remote check timed out": the backup is
+unconfirmed, not missing (#6907). The local dirtiness read stops at the first
+changed path, so a tree with a very large `git status` listing reads `dirty`
+instead of `unknown / probe_failed`. Pending
 and oldest evidence is rotated first rather than probing the same roots each
 time. Evidence expires after one hour even if the configured coverage interval
 is longer. Reuse retains its original timestamp and requires unchanged source
 identity, physical Git directory, HEAD, branch, origin, push-status identity and
 a clean tree. Roots beyond the budget report `budget_exhausted`; successive
-sweeps can cover them. Background and stdio refreshes use local probes only;
+sweeps can cover them. A probe starts only when its full two-second slot is
+still inside the eight-second budget: a root that would get less is deferred
+(`budget_exhausted`, and earlier `verified` evidence for it is kept) rather
+than probed on the leftover and recorded as `unavailable`. Background and stdio refreshes use local probes only;
 remote MCP doctor reads aggregate cache only, with no engine or Git access.
+
+### Remote verification and your Git configuration
+
+The probe runs `git` with an allowlist of your environment, so it reads your own
+`~/.gitconfig`, credential helpers and `url.<base>.insteadOf` rewrites:
+`HOME`, `PATH`, `XDG_CONFIG_HOME`, `SSH_AUTH_SOCK`, `GIT_CONFIG_GLOBAL`,
+`HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` (upper and lower case), plus
+`USERPROFILE`, `APPDATA` and `SystemRoot` on Windows. It never passes `GIT_DIR`,
+`GIT_WORK_TREE` or any other variable, and it always disables prompts.
+
+A deploy key works through `~/.ssh/config` (`Host` with `IdentityFile`). The
+probe sets its own `GIT_SSH_COMMAND` (`ssh -oBatchMode=yes
+-oStrictHostKeyChecking=yes -oConnectTimeout=2`), so a `GIT_SSH_COMMAND` you
+export is not used, and the remote's host key must already be in `known_hosts`.
+
+| `verification.state` | Meaning | What to do |
+|---|---|---|
+| `verified` | The remote branch HEAD matches a clean local HEAD. | Nothing. |
+| `missing_ref` | The remote answered but has no such branch. | `git push -u origin <branch>` <!-- gbrain-allow-shared-tree-git: one-time first push that creates the remote branch and sets its upstream -->, then `gbrain backup check`. |
+| `mismatch` | The remote HEAD differs from the local HEAD, or the tree changed during the probe. | Push or pull until they match, then `gbrain backup check`. |
+| <a id="remote-unavailable"></a>`unavailable` | `git ls-remote` failed: no network, authentication refused, or an unknown host key. `cause` says which kind: `timeout` (the remote did not answer within its full slot, `backup.remote_timeout_ms`, default two seconds; reported as "remote check timed out" and counted in `totals.remote_timeouts`, never as a missing backup) or `exit` (git exited with an error). The probe passes only `HOME`, `PATH`, `XDG_CONFIG_HOME`, `SSH_AUTH_SOCK`, `GIT_CONFIG_GLOBAL`, `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`, `NO_PROXY`/`no_proxy` (and `USERPROFILE`, `APPDATA`, `SystemRoot` on Windows). | Run `git -C <root> ls-remote origin` in the same shell; credentials must come from your Git config, a credential helper, `~/.ssh/config` or the SSH agent, not from a prompt or `GIT_SSH_COMMAND`. |
+| `budget_exhausted` | The sweep's eight-probe or eight-second budget ran out first, or this remote would not have received its full two-second slot. | Run `gbrain backup check` again. |
+| `stale`, `not_checked` | Earlier evidence expired or no probe ran yet. | `gbrain backup check`. |
 
 When does the compute actually run? On any of: `gbrain backup check`, a stale
 cache at `backup status`/doctor/advisor time, `gbrain sync` completion, the
@@ -129,6 +164,8 @@ gbrain config set backup.check_enabled false        # off (file plane)
 gbrain config set backup.check_interval_days 30     # default 30; set rejects values < 1
 GBRAIN_BACKUP_CHECK=0                               # env kill switch (everything)
 GBRAIN_BACKUP_CHECK_DAYS=<n>                        # env interval override (wins over config)
+gbrain config set backup.remote_timeout_ms 6000     # remote probe slot, 500-30000 ms, default 2000 (database)
+GBRAIN_BACKUP_REMOTE_TIMEOUT_MS=<ms>                # env slot override (wins over config)
 ```
 
 Interval values below 1 or non-numeric (env or a hand-edited config file) fall
@@ -162,11 +199,23 @@ source id. Full per-asset detail (which repo, which fix) is local-only:
 - Workspace with no repo: `gbrain bootstrap repo` (creates a private repo,
   verifies privacy, pushes).
 - A source repo with no remote:
-  `git remote add origin git@github.com:you/your-brain-repo.git && git push -u origin main`,
+  `git remote add origin git@github.com:you/your-brain-repo.git && git push -u origin main`, <!-- gbrain-allow-shared-tree-git: one-time first push that creates the remote branch and sets its upstream -->
   then `gbrain sources harden <source-id>` for auto-push durability.
-- Unpushed workspace work: `gbrain sources push --path <workspace>`.
-- db_only pages: `gbrain export --dir <backup-dir>` (store the dump outside
-  the gitignored dirs — another disk, another repo, anywhere durable).
+- Unpushed workspace work: for a managed canonical worktree, inspect the managed writer with `gbrain sources writer status --probe --json` (legacy bulk push is refused there); otherwise `gbrain sources push --path <workspace>`.
+  On a managed worktree the persistence coordinator commits and pushes as Git effects; the probe lists `effects`, `blocking_effects` and `recent_failures`, and a parked push is retried with `gbrain sources writer retry-effects <source> --request-id <id>`. gbrain's own ownership stamp (`.gbrain-owner.json`) never counts as uncommitted work, the session hooks never start `sources push` there, and a root with no `origin` remote reads `no_remote` (add one: `git remote add origin <url>`) even after a recorded push refusal. A recorded push failure stops warning once the tree matches its origin branch with nothing uncommitted.
+- db_only pages: `gbrain export --source <id> --dir BACKUP_DIR/<id>` for
+  each source the row names, with `BACKUP_DIR` replaced by a directory
+  outside the gitignored dirs (another disk, another repo, anywhere durable). One directory per source:
+  an unscoped export refuses when two sources share a slug.
+- A dirty source repo (uncommitted changes): `gbrain sources push <source-id>`
+  (secret-scanned commit and push), or discard the changes, then run
+  `gbrain backup check`. Remote evidence is only read for a clean tree.
+- Google or GitHub connector sources without a Git-backed directory (managed
+  and unbound, or unmanaged with a missing or non-Git directory): they appear
+  as `connector` info rows and do not keep the check in warn. Their pages come
+  from the provider API, so recovery is `gbrain sync --source <id> --full`,
+  within the source's configured history window. A bound connector, or one
+  whose directory is a Git repo, follows the source-repo recipes above.
 
 ## Recovery drill (prove the answer is real)
 
@@ -184,9 +233,14 @@ quarter, on a scratch machine or empty directory:
    a separate backup on an isolated destination.
 
 Windows directory-descriptor fsync portability is covered by Linux fault
-injection and restore drills, not a native Windows full backup/restore test. A
-separate Windows PGLite `dumpDataDir` failure remains unresolved; do not infer
-full Windows restore support from the Git check.
+injection and restore drills, and the archive layer's write → read →
+cluster-extract round trip runs natively on the `windows-latest` CI row
+(`test/backup-archive-roundtrip-5312.test.ts`). A separate Windows PGLite
+`dumpDataDir` failure remains unresolved; do not infer full Windows restore
+support from the Git check. If you copy a brain by hand instead, copy the
+tree, not just the files: the PGLite data directory needs its empty
+directories (`pg_tblspc`, `pg_wal/archive_status`, `pg_notify`, …), and a
+file-only copy fails to open with a message that reads like corruption.
 
 If a drill fails, fix the gap while the original disk still works. This check
 does not itself certify the database or full agent recovery.

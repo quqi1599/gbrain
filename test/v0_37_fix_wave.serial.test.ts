@@ -9,9 +9,11 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { surfaceFileSource } from './helpers/source-surface.ts';
+import { CLI_ONLY, CLI_ONLY_SELF_HELP } from '../src/cli/command-table.ts';
 
 // Lane A — defaults sweep
 describe('v0.37 Lane A — defaults sweep', () => {
@@ -209,7 +211,7 @@ describe('v0.37 Lane C.3 — Voyage key reaches buildGatewayConfig', () => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
     try {
-      const { buildGatewayConfig } = await import('../src/cli.ts');
+      const { buildGatewayConfig } = await import('../src/cli/main.ts');
       const cfg = {
         engine: 'pglite' as const,
         voyage_api_key: 'test-voyage-key',
@@ -235,7 +237,7 @@ describe('v0.37 Lane C.3 — Voyage key reaches buildGatewayConfig', () => {
     const saved = process.env.VOYAGE_API_KEY;
     process.env.VOYAGE_API_KEY = 'env-wins-key';
     try {
-      const { buildGatewayConfig } = await import('../src/cli.ts');
+      const { buildGatewayConfig } = await import('../src/cli/main.ts');
       const cfg = { engine: 'pglite' as const, voyage_api_key: 'file-key' };
       const gwCfg = buildGatewayConfig(cfg as any);
       expect(gwCfg.env?.VOYAGE_API_KEY).toBe('env-wins-key');
@@ -245,12 +247,6 @@ describe('v0.37 Lane C.3 — Voyage key reaches buildGatewayConfig', () => {
     }
   });
 
-  test('GBrainConfig type includes voyage_api_key field (TS compile guard)', async () => {
-    const { type } = await import('../src/core/config.ts').then(m => ({ type: undefined }));
-    // The type-level assertion happens at compile time. If this file
-    // compiles, the field exists. Body of the test is a runtime no-op.
-    expect(true).toBe(true);
-  });
 });
 
 // Lane D.1 — engine-kind branching already covered in test/embedding-dim-check.test.ts
@@ -275,34 +271,34 @@ describe('v0.37 Lane D.4 — sync --help dispatch', () => {
   test('CDX2-12: sync is in CLI_ONLY_SELF_HELP', async () => {
     // This is a structural test — read the cli.ts source and assert
     // sync appears in the set. Avoids requiring engine wiring.
-    const src = readFileSync(join(__dirname, '..', 'src', 'cli.ts'), 'utf-8');
-    // Match the CLI_ONLY_SELF_HELP set definition.
-    const setMatch = src.match(/const CLI_ONLY_SELF_HELP = new Set\(\[([\s\S]*?)\]\)/);
+    // Refactor wave 1 (W4 cli): CLI_ONLY_SELF_HELP is derived from the
+    // command table; the sync record carries the membership.
+    const src = surfaceFileSource('cli', 'src/cli/command-table.ts');
+    const setMatch = src.match(/\{ name: 'sync', [^\n]*\},/);
     expect(setMatch).not.toBeNull();
-    const body = setMatch![1];
-    expect(body).toContain(`'sync'`);
+    const body = setMatch![0];
+    expect(body).toContain('selfHelp: true');
+    expect(CLI_ONLY_SELF_HELP.has('sync')).toBe(true);
   });
 });
 
 // Deferred-TODO ship: gbrain reinit-pglite
 describe('v0.37 deferred TODO shipped — gbrain reinit-pglite', () => {
   test('reinit-pglite is registered in CLI_ONLY + CLI_ONLY_SELF_HELP', () => {
-    const src = readFileSync(join(__dirname, '..', 'src', 'cli.ts'), 'utf-8');
-    const onlyMatch = src.match(/const CLI_ONLY = new Set\(\[([\s\S]*?)\]\)/);
+    // Refactor wave 1 (W4 cli): one command-table record carries both
+    // memberships (CLI_ONLY and CLI_ONLY_SELF_HELP are derived from it).
+    const src = surfaceFileSource('cli', 'src/cli/command-table.ts');
+    const onlyMatch = src.match(/\{ name: 'reinit-pglite', [^\n]*\},/);
     expect(onlyMatch).not.toBeNull();
-    expect(onlyMatch![1]).toContain(`'reinit-pglite'`);
+    expect(CLI_ONLY.has('reinit-pglite')).toBe(true);
 
-    const selfHelpMatch = src.match(/const CLI_ONLY_SELF_HELP = new Set\(\[([\s\S]*?)\]\)/);
+    const selfHelpMatch = onlyMatch;
     expect(selfHelpMatch).not.toBeNull();
-    expect(selfHelpMatch![1]).toContain(`'reinit-pglite'`);
+    expect(selfHelpMatch![0]).toContain('selfHelp: true');
+    expect(CLI_ONLY_SELF_HELP.has('reinit-pglite')).toBe(true);
   });
 
-  test('reinit-pglite module exports runReinitPglite', async () => {
-    const mod = await import('../src/commands/reinit-pglite.ts');
-    expect(typeof mod.runReinitPglite).toBe('function');
-  });
-
-  test('embeddingMismatchMessage PGLite branch recommends `gbrain reinit-pglite`', async () => {
+  test('embeddingMismatchMessage PGLite branch keeps `gbrain reinit-pglite` as the labelled last resort', async () => {
     const { embeddingMismatchMessage } = await import('../src/core/embedding-dim-check.ts');
     const msg = embeddingMismatchMessage({
       currentDims: 1536,
@@ -312,14 +308,13 @@ describe('v0.37 deferred TODO shipped — gbrain reinit-pglite', () => {
       engineKind: 'pglite',
       databasePath: '/tmp/test.pglite',
     });
-    // The one-command path appears before the by-hand recipe.
+    // reinit-pglite stays available, labelled as the last resort AFTER the
+    // data-preserving migration (A7: no hand-run wipe recipe).
     expect(msg).toContain('gbrain reinit-pglite --embedding-model voyage:voyage-4 --embedding-dimensions 1024');
-    // The by-hand path is still present as fallback.
-    expect(msg).toContain('mv /tmp/test.pglite /tmp/test.pglite.bak');
-    // The recommended-section header precedes the by-hand section.
-    const recIdx = msg.indexOf('Recommended');
-    const handIdx = msg.indexOf('Or by hand');
-    expect(recIdx).toBeGreaterThan(0);
-    expect(handIdx).toBeGreaterThan(recIdx);
+    expect(msg).not.toMatch(/\bmv /);
+    const migrateIdx = msg.indexOf('gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run');
+    const lastResortIdx = msg.indexOf('Last resort');
+    expect(migrateIdx).toBeGreaterThan(0);
+    expect(lastResortIdx).toBeGreaterThan(migrateIdx);
   });
 });

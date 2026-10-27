@@ -5,7 +5,7 @@
  *   - chat() resolves provider:model strings + aliases
  *   - assertTouchpoint surfaces chat-only providers correctly
  *   - getChatModel() default + override
- *   - chat_fallback_chain plumbing (config plumbing only — chatWithFallback ships in commit 3)
+ *   - chat_fallback_chain plumbing (the fallback loop itself: test/ai/gateway-chat-fallback.test.ts)
  *   - new openai-compat recipes (deepseek, groq, together) parse + resolve
  *   - new ChatTouchpoint shape: supports_subagent_loop, supports_prompt_cache
  *   - mapStopReason via the chat() boundary (mocked client) — refusal / content_filter / tool_calls / end / length
@@ -16,7 +16,7 @@
  * `generateText` import via Bun's module-replace pattern.
  */
 
-import { describe, test, expect, beforeEach, mock } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll, mock } from 'bun:test';
 import {
   configureGateway,
   resetGateway,
@@ -32,6 +32,11 @@ import { parseModelId, resolveRecipe, assertTouchpoint } from '../../src/core/ai
 import { AIConfigError } from '../../src/core/ai/errors.ts';
 import { listRecipes, getRecipe } from '../../src/core/ai/recipes/index.ts';
 import type { Recipe } from '../../src/core/ai/types.ts';
+
+// These cases configure the gateway without an embedding model (the default
+// shape). Restore the suite baseline so files that share this Bun process
+// (CI runs a shard in one process) keep the pinned embedding shape.
+afterAll(() => resetGateway());
 
 describe('chat touchpoint — recipe registry', () => {
   test('all hosted tool-loop providers ship a chat touchpoint with supports_subagent_loop', () => {
@@ -290,32 +295,6 @@ describe('chat touchpoint — config alias resolution', () => {
   });
 });
 
-describe('chat touchpoint — chat() smoke + stop-reason mapping (Codex D8)', () => {
-  // We exercise chat() against a mocked AI-SDK 'generateText' to assert the
-  // gateway's structural-signal mapping (mapStopReason) covers refusal,
-  // content_filter, tool_calls, end, length without the regex layer (commit 3).
-  // A full integration test against real provider HTTP lives in
-  // test/e2e/agent-multi-provider.test.ts (commit 2).
-  //
-  // We can't easily monkey-patch ESM imports inside Bun's runtime; instead we
-  // write an end-to-end assertion against the resolver logic + verify the
-  // chat() function exists with the documented signature.
-
-  test('chat() function is exported with the expected signature', async () => {
-    const mod = await import('../../src/core/ai/gateway.ts');
-    expect(typeof mod.chat).toBe('function');
-    // Signature check: must accept ChatOpts. We don't call it without a real
-    // provider key — that's the e2e job.
-  });
-
-  test('ChatBlock + ChatMessage + ChatResult types are exported', async () => {
-    // Type-only assertion: if these imports compile, we're good. The test
-    // body is just a runtime touch.
-    const mod = await import('../../src/core/ai/gateway.ts');
-    expect(mod).toBeDefined();
-  });
-});
-
 describe('chat touchpoint — provider_chat_options passthrough', () => {
   beforeEach(() => {
     resetGateway();
@@ -422,6 +401,52 @@ describe('chat touchpoint — provider_chat_options passthrough', () => {
 
     expect(providerOptions).toEqual({
       deepseek: { thinking: { type: 'disabled' } },
+    });
+  });
+
+  test('anthropic call-scoped thinking override wins without dropping configured siblings (#5331)', async () => {
+    // From @kvnloo's #5972: the generic providerOptions merge is a per-call
+    // seam where call-scoped leaves win and configured siblings survive.
+    const providerOptions = await captureProviderOptions({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      provider_chat_options: {
+        anthropic: {
+          thinking: { type: 'adaptive' },
+          cacheControl: { type: 'ephemeral', ttl: '1h' },
+        },
+      },
+      env: { ANTHROPIC_API_KEY: 'fake' },
+    }, {
+      providerOptions: { anthropic: { thinking: { type: 'disabled' } } },
+    });
+
+    expect(providerOptions).toEqual({
+      anthropic: {
+        thinking: { type: 'disabled' },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+      },
+    });
+  });
+
+  test("thinking: 'off' replaces a configured thinking object instead of merging into it (#5331)", async () => {
+    // A deep merge of { type: 'disabled' } into { type: 'enabled', budgetTokens }
+    // keeps budgetTokens; the switch replaces the whole thinking object.
+    const providerOptions = await captureProviderOptions({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      provider_chat_options: {
+        anthropic: {
+          thinking: { type: 'enabled', budgetTokens: 4000 },
+          cacheControl: { type: 'ephemeral', ttl: '1h' },
+        },
+      },
+      env: { ANTHROPIC_API_KEY: 'fake' },
+    }, { thinking: 'off' });
+
+    expect(providerOptions).toEqual({
+      anthropic: {
+        thinking: { type: 'disabled' },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+      },
     });
   });
 

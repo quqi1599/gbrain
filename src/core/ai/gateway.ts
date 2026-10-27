@@ -21,7 +21,9 @@
  *     rotation (via configureGateway()) invalidates stale entries.
  */
 
-import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema, type JSONSchema7, type Output } from 'ai';
+import type { embedMany, generateObject, generateText, JSONSchema7, Output } from 'ai';
+import { jsonSchema } from '@ai-sdk/provider-utils';
+import { installAiSdkWarningWriter } from './sdk-warnings.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { listRecipes } from './recipes/index.ts';
@@ -31,12 +33,13 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { z } from 'zod';
 
-import { truncateUtf8 } from '../text-safe.ts';
-import {
-  BudgetTracker,
-  extractUsageFromError as _extractUsageFromError,
-  type BudgetKind,
-} from '../budget/budget-tracker.ts';
+import { DEFAULT_CHARS_PER_TOKEN, DEFAULT_SAFETY_FACTOR, embedRequestMaxInputTokens, planEmbedRequests, rerankRequestMaxInputTokens, truncateEmbedInputs } from './embed-batch-plan.ts';
+export { splitByTokenBudget, capBatchItems, NO_BATCH_CAP_SUB_BATCH_ITEMS } from './embed-batch-plan.ts';
+import { BudgetTracker, type BudgetReservation } from '../budget/budget-tracker.ts';
+import { failedCallUsage, recordOnTracker } from './budget-record.ts';
+import { estimateChatInputTokens } from './chat-input-estimate.ts';
+import { chatWithFallback, normalizeChatFallbackChain } from './chat-fallback.ts';
+import { applyThinkingOff, thinkingOffMaxOutputTokens } from './thinking-off.ts';
 import type {
   AIGatewayConfig,
   EmbedMultimodalOpts,
@@ -48,26 +51,38 @@ import type {
 } from './types.ts';
 import { resolveRecipe, assertTouchpoint, parseModelId, embeddingDimsForModel } from './model-resolver.ts';
 import { recordChatUsage } from './chat-usage.ts';
+import { buildExpansionPrompt } from './expansion-prompt.ts';
 import {
   OPENROUTER_CACHE_HEADER,
   openrouterRequiresExplicitPromptCache,
 } from './recipes/openrouter.ts';
 import { resolveModelDetailed, resolveEffectiveChatModel, resolveEffectiveExpansionModel } from '../model-config.ts';
+import { readLegacyModelPin } from './legacy-model-pin.ts';
 import { snapshotConfigReader } from '../config-snapshot.ts';
+import { clearGatewayModelSources, gatewayModelSource, setGatewayModelSource } from './gateway-model-sources.ts';
 import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
-import { AIConfigError, AITransientError, isStructuredOutputRejection, normalizeAIError } from './errors.ts';
+import { AIConfigError, AITransientError, isStructuredOutputRejection, isUnbilledEmbeddingRejection, normalizeAIError } from './errors.ts';
+import { embeddingModelNotFoundHint, gatewayModelNotFoundHint } from './model-not-found-hint.ts';
+import { fitMatryoshkaPrefix, isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
 import type { GBrainConfig } from '../config.ts';
 import { mergedProviderEnv } from './provider-env.ts';
+import { redactProviderKeys } from './key-redact.ts';
+import { applyVoyageOutputDimension, embeddingDimMismatchError } from './voyage-gateway.ts';
+import { reportEmbeddingAuthFailure } from './key-warnings.ts';
 import { buildGatewayConfig, foldNativeBaseUrlsFromFilePlane } from './build-gateway-config.ts';
 import { invokeAI, sdkInvocationUsage, responseInvocationUsage, hasAIInvocationGuard, isAIInvocationPolicyError } from './invocation-guard.ts';
+import { installAICallLogFromEnv } from './call-log.ts';
+import { cachedQueryEmbedding, clearQueryEmbedCache, queryEmbedCacheKey, queryEmbedGeneration, storeQueryEmbedding } from './query-embed-cache.ts';
 import { createGuardedGeneration, chatInvocation } from './guarded-generation.ts';
+installAiSdkWarningWriter();
 const guardedGeneration = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS);
+const guardedExpansion = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS, 'gateway.expand');
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -87,8 +102,8 @@ function resolveAiTimeoutMs(envVar: string, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
-/** chat / expansion / OCR — generous; only catches true hangs (non-streaming generateText). */
-const AI_CHAT_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_CHAT_TIMEOUT_MS', 300_000);
+/** chat / expansion / OCR — generous; only catches true hangs (non-streaming generateText). Also sizes the auto-drain job deadline. */
+export const AI_CHAT_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_CHAT_TIMEOUT_MS', 300_000);
 /** embed sub-batch (per SDK call, NOT per whole import). */
 const AI_EMBED_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_EMBED_TIMEOUT_MS', 60_000);
 /** multimodal per request. */
@@ -105,7 +120,6 @@ function withDefaultTimeout(caller: AbortSignal | undefined, timeoutMs: number):
   return caller ? AbortSignal.any([caller, timeout]) : timeout;
 }
 
-const MAX_CHARS = 8000;
 export { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './defaults.ts';
 import {
   DEFAULT_EMBEDDING_MODEL,
@@ -114,14 +128,18 @@ import {
   renderCanonicalMigrationCommands,
 } from './defaults.ts';
 import { logRerankFailure, type RerankFailureReason } from '../rerank-audit.ts';
+import { rerankViaDecide } from './decide/rerank-adapter.ts';
+import { runDecide, type DecideContext, type DecideRequest, type DecideResult } from './decide/index.ts';
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
 const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
 // v0.35.0.0+: reranker runtime fallback. Used only when search.reranker.enabled
 // is set AND no explicit reranker_model is configured. #3657 seam: the value is
 // `DEFAULT_RERANKER_MODEL` imported from ./defaults.ts (ONE constant, shared with
-// the mode bundles) — `voyage:rerank-2.5` since v0.48.2.
+// the mode bundles) — `voyage:rerank-3-lite` (was `voyage:rerank-2.5` from v0.48.2).
 
 let _config: AIGatewayConfig | null = null;
+/** #5137: provider auth errors echo keys; scrub every key in effect before the text leaves the gateway. */
+const redactKeys = (text: string): string => redactProviderKeys(text, _config?.env ?? {});
 const _modelCache = new Map<string, any>();
 
 /**
@@ -152,19 +170,27 @@ export function configureGatewayIfUninitialized(): void {
 
 /**
  * The function the gateway calls to actually run a batch through the AI SDK.
- * Defaults to the imported `embedMany`. Tests inject a stub via
+ * Defaults to the AI SDK's `embedMany`, loaded on the first call. Tests inject a stub via
  * `__setEmbedTransportForTests` to drive recursion + fast-path scenarios
  * without hitting a real provider. Production never reads the override.
  */
 type EmbedManyFn = typeof embedMany;
-let _embedTransport: EmbedManyFn = embedMany;
 type GenerateTextFn = typeof generateText;
-let _generateTextTransport: GenerateTextFn = generateText;
+type GenerateObjectFn = typeof generateObject;
+// The AI SDK (and the OpenTelemetry API it pulls in) loads at the first
+// provider call, not when the gateway is configured, so a command that never
+// calls a model never pays for its module graph.
+let aiSdk: Promise<typeof import('ai')> | undefined;
+const loadAiSdk = () => (aiSdk ??= import('ai'));
+const sdkEmbedMany = (async (opts: Parameters<EmbedManyFn>[0]) => (await loadAiSdk()).embedMany(opts)) as EmbedManyFn;
+const sdkGenerateText = (async (opts: Parameters<GenerateTextFn>[0]) => (await loadAiSdk()).generateText(opts)) as GenerateTextFn;
+const sdkGenerateObject = (async (opts: Parameters<GenerateObjectFn>[0]) => (await loadAiSdk()).generateObject(opts as never)) as GenerateObjectFn;
+let _embedTransport: EmbedManyFn = sdkEmbedMany;
+let _generateTextTransport: GenerateTextFn = sdkGenerateText;
 // Test-only seam for expand()'s structured-output SDK call. Mirrors
 // _generateTextTransport (see __setGenerateObjectTransportForTests). Never
 // swapped in production — expand() always calls the real generateObject.
-type GenerateObjectFn = typeof generateObject;
-let _generateObjectTransport: GenerateObjectFn = generateObject;
+let _generateObjectTransport: GenerateObjectFn = sdkGenerateObject;
 // Adversarial F5 (#4121): recipes that DECLARE structured-output support but
 // reject json_schema at call time would otherwise pay the rejected attempt —
 // and a pessimistic '.failed' budget record — on EVERY expand() call
@@ -199,10 +225,6 @@ const _shrinkState = new Map<string, ShrinkEntry>();
 const SHRINK_FLOOR = 0.05;
 /** Successful batches needed before the factor heals back toward recipe default. */
 const SHRINK_HEAL_AFTER = 10;
-/** Default chars-per-token when a recipe omits it. Matches OpenAI tiktoken on English. */
-const DEFAULT_CHARS_PER_TOKEN = 4;
-/** Default safety factor when a recipe omits it. */
-const DEFAULT_SAFETY_FACTOR = 0.8;
 
 /**
  * v0.31.8 (D2 + D10): hard ceiling on Voyage response size, sized as
@@ -396,20 +418,26 @@ export function applyOpenAICompatConfig(
  *
  * Returns undefined when the env provides no base URL, so the SDK's own default
  * (which already includes `/v1`) is preserved untouched — the happy path is not
- * altered. Google is intentionally NOT handled here: its native suffix is
- * unproven (Gemini's OpenAI-compat route is `/v1beta/openai`), so it's deferred
- * to a follow-up rather than risk a regression on a wrong assumption.
+ * altered.
+ *
+ * Google (`GOOGLE_GENERATIVE_AI_BASE_URL`, used by native-google chat,
+ * expansion and embedding): the SDK's default root is
+ * `https://generativelanguage.googleapis.com/v1beta` and it appends
+ * `/models/<id>:<method>`, so a URL with no version segment gets `/v1beta`
+ * (a pass-through proxy then forwards the real path); a URL that already
+ * names a version (`/v1`, `/v1beta`, `/v1alpha`) is kept as written.
  *
  * @internal exported for tests.
  */
 export function resolveNativeBaseUrl(
-  provider: 'anthropic' | 'openai',
+  provider: 'anthropic' | 'openai' | 'google',
   cfg: AIGatewayConfig,
 ): string | undefined {
-  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : 'OPENAI_BASE_URL';
+  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : provider === 'openai' ? 'OPENAI_BASE_URL' : 'GOOGLE_GENERATIVE_AI_BASE_URL';
   const raw = cfg.env[envKey];
   if (!raw || !raw.trim()) return undefined;
   const trimmed = raw.trim().replace(/\/+$/, '');
+  if (provider === 'google') return /\/v\d+[a-z]*$/i.test(trimmed) ? trimmed : `${trimmed}/v1beta`;
   return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
@@ -442,7 +470,8 @@ export function configureGateway(config: AIGatewayConfig): void {
     embedding_image_ocr_model: config.embedding_image_ocr_model,
     expansion_model: config.expansion_model ?? DEFAULT_EXPANSION_MODEL,
     chat_model: config.chat_model ?? DEFAULT_CHAT_MODEL,
-    chat_fallback_chain: config.chat_fallback_chain,
+    chat_fallback_chain: normalizeChatFallbackChain(config.chat_fallback_chain),
+    chat_fallback_on_refusal: config.chat_fallback_on_refusal,
     // v0.35.0.0+: reranker_model stays undefined when unset — reranker is
     // opt-in and pulling DEFAULT_RERANKER_MODEL into every gateway start
     // would silently register a third-party model id on brains that never
@@ -454,11 +483,13 @@ export function configureGateway(config: AIGatewayConfig): void {
   };
   stashGatewayAnthropicKeyFromEnv(config.env); // #2119: filter + rationale in anthropic-key.ts
   _modelCache.clear();
+  clearQueryEmbedCache();
   _shrinkState.clear();
   // A (re)configure is a new env snapshot: a key that appeared or vanished
   // since the last no_key audit row deserves a fresh once-per-process row.
   _noKeyNoticed.clear();
   warnRecipesMissingBatchTokens();
+  installAICallLogFromEnv();
 }
 
 /**
@@ -484,6 +515,7 @@ export function refreshGatewayEnvFromFilePlane(): void {
   // DB-plane base_urls never steer native keys.
   _config = { ..._config, env: foldNativeBaseUrlsFromFilePlane(cfg, mergedProviderEnv(cfg, process.env)) };
   _modelCache.clear();
+  clearQueryEmbedCache();
 }
 
 /**
@@ -506,33 +538,45 @@ export function refreshGatewayEnvFromFilePlane(): void {
  * config for callers who want to inspect what landed.
  */
 export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise<AIGatewayConfig> {
-  const cfg = requireConfig();
-  // Refresh the OpenAI latest-model discovery cache BEFORE resolution so the
-  // key-aware tier defaults below see it. TTL-throttled (one fetch/24h),
-  // 3s-bounded, fail-open, disabled in test lanes via GBRAIN_MODEL_DISCOVERY
-  // — a connect never blocks on or breaks from discovery.
-  const { refreshLatestOpenAIModels } = await import('./openai-latest.ts');
-  // Discovery hits the same endpoint real native-openai calls use:
-  // OPENAI_BASE_URL via resolveNativeBaseUrl — the ENV PLANE, deliberately
-  // NOT cfg.base_urls.openai. Two reasons: (1) defaulting to api.openai.com
-  // when a custom endpoint is configured would send that endpoint's key to
-  // the official host; (2) base_urls can be DB-plane-merged from a mounted
-  // brain, and discovery fires automatically on connect — a hostile shared
-  // brain must never be able to point this process's bearer key at an
-  // attacker URL (native chat calls ignore base_urls for the same reason).
-  await refreshLatestOpenAIModels({
-    env: cfg.env ?? process.env,
-    baseUrl: resolveNativeBaseUrl('openai', cfg),
-  });
+  _discoveryEngine = engine;
+  _discovery = null;
+  return resolveGatewayModels(engine);
+}
 
-  // The two resolutions below each walk a 5-tier precedence chain that reads
-  // up to 4 config keys, plus alias expansion. Against the engine that is
-  // many sequential round trips before the CLI does any work — seconds of
-  // `gbrain stats`'s wall clock on a hosted brain, for reads the server
-  // answered in microseconds. Take one snapshot of the config table (AFTER
-  // the discovery refresh above, so tier defaults see fresh discovery) and
-  // resolve every model against it. Same keys, same precedence, one round
-  // trip.
+let _discoveryEngine: BrainEngine | null = null;
+let _discovery: Promise<void> | null = null;
+
+/**
+ * #6607: OpenAI model discovery runs once per reconfigure, just before an
+ * OpenAI-routed call, never on connect (a brain that never calls OpenAI sends
+ * nothing). TTL, backoff, decline and kill switch live in openai-latest.ts.
+ * Changed tiers re-resolve the models first. Endpoint: OPENAI_BASE_URL (env
+ * plane), never DB-mergeable base_urls, so a shared brain cannot redirect the
+ * key. Fail-open.
+ */
+async function discoverBeforeOpenAICall(modelStr: string | undefined): Promise<void> {
+  if (!modelStr) return;
+  try { if (resolveRecipe(modelStr).recipe.id !== 'openai') return; } catch { return; }
+  _discovery ??= (async () => {
+    try {
+      const cfg = requireConfig();
+      const { refreshLatestOpenAIModels, latestOpenAITiers } = await import('./openai-latest.ts');
+      const before = JSON.stringify(latestOpenAITiers());
+      await refreshLatestOpenAIModels({ env: cfg.env ?? process.env, baseUrl: resolveNativeBaseUrl('openai', cfg) });
+      if (_discoveryEngine && JSON.stringify(latestOpenAITiers()) !== before) await resolveGatewayModels(_discoveryEngine);
+    } catch {
+      // Fail-open: the call proceeds on the models already resolved.
+    }
+  })();
+  await _discovery;
+}
+
+async function resolveGatewayModels(engine: BrainEngine): Promise<AIGatewayConfig> {
+  const cfg = requireConfig();
+
+  // Resolve every model (each walks a 5-tier chain plus alias expansion, and
+  // the legacy DB pins below) against ONE config snapshot: per-key reads add
+  // seconds of sequential round trips on a hosted brain.
   const reader = await snapshotConfigReader(engine);
 
   // Resolve expansion (utility tier) and chat (reasoning tier). Embedding is
@@ -558,6 +602,7 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   // present), warns once and falls to the key-aware tier default otherwise —
   // an init-era `chat_model: openai:*` pin survives reconnect when the
   // OpenAI key is live, and stops freezing provider choice when it isn't.
+  // Only with no pin does a DB-plane chat_model/expansion_model (#6795) apply.
   const needsFileCfg = (s: string) => s === 'tier_default' || s === 'fallback';
   let fileCfg: GBrainConfig | null = null;
   if (needsFileCfg(chatDetailed.source) || needsFileCfg(expansionDetailed.source)) {
@@ -567,12 +612,13 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
       fileCfg = null;
     }
   }
-  const newChat = needsFileCfg(chatDetailed.source)
-    ? resolveEffectiveChatModel(fileCfg, cfg.env ?? process.env).model
-    : chatDetailed.model;
-  const newExpansion = needsFileCfg(expansionDetailed.source)
-    ? resolveEffectiveExpansionModel(fileCfg, cfg.env ?? process.env).model
-    : expansionDetailed.model;
+  const env = cfg.env ?? process.env;
+  const chatEffective = needsFileCfg(chatDetailed.source) ? resolveEffectiveChatModel(fileCfg, env) : null;
+  const expansionEffective = needsFileCfg(expansionDetailed.source) ? resolveEffectiveExpansionModel(fileCfg, env) : null;
+  const dbChat = await readLegacyModelPin(reader, 'chat_model', chatEffective, fileCfg, env);
+  const dbExpansion = await readLegacyModelPin(reader, 'expansion_model', expansionEffective, fileCfg, env);
+  const newChat = dbChat ?? chatEffective?.model ?? chatDetailed.model;
+  const newExpansion = dbExpansion ?? expansionEffective?.model ?? expansionDetailed.model;
 
   // Resolved values are bare model ids (e.g. `claude-sonnet-4-6`) — prepend
   // the existing provider prefix from cfg so the gateway keeps routing to
@@ -582,7 +628,10 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   const chatFull = newChat.includes(':') ? newChat : prefixWithProviderFrom(cfg.chat_model ?? DEFAULT_CHAT_MODEL, newChat);
 
   _config = { ...cfg, expansion_model: expansionFull, chat_model: chatFull };
+  setGatewayModelSource('expansion', expansionFull, dbExpansion ? { source: 'config_key', origin: 'expansion_model' } : gatewayModelSource('expansion', expansionDetailed, expansionEffective));
+  setGatewayModelSource('chat', chatFull, dbChat ? { source: 'config_key', origin: 'chat_model' } : gatewayModelSource('chat', chatDetailed, chatEffective));
   _modelCache.clear();
+  clearQueryEmbedCache();
   _shrinkState.clear();
   return _config;
 }
@@ -662,12 +711,16 @@ export function __setGatewayResetBaselineForTests(
 /** Clear every piece of module state. Shared by both reset flavors. */
 function clearGatewayState(): void {
   _config = null;
+  _discoveryEngine = null;
+  _discovery = null;
+  clearGatewayModelSources();
   stashGatewayAnthropicKeyFromEnv(undefined); // gateway-owned snapshot dies with the config
   _modelCache.clear();
+  clearQueryEmbedCache();
   _shrinkState.clear();
-  _embedTransport = embedMany;
-  _generateTextTransport = generateText;
-  _generateObjectTransport = generateObject;
+  _embedTransport = sdkEmbedMany;
+  _generateTextTransport = sdkGenerateText;
+  _generateObjectTransport = sdkGenerateObject;
   _structuredOutputRejectedRecipes.clear();
   _embedTransportInstalled = false;
   _chatTransport = null;
@@ -720,9 +773,13 @@ export function __unconfigureGatewayForTests(): void {
  * @internal exported for tests; not part of the public gateway API.
  */
 export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
-  _embedTransport = fn ?? embedMany;
+  _embedTransport = fn ?? sdkEmbedMany;
   _embedTransportInstalled = fn !== null;
+  clearQueryEmbedCache();
 }
+
+/** @internal exported for tests: drop every cached query embedding. */
+export const __clearQueryEmbedCacheForTests = clearQueryEmbedCache;
 
 /**
  * Test-only seam for the chat() SDK call. Unlike __setChatTransportForTests,
@@ -732,7 +789,7 @@ export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
  * @internal exported for tests; not part of the public gateway API.
  */
 export function __setGenerateTextTransportForTests(fn: GenerateTextFn | null): void {
-  _generateTextTransport = fn ?? generateText;
+  _generateTextTransport = fn ?? sdkGenerateText;
 }
 
 /**
@@ -743,7 +800,7 @@ export function __setGenerateTextTransportForTests(fn: GenerateTextFn | null): v
  * @internal exported for tests; not part of the public gateway API.
  */
 export function __setGenerateObjectTransportForTests(fn: GenerateObjectFn | null): void {
-  _generateObjectTransport = fn ?? generateObject;
+  _generateObjectTransport = fn ?? sdkGenerateObject;
 }
 
 /**
@@ -1073,7 +1130,7 @@ const voyageCompatFetch = (async (input: RequestInfo | URL, init?: RequestInit) 
         if ('dimensions' in parsed) {
           const dims = parsed.dimensions;
           delete parsed.dimensions;
-          if (typeof dims === 'number') parsed.output_dimension = dims;
+          if (typeof dims === 'number') applyVoyageOutputDimension(parsed, input, dims);
           mutated = true;
         }
         // Recover the SDK-stripped input_type (#1400) — opt-in, mirroring
@@ -1348,9 +1405,6 @@ export const perplexityCompatFetch = (async (input: RequestInfo | URL, init?: Re
  * line on every search, and today's keyless state is stderr-silent.
  */
 const _noKeyNoticed = new Set<string>();
-export function _resetRerankWarningsForTest(): void {
-  _noKeyNoticed.clear();
-}
 function noKeyOnce(modelStr: string, keyName: string, query: string, docCount: number): void {
   try {
     if (_noKeyNoticed.has(modelStr)) return;
@@ -1372,6 +1426,7 @@ function noKeyOnce(modelStr: string, keyName: string, query: string, docCount: n
 }
 
 async function resolveEmbeddingProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'embedding', parsed.modelId);
   const cfg = requireConfig();
@@ -1409,7 +1464,8 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `Google embedding requires GOOGLE_GENERATIVE_AI_API_KEY.`,
         recipe.setup_hint,
       );
-      const client = createGoogleGenerativeAI({ apiKey });
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      const client = createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
       return (client as any).textEmbeddingModel
         ? (client as any).textEmbeddingModel(modelId)
         : (client as any).embedding(modelId);
@@ -1464,30 +1520,14 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
 const MIN_SUB_BATCH = 1;
 
 /**
- * #3875: default per-call item cap for `no_batch_cap` recipes (Ollama,
- * LiteLLM proxy). These recipes declare no static token/item cap because the
- * backend's capacity is user-launched — but the per-SDK-call
- * AI_EMBED_TIMEOUT_MS (60s default) then bounded a whole FILE's chunks in one
- * request. A slow local model (CPU Ollama) embedding a large file timed out
- * deterministically and every retry re-sent the same oversized batch. Capping
- * items per sub-batch makes the 60s timeout a per-BATCH budget: 16 chunks per
- * call finishes comfortably even on CPU-bound local models, and a genuinely
- * wedged provider still surfaces the timeout loudly on the first sub-batch.
- * An explicit `max_batch_items` on the recipe always wins over this default.
- *
- * @internal exported for tests; not part of the public gateway API.
- */
-export const NO_BATCH_CAP_SUB_BATCH_ITEMS = 16;
-
-/**
- * Embed many texts. Truncates to MAX_CHARS, then dispatches based on whether
+ * Embed many texts. Truncates to EMBED_MAX_CHARS, then dispatches based on whether
  * the recipe declares a per-batch token budget.
  *
  * Flow:
  * ```
  * embed(texts)
  *   ├─ resolve recipe + model
- *   ├─ truncate each text to MAX_CHARS (8000)
+ *   ├─ truncate each text to EMBED_MAX_CHARS (8000)
  *   ├─ read recipe.touchpoints.embedding.{max_batch_tokens, chars_per_token, safety_factor}
  *   │
  *   ├─ if max_batch_tokens declared (Voyage path):
@@ -1567,23 +1607,8 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => truncateUtf8(t ?? '', MAX_CHARS));
+  const truncated = truncateEmbedInputs(texts);
 
-  // Reserve up front for the worst-case batch token count. Embeddings have
-  // no output rate, so maxOutputTokens=0. record() at the end uses the
-  // actual total reported by the SDK across all sub-batches.
-  if (tracker) {
-    const charsPerToken = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
-    const totalChars = truncated.reduce((s, t) => s + t.length, 0);
-    const estimatedInputTokens = Math.ceil(totalChars / Math.max(charsPerToken, 1));
-    tracker.reserve({
-      modelId: `${recipe.id}:${modelId}`,
-      estimatedInputTokens,
-      maxOutputTokens: 0,
-      kind: 'embed',
-      label: 'gateway.embed',
-    });
-  }
   // Dim override (D10) — when caller passes `dimensions`, use it. Otherwise
   // fall back to the global cfg default. dimsProviderOptions throws a
   // clear AIConfigError when a Voyage flexible-dim model gets an
@@ -1597,134 +1622,64 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   );
   const expected = effectiveDims;
 
-  const embedding = recipe.touchpoints?.embedding;
   // GBRAIN_EMBED_MAX_BATCH_TOKENS (#3622): operator-declared cap for recipes
-  // that ship without one (ollama/llama-server/litellm declare no_batch_cap
-  // because real capacity depends on the operator's local server). Without
-  // any cap, a page's entire chunk set goes out as ONE request — on a serial
-  // local server that can outlive the embed timeout and starve the queue.
-  // Recipe-declared caps always win; invalid values are ignored. Read from
-  // the configure-time env snapshot (Codex C3), never process.env at call
-  // time — buildGatewayConfig folds the operator's process env into it.
+  // that ship without one. Read from the configure-time env snapshot (Codex
+  // C3), never process.env at call time; invalid values are ignored.
   const envCapRaw = parseInt(cfg.env?.GBRAIN_EMBED_MAX_BATCH_TOKENS ?? '', 10);
   const envCap = Number.isFinite(envCapRaw) && envCapRaw > 0 ? envCapRaw : undefined;
-  const maxBatchTokens = embedding?.max_batch_tokens ?? envCap;
-  const charsPerToken = embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
+  // #4616: empty inputs never reach the provider; screenEmbeddings refuses them per item.
+  const sent = sendableEmbeddingInputs(truncated);
+  const batches = sent.length ? planEmbedRequests(sent.map(i => truncated[i]!), recipe, effectiveSafetyFactor(recipe), envCap) : [];
 
-  // Pre-split is gated on max_batch_tokens. Recipes without it (e.g. OpenAI)
-  // ride the fast path: one embedMany call, no recursion safety net.
-  const tokenBatches = maxBatchTokens
-    ? splitByTokenBudget(truncated, Math.floor(maxBatchTokens * effectiveSafetyFactor(recipe)), charsPerToken)
-    : [truncated];
-
-  // Hard COUNT cap (e.g. llama-server's "maximum allowed batch size 32").
-  // Token budget can't bound item count, so re-split any oversized batch.
-  //
-  // #3875: recipes that declare `no_batch_cap` (Ollama, LiteLLM proxy) have
-  // NO static token cap AND no item cap, so a large file used to ride to the
-  // provider as ONE request — and the 60s AI_EMBED_TIMEOUT_MS (per SDK call)
-  // became a per-FILE budget. A slow local model embedding hundreds of chunks
-  // hit the timeout deterministically, and no amount of retrying could ever
-  // succeed. Default those recipes to a conservative item cap so the per-call
-  // timeout bounds a fixed amount of work; an explicit max_batch_items still
-  // wins.
-  const maxBatchItems =
-    embedding?.max_batch_items ??
-    (embedding?.no_batch_cap === true ? NO_BATCH_CAP_SUB_BATCH_ITEMS : undefined);
-  const batches = maxBatchItems
-    ? tokenBatches.flatMap(b => capBatchItems(b, maxBatchItems))
-    : tokenBatches;
+  // Reserve the worst-case batch tokens after every preflight that can throw
+  // (dims, batch planning), so a config error leaves no hold; record() below settles it.
+  const charsPerToken = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
+  const totalChars = truncated.reduce((s, t) => s + t.length, 0);
+  const reservation = tracker?.reserve({
+    modelId: `${recipe.id}:${modelId}`, estimatedInputTokens: Math.ceil(totalChars / Math.max(charsPerToken, 1)), maxOutputTokens: 0, kind: 'embed', label: 'gateway.embed',
+  });
 
   const allEmbeddings: Float32Array[] = [];
   let _embedThrew = false;
+  // Provider-reported input tokens summed across sub-batches; null as soon as
+  // any sub-batch's provider did not report (all-or-nothing: a partial sum
+  // would undercharge the budget while looking measured).
+  let reportedTokens: number | null = 0;
   try {
     for (const batch of batches) {
       const result = await embedSubBatch(batch, model, providerOpts, expected, recipe, modelId, opts);
-      allEmbeddings.push(...result);
+      allEmbeddings.push(...result.embeddings);
+      reportedTokens = reportedTokens !== null && result.reportedTokens !== null
+        ? reportedTokens + result.reportedTokens
+        : null;
     }
-    return allEmbeddings;
+    return screenEmbeddings(truncated, sent, allEmbeddings, `${recipe.id}:${modelId}`);
   } catch (err) {
     _embedThrew = true;
     throw err;
   } finally {
     if (tracker) {
-      // Embed token usage is not surfaced by the AI SDK shape we use; charge
-      // based on the truncated input character count using the recipe's
-      // chars-per-token. On failure, A3 amended says charge the pessimistic
-      // estimate too — embed has no output side, so the input estimate IS
-      // the worst case.
-      const charsPerToken = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
-      const totalChars = truncated.reduce((s, t) => s + t.length, 0);
-      const inputTokens = Math.ceil(totalChars / Math.max(charsPerToken, 1));
-      try {
-        tracker.record({
-          modelId: `${recipe.id}:${modelId}`,
-          inputTokens,
-          outputTokens: 0,
-          embeddingDims: expected,
-          kind: 'embed',
-          label: _embedThrew ? 'gateway.embed.failed' : 'gateway.embed',
-        });
-      } catch {
-        // BudgetExhausted (TX1) — original throw (if any) wins.
-      }
+      // Charge what the provider reported (embedMany surfaces usage.tokens)
+      // when every sub-batch reported it; otherwise fall back to the
+      // chars-per-token estimate over the truncated input. On failure, A3
+      // amended says charge the pessimistic estimate — embed has no output
+      // side, so the input estimate IS the worst case.
+      const measured = !_embedThrew && reportedTokens !== null && reportedTokens > 0
+        ? reportedTokens
+        : null;
+      recordOnTracker(tracker, {
+        modelId: `${recipe.id}:${modelId}`,
+        reservation,
+        requestedModelId: resolveTarget,
+        inputTokens: measured ?? Math.ceil(totalChars / Math.max(charsPerToken, 1)),
+        outputTokens: 0,
+        embeddingDims: expected,
+        kind: 'embed',
+        label: _embedThrew ? 'gateway.embed.failed' : 'gateway.embed',
+        estimated: measured === null,
+      });
     }
   }
-}
-
-/**
- * Split texts into sub-batches that stay under the provided budget. Pure;
- * no module state. Exported for the adaptive-embed-batch test suite.
- *
- * @param texts - The texts to partition. Each text counts as
- *   `Math.ceil(text.length / charsPerToken)` tokens for budget purposes.
- * @param budgetTokens - The token ceiling for each sub-batch. Caller is
- *   responsible for applying any safety-factor shrink before passing in.
- * @param charsPerToken - Provider-specific character density. Defaults to
- *   `DEFAULT_CHARS_PER_TOKEN` (4) when omitted, matching OpenAI tiktoken.
- *
- * @internal exported for tests; not part of the public gateway API.
- */
-export function splitByTokenBudget(
-  texts: string[],
-  budgetTokens: number,
-  charsPerToken: number = DEFAULT_CHARS_PER_TOKEN,
-): string[][] {
-  const ratio = charsPerToken > 0 ? charsPerToken : DEFAULT_CHARS_PER_TOKEN;
-  const batches: string[][] = [];
-  let current: string[] = [];
-  let currentTokens = 0;
-
-  for (const text of texts) {
-    const estTokens = Math.ceil(text.length / ratio);
-    if (current.length > 0 && currentTokens + estTokens > budgetTokens) {
-      batches.push(current);
-      current = [];
-      currentTokens = 0;
-    }
-    current.push(text);
-    currentTokens += estTokens;
-  }
-  if (current.length > 0) batches.push(current);
-
-  return batches;
-}
-
-/**
- * Split a batch into sub-batches of at most `maxItems` inputs. Enforces a
- * hard COUNT cap that the token-budget split can't (many tiny inputs fit
- * under any token budget). Used for endpoints like llama.cpp's llama-server
- * that reject requests exceeding their launch batch size.
- *
- * @internal exported for tests; not part of the public gateway API.
- */
-export function capBatchItems(texts: string[], maxItems: number): string[][] {
-  if (maxItems <= 0 || texts.length <= maxItems) return [texts];
-  const batches: string[][] = [];
-  for (let i = 0; i < texts.length; i += maxItems) {
-    batches.push(texts.slice(i, i + maxItems));
-  }
-  return batches;
 }
 
 /**
@@ -1795,6 +1750,11 @@ export function __getShrinkStateForTests(recipeId: string): ShrinkEntry | undefi
 /**
  * Embed a single sub-batch with automatic halving on token-limit errors.
  * If the batch is already at MIN_SUB_BATCH and still fails, throws.
+ *
+ * `reportedTokens` is the provider's usage.tokens for this sub-batch (summed
+ * across halves when the batch split), or null when the provider did not
+ * report usage — the caller's budget record falls back to the chars-per-token
+ * estimate in that case.
  */
 async function embedSubBatch(
   texts: string[],
@@ -1804,13 +1764,11 @@ async function embedSubBatch(
   recipe: Recipe,
   modelId: string,
   opts?: EmbedOpts,
-): Promise<Float32Array[]> {
+): Promise<{ embeddings: Float32Array[]; reportedTokens: number | null }> {
   try {
+    const maxRetries = hasAIInvocationGuard() ? 0 : opts?.maxRetries ?? __budgetStore.getStore()?.providerRetries; // PR 4 (Wave B incremental derivation, transcripts): an embed in a metered page step makes only the attempts it reserved for
     const callTransport = () => invokeAI({ operation: 'gateway.embed', kind: 'embedding', model: `${recipe.id}:${modelId}`,
-      maxInputTokens: recipe.touchpoints.embedding?.max_batch_tokens
-        ?? (recipe.touchpoints.embedding?.max_input_tokens?.[modelId] !== undefined
-          ? recipe.touchpoints.embedding.max_input_tokens[modelId]! * texts.length : undefined),
-      maxOutputTokens: 0 }, () => _embedTransport({
+      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0, estimatedInputTokens: Math.ceil(texts.reduce((n, text) => n + text.length, 0) / (recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN)) }, () => _embedTransport({
       model,
       values: texts,
       providerOptions: providerOpts,
@@ -1819,8 +1777,8 @@ async function embedSubBatch(
       // per-SDK-call scope). Composes with a caller signal (Fix 3's 6s query
       // deadline) — shorter wins.
       abortSignal: withDefaultTimeout(opts?.abortSignal, AI_EMBED_TIMEOUT_MS),
-      ...(hasAIInvocationGuard() ? { maxRetries: 0 } : opts?.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
-    }), sdkInvocationUsage);
+      ...(maxRetries !== undefined ? { maxRetries } : {}),
+    }), sdkInvocationUsage, err => isTokenLimitError(err) || isUnbilledEmbeddingRejection(recipe.id, err) ? { inputTokens: 0, outputTokens: 0 } : null);
     // Carry the threaded input_type across the SDK boundary via
     // __embedInputTypeStore (the adapter strips it from providerOptions —
     // see the store's doc comment). Populated only when dimsProviderOptions
@@ -1838,17 +1796,21 @@ async function embedSubBatch(
       );
     }
 
-    for (const embedding of result.embeddings) {
+    const embeddings: number[][] = result.embeddings.map((e: number[]) => fitMatryoshkaPrefix(recipe, modelId, e, expectedDims)); // PR #5921
+    for (const embedding of embeddings) {
       if (Array.isArray(embedding) && embedding.length !== expectedDims) {
-        throw new AIConfigError(
-          `Embedding dim mismatch: model ${modelId} returned ${embedding.length} but schema expects ${expectedDims}.`,
-          `Run \`gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}\` or change models.`,
-        );
+        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`, { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
       }
     }
 
     recordSubBatchSuccess(recipe);
-    return result.embeddings.map((e: number[]) => new Float32Array(e));
+    const usageTokens = (result as { usage?: { tokens?: unknown } }).usage?.tokens;
+    return {
+      embeddings: embeddings.map((e: number[]) => new Float32Array(e)),
+      reportedTokens: typeof usageTokens === 'number' && Number.isFinite(usageTokens) && usageTokens > 0
+        ? usageTokens
+        : null,
+    };
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
     // On token-limit error, tighten the recipe's effective safety factor
@@ -1859,9 +1821,15 @@ async function embedSubBatch(
       const mid = Math.ceil(texts.length / 2);
       const left = await embedSubBatch(texts.slice(0, mid), model, providerOpts, expectedDims, recipe, modelId, opts);
       const right = await embedSubBatch(texts.slice(mid), model, providerOpts, expectedDims, recipe, modelId, opts);
-      return [...left, ...right];
+      return {
+        embeddings: [...left.embeddings, ...right.embeddings],
+        reportedTokens: left.reportedTokens !== null && right.reportedTokens !== null
+          ? left.reportedTokens + right.reportedTokens
+          : null,
+      };
     }
-    throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`);
+    reportEmbeddingAuthFailure(recipe, err);
+    throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`, redactKeys, embeddingModelNotFoundHint());
   }
 }
 
@@ -1873,9 +1841,20 @@ export async function embedOne(text: string, opts?: EmbedOpts): Promise<Float32A
 
 export async function embedQuery(
   text: string,
-  opts?: { embeddingModel?: string; dimensions?: number; abortSignal?: AbortSignal },
+  opts?: { embeddingModel?: string; dimensions?: number; abortSignal?: AbortSignal; queryPrefix?: string },
 ): Promise<Float32Array> {
-  const [v] = await embed([text], {
+  // #5691: instruction-style models (Qwen3-Embedding, e5, BGE, nomic) take a
+  // query instruction. The caller resolves it per brain (search/query-prefix.ts);
+  // documents are never prefixed.
+  const input = (opts?.queryPrefix ?? '') + text;
+  const cfg = requireConfig();
+  const { recipe, modelId } = await resolveEmbeddingProvider(opts?.embeddingModel ?? getEmbeddingModel());
+  const dims = opts?.dimensions ?? cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS;
+  const key = queryEmbedCacheKey(recipe.id, modelId, cfg.base_urls?.[recipe.id] ?? '', dims, input);
+  const cached = hasAIInvocationGuard() ? undefined : cachedQueryEmbedding(key);
+  if (cached) return cached;
+  const generation = queryEmbedGeneration();
+  const [v] = await embed([input], {
     inputType: 'query',
     embeddingModel: opts?.embeddingModel,
     dimensions: opts?.dimensions,
@@ -1884,6 +1863,7 @@ export async function embedQuery(
     // default via withDefaultTimeout (shorter wins).
     abortSignal: opts?.abortSignal,
   });
+  if (v) storeQueryEmbedding(key, v, generation);
   return v;
 }
 
@@ -1913,6 +1893,37 @@ export async function embedMultimodal(
   opts: EmbedMultimodalOpts = {},
 ): Promise<Float32Array[]> {
   if (!inputs || inputs.length === 0) return [];
+  // Fix wave 13 P1.18: reserve on the ambient tracker before any provider call,
+  // as embed() does. An image is reserved at the provider's per-input maximum
+  // (MULTIMODAL_IMAGE_TOKEN_CEILING) and settled at the provider's reported
+  // tokens when it reports them, so a cap is never crossed by an estimate.
+  const tracker = __budgetStore.getStore() ?? null;
+  if (!tracker) return embedMultimodalUnmetered(inputs, opts);
+  const modelStr = requireConfig().embedding_multimodal_model ?? getEmbeddingModel();
+  const { parsed, recipe } = resolveRecipe(modelStr);
+  const mmModelId = `${recipe.id}:${parsed.modelId}`;
+  const charsPerToken = Math.max(recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN, 1);
+  const estimatedInputTokens = inputs.reduce((n, input) => n + (input.kind === 'text' ? Math.ceil(input.text.length / charsPerToken) : MULTIMODAL_IMAGE_TOKEN_CEILING), 0);
+  const reservation = tracker.reserve({ modelId: mmModelId, estimatedInputTokens, maxOutputTokens: 0, kind: 'embed', label: 'gateway.multimodal' });
+  const usage: { tokens: number | null } = { tokens: 0 };
+  try {
+    const out = await embedMultimodalUnmetered(inputs, opts, usage);
+    recordOnTracker(tracker, { modelId: mmModelId, reservation, requestedModelId: modelStr, kind: 'embed', label: 'gateway.multimodal',
+      inputTokens: usage.tokens || estimatedInputTokens, outputTokens: 0, estimated: !usage.tokens });
+    return out;
+  } catch (err) {
+    if (err instanceof AIConfigError) tracker.release(reservation);
+    else recordOnTracker(tracker, { modelId: mmModelId, reservation, requestedModelId: modelStr, kind: 'embed', label: 'gateway.multimodal.failed',
+      inputTokens: estimatedInputTokens, outputTokens: 0, failed: true, estimated: true });
+    throw err;
+  }
+}
+
+async function embedMultimodalUnmetered(
+  inputs: MultimodalInput[],
+  opts: EmbedMultimodalOpts,
+  usage: { tokens: number | null } = { tokens: null },
+): Promise<Float32Array[]> {
 
   const cfg = requireConfig();
   // Prefer embedding_multimodal_model when set, so brains using OpenAI for
@@ -1946,6 +1957,7 @@ export async function embedMultimodal(
   // recipe is `openai-compat` per tier but uses its own /multimodalembeddings
   // path, so we still branch on recipe.id for that one.
   if (recipe.id !== 'voyage' && recipe.implementation === 'openai-compatible') {
+    usage.tokens = null;
     return embedMultimodalOpenAICompat(inputs, recipe, parsed.modelId, cfg, opts);
   }
   if (recipe.id !== 'voyage') {
@@ -2020,12 +2032,13 @@ export async function embedMultimodal(
       }), responseInvocationUsage);
     } catch (err) {
       if (isAIInvocationPolicyError(err)) throw err;
-      throw normalizeAIError(err, `embedMultimodal(${recipe.id}:${parsed.modelId})`);
+      throw normalizeAIError(err, `embedMultimodal(${recipe.id}:${parsed.modelId})`, redactKeys);
     }
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
+      const text = redactKeys(await res.text().catch(() => ''));
       if (res.status === 401 || res.status === 403) {
+        reportEmbeddingAuthFailure(recipe, { status: res.status });
         throw new AIConfigError(
           `Voyage multimodal returned ${res.status}: ${text || 'auth failed'}.`,
           `Re-export ${recipe.auth_env?.required[0]} or rotate the key at ${recipe.auth_env?.setup_url}.`,
@@ -2037,9 +2050,9 @@ export async function embedMultimodal(
       );
     }
 
-    let parsedBody: { data?: Array<{ embedding: number[] }> };
+    let parsedBody: { data?: Array<{ embedding: number[] }>; usage?: { total_tokens?: unknown } };
     try {
-      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }> };
+      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }>; usage?: { total_tokens?: unknown } };
     } catch (err) {
       throw new AITransientError(
         `Voyage multimodal returned malformed JSON: ${err instanceof Error ? err.message : String(err)}.`,
@@ -2061,9 +2074,11 @@ export async function embedMultimodal(
       }
       allEmbeddings.push(new Float32Array(row.embedding));
     }
+    const reported = parsedBody.usage?.total_tokens;
+    usage.tokens = usage.tokens !== null && typeof reported === 'number' && reported > 0 ? usage.tokens + reported : null;
   }
 
-  return allEmbeddings;
+  return screenAlignedEmbeddings(allEmbeddings, `${recipe.id}:${parsed.modelId}`);
 }
 
 // Documentation pointer: callers must size-check before calling. Voyage caps
@@ -2166,12 +2181,13 @@ async function embedMultimodalOpenAICompat(
       }), responseInvocationUsage);
     } catch (err) {
       if (isAIInvocationPolicyError(err)) throw err;
-      throw normalizeAIError(err, `embedMultimodal(${recipe.id}:${modelId})`);
+      throw normalizeAIError(err, `embedMultimodal(${recipe.id}:${modelId})`, redactKeys);
     }
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
+      const text = redactKeys(await res.text().catch(() => ''));
       if (res.status === 401 || res.status === 403) {
+        reportEmbeddingAuthFailure(recipe, { status: res.status });
         const requiredKey = recipe.auth_env?.required[0];
         throw new AIConfigError(
           `${recipe.name} multimodal returned ${res.status}: ${text || 'auth failed'}.`,
@@ -2224,7 +2240,7 @@ async function embedMultimodalOpenAICompat(
     allEmbeddings.push(new Float32Array(row.embedding));
   }
 
-  return allEmbeddings;
+  return screenAlignedEmbeddings(allEmbeddings, `${recipe.id}:${modelId}`);
 }
 
 // ---- v0.36 cross-modal wave: query-side multimodal embedding + safe variant ----
@@ -2319,6 +2335,10 @@ export async function embedMultimodalSafe(
     } catch (err) {
       if (isAIInvocationPolicyError(err)) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
+      if (isEmbeddingZeroNormError(err)) {
+        err.vectors.forEach((v, i) => { if (v) embeddings[startIdx + i] = v; else failedIndices.push(startIdx + i); });
+        return;
+      }
       // AIConfigError = permanent misconfig. Retrying smaller won't help.
       if (lastError instanceof AIConfigError) {
         for (let i = 0; i < items.length; i++) failedIndices.push(startIdx + i);
@@ -2345,6 +2365,7 @@ export async function embedMultimodalSafe(
 // ---- Expansion ----
 
 async function resolveExpansionProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'expansion', parsed.modelId);
   const cfg = requireConfig();
@@ -2369,7 +2390,8 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google expansion requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -2425,6 +2447,14 @@ export function parseExpansionResponse(text: string): string[] | null {
 // by the image token cost, NOT its base64 length (bytes are not tokens).
 const EXPANSION_FAILED_PESSIMISTIC_OUTPUT_TOKENS = 512;
 const OCR_IMAGE_INPUT_TOKEN_ESTIMATE = 1600;
+/** Fix wave 13 P1.18: OCR's explicit output bound, the same number its tracker reservation holds. */
+const OCR_MAX_OUTPUT_TOKENS = 4096;
+/**
+ * Fix wave 13 P1.18: the tokens one image input can cost a multimodal embedding
+ * provider at most, reserved before the call (Voyage: 16M pixels at 560 pixels
+ * per token). The provider's reported usage settles it when present.
+ */
+const MULTIMODAL_IMAGE_TOKEN_CEILING = Math.ceil(16_000_000 / 560);
 
 /**
  * #4121 — the v6/legacy AI-SDK usage shapes (`inputTokens|promptTokens`,
@@ -2452,26 +2482,6 @@ function normalizeSdkUsage(usage: unknown): { inputTokens: number; outputTokens:
 }
 
 /**
- * #4121 — one fail-open record wrapper for every uninstrumented-path spend
- * site (expand + OCR): no-tracker is a no-op; BudgetExhausted from record()
- * (TX1) is swallowed exactly like chat()'s _recordBudget — the breach
- * surfaces on the NEXT reserve(), never here.
- */
-function recordSpendOnTracker(
-  tracker: ReturnType<typeof getCurrentBudgetTracker>,
-  modelId: string,
-  label: string,
-  tokens: { inputTokens: number; outputTokens: number },
-): void {
-  if (!tracker) return;
-  try {
-    tracker.record({ modelId, inputTokens: tokens.inputTokens, outputTokens: tokens.outputTokens, label });
-  } catch {
-    // BudgetExhausted (TX1) — surfaced via the next reserve().
-  }
-}
-
-/**
  * Expand a search query into up to 4 related queries.
  * Returns the original query PLUS expansions. On failure, returns just the original.
  * Caller is responsible for sanitizing the query (prompt-injection boundary stays in expansion.ts).
@@ -2487,13 +2497,7 @@ export async function expand(query: string): Promise<string[]> {
     metadata: { query_chars: query.length },
   });
 
-  const expansionPrompt = [
-    'Rewrite the search query below into 3-4 different, related queries that would help find relevant documents. Respond with a JSON object in exactly this shape: {"queries": ["rewrite1", "rewrite2", "rewrite3"]}. The JSON key MUST be exactly "queries" (not "rewrites" or any other variation).',
-    'Return ONLY the JSON object. Do NOT include the original query in the result.',
-    'Each rewrite should emphasize different aspects, synonyms, or framings.',
-    '',
-    `Query: ${query}`,
-  ].join('\n');
+  const expansionPrompt = buildExpansionPrompt(query);
 
   // #4121: expand() calls generateObject/generateText directly and never
   // goes through chat()'s _recordBudget closure, so every expansion LLM
@@ -2505,31 +2509,32 @@ export async function expand(query: string): Promise<string[]> {
   // provider tokens; the viaText fallback then bills its own call, so one
   // expand() can legitimately produce TWO records). Fail-open (no tracker →
   // no-op) and swallow BudgetExhausted the same way chat()'s _recordBudget
-  // does — TX1 surfaces on the NEXT reserve(), not here.
+  // does — TX1 surfaces on the NEXT reserve(), not here. The fallback's
+  // record is an extra attempt of the same operation (countsAsCall: false).
   const tracker = getCurrentBudgetTracker();
-  const recordExpansion = (
-    modelLabel: string,
-    label: 'gateway.expand' | 'gateway.expand.failed',
-    tokens: { inputTokens: number; outputTokens: number },
-  ): void => recordSpendOnTracker(tracker, modelLabel, label, tokens);
-  const recordExpansionUsage = (modelLabel: string, usage: unknown): void =>
-    recordExpansion(modelLabel, 'gateway.expand', normalizeSdkUsage(usage));
   const estimatedPromptTokens = estimateChatInputTokens({
     messages: [{ content: expansionPrompt }],
   });
-  const recordExpansionFailure = (modelLabel: string, err: unknown): void =>
-    recordExpansion(
-      modelLabel,
-      'gateway.expand.failed',
-      _extractUsageFromError(err, {
-        inputTokens: estimatedPromptTokens,
-        outputTokens: EXPANSION_FAILED_PESSIMISTIC_OUTPUT_TOKENS,
-      }),
-    );
 
   try {
-    const { model, recipe, modelId } = await resolveExpansionProvider(getExpansionModel());
+    await discoverBeforeOpenAICall(_config?.expansion_model);
+    const requestedModelId = getExpansionModel();
+    const { model, recipe, modelId } = await resolveExpansionProvider(requestedModelId);
     const modelLabel = `${recipe.id}:${modelId}`;
+    // #7176: a successful expansion is also a chat_usage_log row, phase 'expansion'.
+    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void => {
+      const { inputTokens, outputTokens } = normalizeSdkUsage(usage);
+      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, inputTokens, outputTokens });
+      recordChatUsage({ model: modelLabel, provider: recipe.id, phase: 'expansion', usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+    };
+    const recordExpansionFailure = (err: unknown, countsAsCall: boolean): void =>
+      recordOnTracker(tracker, {
+        modelId: modelLabel,
+        requestedModelId,
+        label: 'gateway.expand.failed',
+        countsAsCall,
+        ...failedCallUsage(err, { inputTokens: estimatedPromptTokens, outputTokens: EXPANSION_FAILED_PESSIMISTIC_OUTPUT_TOKENS }),
+      });
 
     let expansions: string[];
 
@@ -2537,20 +2542,20 @@ export async function expand(query: string): Promise<string[]> {
     // support is unknown: the AI SDK can't send a json_schema response_format
     // there, so generateObject would warn and silently degrade. generateText + a
     // tolerant parse recovers the queries instead. Fresh abortSignal per call.
-    const viaText = async (): Promise<string[]> => {
+    const viaText = async (countsAsCall = true): Promise<string[]> => {
       let textResult: Awaited<ReturnType<GenerateTextFn>>;
       try {
-        textResult = await guardedGeneration(modelLabel, _generateTextTransport, {
+        textResult = await guardedExpansion(modelLabel, _generateTextTransport, {
           model,
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
         });
       } catch (err) {
         if (isAIInvocationPolicyError(err)) throw err;
-        recordExpansionFailure(modelLabel, err); // failed call still billed upstream
+        recordExpansionFailure(err, countsAsCall); // failed call still billed upstream
         throw err; // outer catch degrades to [query]
       }
-      recordExpansionUsage(modelLabel, textResult.usage);
+      recordExpansionUsage(textResult.usage, countsAsCall);
       return parseExpansionResponse(textResult.text) ?? [];
     };
 
@@ -2581,7 +2586,7 @@ export async function expand(query: string): Promise<string[]> {
       // generic, so `object` would be `{}`.)
       let result: { object?: unknown; usage?: unknown };
       try {
-        result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Name the schema. On the native-anthropic path the SDK turns the schema
@@ -2604,10 +2609,10 @@ export async function expand(query: string): Promise<string[]> {
         });
       } catch (err) {
         if (isAIInvocationPolicyError(err)) throw err;
-        recordExpansionFailure(modelLabel, err);
+        recordExpansionFailure(err, true);
         throw err; // outer catch degrades to [query]
       }
-      recordExpansionUsage(modelLabel, result.usage);
+      recordExpansionUsage(result.usage, true);
       const parsed = ExpansionSchema.safeParse(result.object);
       expansions = parsed.success ? parsed.data.queries : [];
     } else if (recipeSupportsStructuredOutputs(recipe) && !_structuredOutputRejectedRecipes.has(recipe.id)) {
@@ -2615,7 +2620,7 @@ export async function expand(query: string): Promise<string[]> {
       // schema (strict validation), and fall back to the text path if it is
       // rejected at call time so a mis-declared capability never drops expansion.
       try {
-        const result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        const result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Same schema name+description as the native branch above: an
@@ -2627,18 +2632,18 @@ export async function expand(query: string): Promise<string[]> {
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
         });
-        recordExpansionUsage(modelLabel, result.usage);
+        recordExpansionUsage(result.usage, true);
         const parsed = ExpansionSchema.safeParse(result.object);
         expansions = parsed.success ? parsed.data.queries : [];
       } catch (err) {
         if (isAIInvocationPolicyError(err)) throw err;
         // The rejected structured attempt billed real tokens — record it
         // before the fallback bills its own call (two records, both true).
-        recordExpansionFailure(modelLabel, err);
+        recordExpansionFailure(err, true);
         // Adversarial F5: don't re-pay this attempt on every call — the
         // capability mis-declaration is stable for the process lifetime.
         _structuredOutputRejectedRecipes.add(recipe.id);
-        expansions = await viaText();
+        expansions = await viaText(false);
       }
     } else {
       // openai-compatible backend, structured-output support unknown: skip the
@@ -2658,7 +2663,7 @@ export async function expand(query: string): Promise<string[]> {
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
     // Expansion is best-effort: on failure, fall back to the original query alone.
-    const normalized = normalizeAIError(err, 'expand');
+    const normalized = normalizeAIError(err, `expand(${_config?.expansion_model ?? ''})`, redactKeys, gatewayModelNotFoundHint('expansion', _config?.expansion_model ?? ''));
     if (normalized instanceof AIConfigError) {
       console.warn(`[ai.gateway] expansion disabled: ${normalized.message}`);
     }
@@ -2709,12 +2714,15 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
   const estimatedOcrInputTokens =
     estimateChatInputTokens({ system: systemPrompt, messages: [{ content: 'Extract visible text only.' }] }) +
     OCR_IMAGE_INPUT_TOKEN_ESTIMATE;
-  const recordOcr = (label: 'gateway.ocr' | 'gateway.ocr.failed', tokens: { inputTokens: number; outputTokens: number }): void =>
-    recordSpendOnTracker(tracker, ocrModelId, label, tokens);
+  // Fix wave 13 P1.18: reserve before the call with the explicit output bound the call is sent with.
+  const reservation = tracker?.reserve({ modelId: ocrModelId, estimatedInputTokens: estimatedOcrInputTokens, maxOutputTokens: OCR_MAX_OUTPUT_TOKENS, kind: 'chat', label: 'gateway.ocr' });
+  const recordOcr = (label: 'gateway.ocr' | 'gateway.ocr.failed', usage: { inputTokens: number; outputTokens: number }): void =>
+    recordOnTracker(tracker, { modelId: ocrModelId, requestedModelId: ocrModel, label, reservation, ...usage });
   let result: Awaited<ReturnType<GenerateTextFn>>;
   try {
     result = await guardedGeneration(ocrModelId, _generateTextTransport, {
       model,
+      maxOutputTokens: OCR_MAX_OUTPUT_TOKENS,
       // v0.42.20.0 (codex) — OCR is a 5th unbounded generateText entry point.
       abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
       messages: [
@@ -2736,9 +2744,9 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
     });
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
-    recordOcr('gateway.ocr.failed', _extractUsageFromError(err, {
+    recordOcr('gateway.ocr.failed', failedCallUsage(err, {
       inputTokens: estimatedOcrInputTokens,
-      outputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+      outputTokens: OCR_MAX_OUTPUT_TOKENS,
     }));
     // Throw-to-caller contract unchanged: importImageFile routes this to
     // ocr_failed_other. A cap breach surfaces there as a real import failure.
@@ -2773,23 +2781,6 @@ export function getCurrentBudgetTracker(): BudgetTracker | null {
   return __budgetStore.getStore() ?? null;
 }
 
-/** Internal helper: estimate input tokens from messages + system. Heuristic only
- * (~4 chars/token); cap math is best-effort because we pre-flight reservation
- * before the SDK has counted anything. */
-function estimateChatInputTokens(opts: { system?: string; messages?: Array<{ content?: unknown }> }): number {
-  let chars = (opts.system ?? '').length;
-  for (const m of opts.messages ?? []) {
-    if (typeof m.content === 'string') chars += m.content.length;
-    else if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        const t = (block as { text?: unknown }).text;
-        if (typeof t === 'string') chars += t.length;
-      }
-    }
-  }
-  return Math.ceil(chars / 4);
-}
-
 // ---- Chat (commit 1) ----
 
 /**
@@ -2819,7 +2810,10 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
  * on turn 2 without this: `chat()` previously never captured the part at all.
  */
 export type ChatBlock =
-  | { type: 'text'; text: string; providerMetadata?: Record<string, unknown> }
+  // `cache: true` (PR #6341): an explicit prompt-cache breakpoint after this block, so a
+  // single-turn caller's stable USER prefix (page-summary's title + document) caches. Honoured
+  // only when the call derives a cache-control value; other routes see a plain text block.
+  | { type: 'text'; text: string; cache?: true; providerMetadata?: Record<string, unknown> }
   | { type: 'reasoning'; text: string; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-result'; toolCallId: string; toolName: string; output: unknown; isError?: boolean; providerMetadata?: Record<string, unknown> };
@@ -2900,6 +2894,8 @@ export function isThinkingModel(modelStr: string | undefined): boolean {
 export function defaultMaxOutputTokens(modelStr: string | undefined): number {
   return isThinkingModel(modelStr) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
 }
+/** The cap `chat({ thinking: 'off', maxTokens: requested })` sends (thinking-off.ts table); judge preflight estimates price with it. */
+export const thinkingOffOutputCap = (modelStr: string, requested: number): number => thinkingOffMaxOutputTokens(modelStr, requested, isThinkingModel(modelStr), THINKING_MODEL_MAX_OUTPUT_TOKENS);
 
 /**
  * Deep-serialize a tool output into a plain JSON value for the AI SDK v6
@@ -2950,7 +2946,10 @@ function ensureToolCallId(id: unknown, toolName: string): string {
   return `glmfix-${toolName}-${randomUUID()}`;
 }
 
-export function toModelMessages(messages: ChatMessage[]): unknown[] {
+export function toModelMessages(
+  messages: ChatMessage[],
+  cacheControl?: { type: 'ephemeral'; ttl?: '5m' | '1h' },
+): unknown[] {
   return messages.map((m) => {
     if (typeof m.content === 'string') return { role: m.role, content: m.content };
     const blocks = m.content;
@@ -2987,10 +2986,13 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
           // Gemini 3.x thoughtSignature, OpenAI reasoning-item id) — attached
           // only when captured.
           if (b.type === 'text') {
+            const providerOptions = b.cache && cacheControl
+              ? { ...b.providerMetadata, anthropic: { ...(b.providerMetadata?.anthropic as Record<string, unknown> | undefined), cacheControl } }
+              : b.providerMetadata;
             return {
               type: 'text' as const,
               text: b.text,
-              ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
+              ...(providerOptions ? { providerOptions } : {}),
             };
           }
           if (b.type === 'reasoning') {
@@ -3087,6 +3089,8 @@ export interface ChatResult {
     output_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    /** A1: the reasoning subset of output_tokens, when the provider reported one. */
+    reasoning_tokens?: number;
   };
   /** "provider:modelId" string of the model that actually answered. */
   model: string;
@@ -3100,6 +3104,10 @@ export interface ChatResult {
   providerId: string;
   /** Raw provider metadata (Anthropic-specific cache fields, OpenAI finish_reason, etc.) for downstream callers that need it. */
   providerMetadata?: Record<string, any>;
+  /** Set when a `chat_fallback_chain` entry answered: the call's own model, which failed or refused (`model` names the one that ran). */
+  fallbackFrom?: string;
+  /** With `fallbackFrom`: why that model did not answer ("failed (<first error line>)" / "refused (...)"). */
+  fallbackReason?: string;
 }
 
 export interface ChatOpts {
@@ -3117,6 +3125,12 @@ export interface ChatOpts {
    */
   temperature?: number;
   abortSignal?: AbortSignal;
+  /**
+   * Replaces the default chat backstop (`GBRAIN_AI_CHAT_TIMEOUT_MS`, 300 s)
+   * for this call; `abortSignal` still composes (shorter wins). Set by
+   * callers that own a longer budget, such as a subagent turn (#4921).
+   */
+  timeoutMs?: number;
   /**
    * Per-call provider options keyed by recipe id, deep-merged LAST — after
    * the derived cache markers and configured `provider_chat_options` — so a
@@ -3144,6 +3158,21 @@ export interface ChatOpts {
    * validating it themselves (see `jsonSchemaOutput`).
    */
   responseSchema?: { name: string; description?: string; schema: Record<string, unknown> };
+  /** Caller purpose (`skillopt.judge`, …) stamped on the BudgetTracker ledger row. */
+  purpose?: string;
+  /**
+   * `'off'` turns thinking off for this call on routes with a per-call switch
+   * (native Anthropic, DeepSeek, OpenRouter DeepSeek), replacing a configured
+   * thinking object; elsewhere a thinking-by-default model keeps thinking and
+   * gets the thinking output headroom instead (see `thinking-off.ts`).
+   */
+  thinking?: 'off';
+  /**
+   * `false` pins the call to its own model: `chat_fallback_chain` is not
+   * consulted (see `chat-fallback.ts`). Judge, critic and eval call sites set
+   * it so a verdict or score always comes from the model they named.
+   */
+  allowFallback?: boolean;
 }
 
 /**
@@ -3260,6 +3289,7 @@ function chatSupportsPromptCache(recipe: Recipe, modelId: string): boolean {
 }
 
 async function resolveChatProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'chat', parsed.modelId);
   const cfg = requireConfig();
@@ -3284,7 +3314,8 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google chat requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -3322,7 +3353,7 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
 /**
  * Map AI SDK's `finish_reason` (and provider-specific signals) to a provider-
  * neutral `stopReason`. This is the structural-signal layer that
- * `chatWithFallback` (commit 3) consults BEFORE any regex heuristic (per D8).
+ * `chatWithFallback` (chat-fallback.ts) consults BEFORE any regex heuristic (per D8).
  */
 function mapStopReason(
   finishReason: string | undefined,
@@ -3508,6 +3539,9 @@ export function toAISDKTools(tools: ChatToolDef[] | undefined): Record<string, a
 }
 
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
+  await discoverBeforeOpenAICall(opts.model ?? _config?.chat_model);
+  const fallbackChain = opts.allowFallback === false ? undefined : _config?.chat_fallback_chain;
+  if (fallbackChain?.length) return chatWithFallback(opts, opts.model ?? getChatModel(), fallbackChain, chat, { onRefusal: _config?.chat_fallback_on_refusal !== false });
   const tracker = __budgetStore.getStore() ?? null;
   const modelStrEarly = opts.model ?? getChatModel();
 
@@ -3528,21 +3562,27 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     }
   }
   const estimatedInputTokens = estimateChatInputTokens(opts);
-  const maxOutputTokens = opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly);
+  const maxOutputTokens = opts.thinking === 'off' ? thinkingOffOutputCap(modelStrEarly, opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly)) : (opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly));
 
-  // TX5: reserve BEFORE the provider call. Throws BudgetExhausted on cost,
-  // runtime, or no_pricing (when cap is set). Pre-resolution model id is
-  // fine here — resolveChatProvider would map aliases the same way for the
-  // cost lookup. record() below uses the real result.model.
-  if (tracker) {
-    tracker.reserve({
-      modelId: modelStrEarly,
-      estimatedInputTokens,
-      maxOutputTokens,
-      kind: 'chat' as BudgetKind,
-      label: 'gateway.chat',
-    });
+  // TX5: reserve BEFORE the provider call (BudgetExhausted on cost, runtime,
+  // or no_pricing under a user cap) with the pre-resolution model id. record()
+  // settles the reservation by id; the finally frees an attempt that never
+  // billed (provider resolution failed, an invocation policy refused it).
+  const reservation = tracker?.reserve({ modelId: modelStrEarly, estimatedInputTokens, maxOutputTokens, kind: 'chat', label: 'gateway.chat' });
+  const chatRecord = { requestedModelId: modelStrEarly, purpose: opts.purpose, label: 'gateway.chat', reservation };
+  try {
+    return await chatAdmitted(opts, { tracker, modelStrEarly, estimatedInputTokens, maxOutputTokens, chatRecord });
+  } finally {
+    tracker?.release(reservation);
   }
+}
+
+/** One admitted chat attempt: the provider call plus its budget record. */
+async function chatAdmitted(opts: ChatOpts, admitted: {
+  tracker: BudgetTracker | null; modelStrEarly: string; estimatedInputTokens: number; maxOutputTokens: number;
+  chatRecord: { requestedModelId: string; purpose?: string; label: string; reservation?: BudgetReservation };
+}): Promise<ChatResult> {
+  const { tracker, modelStrEarly, estimatedInputTokens, maxOutputTokens, chatRecord } = admitted;
 
   // Test seam: when a test transport is installed, route through it without
   // touching provider resolution, AI SDK, or any network. See
@@ -3570,33 +3610,11 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       threw = err;
       throw err;
     } finally {
-      if (tracker) {
-        try {
-          if (res) {
-            tracker.record({
-              modelId: res.model ?? modelStrEarly,
-              inputTokens: res.usage.input_tokens,
-              outputTokens: res.usage.output_tokens,
-              label: 'gateway.chat',
-            });
-          } else {
-            const usage = _extractUsageFromError(threw, {
-              inputTokens: estimatedInputTokens,
-              outputTokens: maxOutputTokens,
-            });
-            tracker.record({
-              modelId: modelStrEarly,
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              label: 'gateway.chat',
-            });
-          }
-        } catch {
-          // record() can throw BudgetExhausted (TX1) — suppress here so the
-          // original error (if any) wins; the BudgetExhausted is surfaced
-          // on the NEXT call via reserve(). For test transport this branch
-          // is rare in practice.
-        }
+      // A policy refusal never reached the provider: chat() releases its hold.
+      if (res || threw) {
+        recordOnTracker(tracker, res
+          ? { ...chatRecord, modelId: res.model ?? modelStrEarly, inputTokens: res.usage.input_tokens, outputTokens: res.usage.output_tokens }
+          : { ...chatRecord, modelId: modelStrEarly, ...failedCallUsage(threw, { inputTokens: estimatedInputTokens, outputTokens: maxOutputTokens }) });
       }
     }
   }
@@ -3661,6 +3679,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   applyConfiguredChatProviderOptions(providerOptions, cfg, recipe.id, modelId);
   // Call-scoped options merge last so they win over configured siblings.
   providerOptions = deepMergeRecords(providerOptions, opts.providerOptions);
+  if (opts.thinking === 'off') applyThinkingOff(providerOptions, `${recipe.id}:${modelId}`);
 
   // Derive ONE canonical cache-control value AFTER config merging and reuse
   // it for every breakpoint (system block, last tool def, call-level). If
@@ -3687,19 +3706,10 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   }
 
   let _budgetRecorded = false;
-  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
-    if (!tracker || _budgetRecorded) return;
+  const _recordBudget = (usage: { inputTokens: number; outputTokens: number; failed?: boolean; estimated?: boolean }): void => {
+    if (_budgetRecorded) return;
     _budgetRecorded = true;
-    try {
-      tracker.record({
-        modelId: modelLabel,
-        inputTokens,
-        outputTokens,
-        label: 'gateway.chat',
-      });
-    } catch {
-      // BudgetExhausted (TX1) raised here; surface via next reserve()
-    }
+    recordOnTracker(tracker, { ...chatRecord, modelId: `${recipe.id}:${modelId}`, ...usage });
   };
 
   // The actual Anthropic system-prompt cache breakpoint. A bare string
@@ -3740,17 +3750,19 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const generate = (out: typeof output) => guardedGeneration(modelStr, _generateTextTransport, {
     model,
     system: systemParam,
-    messages: toModelMessages(repairToolPairing(opts.messages)) as any,
+    messages: toModelMessages(repairToolPairing(opts.messages), cacheControlValue) as any,
     tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
-    maxOutputTokens: opts.maxTokens ?? defaultMaxOutputTokens(modelStr),
+    maxOutputTokens,
     ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
     output: out,
     // v0.42.20.0 — default a chat timeout (composes with the caller's signal,
     // shorter wins). Covers native-anthropic (the default provider + facts Haiku).
     // Fresh signal per attempt so the schemaless retry gets its own timeout.
-    abortSignal: withDefaultTimeout(opts.abortSignal, AI_CHAT_TIMEOUT_MS),
+    abortSignal: withDefaultTimeout(opts.abortSignal, opts.timeoutMs ?? AI_CHAT_TIMEOUT_MS),
     providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
     ...(requestHeaders ? { headers: requestHeaders } : {}),
+    // PR 4 (Wave B incremental derivation, transcripts): a metered page step sees every attempt it pays for.
+    ...(tracker?.providerRetries !== undefined ? { maxRetries: tracker.providerRetries } : {}),
   });
 
   try {
@@ -3814,8 +3826,9 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const anthropicCache = providerMetadata?.anthropic ?? {};
 
     const { inputTokens: inTok, outputTokens: outTok } = normalizeSdkUsage(usage);
-    _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
+    _recordBudget({ inputTokens: inTok, outputTokens: outTok });
 
+    const reasoningTokens = usage.outputTokenDetails?.reasoningTokens ?? usage.reasoningTokens;
     const usageOut = {
       input_tokens: inTok,
       output_tokens: outTok,
@@ -3824,6 +3837,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       // prompt_tokens_details.cached_tokens) surface cache hits.
       cache_read_tokens: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
       cache_creation_tokens: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+      ...(typeof reasoningTokens === 'number' && Number.isFinite(reasoningTokens) ? { reasoning_tokens: reasoningTokens } : {}),
     };
     // #4218 success boundary: durable usage ledger (fire-and-forget, fail-open).
     recordChatUsage({
@@ -3847,12 +3861,8 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     if (isAIInvocationPolicyError(err)) throw err;
     // Pessimistic fallback (A3 amended): when err.usage isn't there, charge
     // the worst-case ceiling — better to overcount on failure than under.
-    const fallback = _extractUsageFromError(err, {
-      inputTokens: estimatedInputTokens,
-      outputTokens: maxOutputTokens,
-    });
-    _recordBudget(`${recipe.id}:${modelId}`, fallback.inputTokens, fallback.outputTokens);
-    throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
+    _recordBudget(failedCallUsage(err, { inputTokens: estimatedInputTokens, outputTokens: maxOutputTokens }));
+    throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`, redactKeys, gatewayModelNotFoundHint('chat', modelStr));
   }
 }
 
@@ -3909,6 +3919,12 @@ export interface ToolLoopOpts {
    * Silently ignored on recipes that declare no prompt caching.
    */
   cacheSystem?: boolean;
+  /** Forwarded to every `chat()` turn; see `ChatOpts.purpose`. */
+  purpose?: string;
+  /** Forwarded to every `chat()` turn; see `ChatOpts.allowFallback`. */
+  allowFallback?: boolean;
+  /** Forwarded to every `chat()` turn as `ChatOpts.timeoutMs`. */
+  turnTimeoutMs?: number;
 
   /** Crash-replay state. When set, the loop resumes from the recorded position. */
   replayState?: ToolLoopReplayState;
@@ -3969,7 +3985,7 @@ export type TurnPermit =
   | (() => Promise<void> | void)
   | { release: () => Promise<void> | void; signal?: AbortSignal };
 
-export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
+export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable' | 'empty_response';
 
 export interface ToolLoopResult {
   finalText: string;
@@ -4057,6 +4073,9 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
           ? (opts.abortSignal ? AbortSignal.any([opts.abortSignal, turnPermitSignal]) : turnPermitSignal)
           : opts.abortSignal,
         cacheSystem: opts.cacheSystem,
+        purpose: opts.purpose,
+        allowFallback: opts.allowFallback,
+        timeoutMs: opts.turnTimeoutMs,
       });
     } catch (err) {
       if (isAIInvocationPolicyError(err)) throw err;
@@ -4100,8 +4119,9 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
       // #4088: an output-cap hit is NOT a clean finish. Folding 'length' into
       // 'end' made truncated zero-tool-call runs indistinguishable from the
       // model choosing to stop — the exact honesty bug #2778 fixed on the
-      // direct Anthropic path.
-      stopReason = chatResult.stopReason === 'length' ? 'length' : 'end';
+      // direct Anthropic path. #6448: a clean stop with no text (refusal
+      // body, thinking-only turn) is 'empty_response', not 'end'.
+      stopReason = chatResult.stopReason === 'length' ? 'length' : chatResult.text.trim() === '' ? 'empty_response' : 'end';
       finalText = chatResult.text;
       break;
     }
@@ -4260,7 +4280,11 @@ export interface RerankInput {
   signal?: AbortSignal;
   /** Timeout in ms (default 5000). Search hot path; long stalls degrade UX. */
   timeoutMs?: number;
+  /** Provider-reported call facts (resolved model, score semantics, usage); System One reranker only. */
+  onMeta?: (meta: RerankMeta) => void;
 }
+
+export interface RerankMeta { model_resolved: string; score_semantics: 'rubric'; input_tokens: number; output_tokens: number; latency_ms: number; batches: number }
 
 export interface RerankResult {
   index: number;
@@ -4313,6 +4337,11 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
     );
   }
   const cfg = requireConfig();
+  if (tp.wire_format === 'typesafe-systemone') { // System One reranker: packed score questions via the decide core (#5178 contract)
+    if (recipe.authPresent && !recipe.authPresent(cfg.env)) { noKeyOnce(modelStr, 'TYPESAFE_API_KEY', input.query, input.documents.length); throw new RerankError(`Reranker ${modelStr} needs TYPESAFE_API_KEY (not set) — rerank skipped, results pass through unreranked.`, 'no_key'); }
+    return rerankViaDecide(input, { model: modelStr, modelId: parsed.modelId, maxPayloadBytes: tp.max_payload_bytes, defaultTimeoutMs: DEFAULT_RERANK_TIMEOUT_MS, tracker, transport: _rerankTransport ?? ((u, init) => fetch(u, init)),
+      url: `${applyOpenAICompatConfig(recipe, cfg).baseURL.replace(/\/$/, '')}${tp.path ?? '/systemone'}`, headers: { ...authToHeaders(applyResolveAuth(recipe, cfg, 'reranker')), 'Content-Type': 'application/json' } });
+  }
   // v0.48.2 `no_key` preflight — fail-open, audit-only, once per process per
   // model (see noKeyOnce). A recipe without a custom resolveAuth needs every
   // `auth_env.required` key in the gateway env snapshot; when one is missing
@@ -4383,49 +4412,45 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   // leaking one projection per search on a keyless brain under a cost cap.
   // Reranker pricing resolves through the embedding pricing table (the default
   // model is priced); an unpriced custom reranker still hits the warn-once
-  // (no cap) / TX2 hard-fail (cap set) path. record() below settles it.
-  if (tracker) {
-    const totalChars = input.query.length + input.documents.reduce((s, d) => s + d.length, 0);
-    tracker.reserve({
-      modelId: modelStr,
-      // Honor the recipe's tokenizer density (Voyage declares ~1 char/token on
-      // dense payloads) so a cap cannot be under-reserved ~4× by CJK/JSON docs.
-      estimatedInputTokens: Math.ceil(totalChars / (recipe.touchpoints.embedding?.chars_per_token ?? 4)),
-      maxOutputTokens: 0,
-      kind: 'rerank',
-      label: 'gateway.rerank',
-    });
-  }
+  // (no cap) / TX2 hard-fail (cap set) path. record() below settles it by
+  // id; a policy refusal releases it in the finally. The estimate honors the
+  // recipe's tokenizer density (Voyage declares ~1 char/token on dense
+  // payloads) so a cap cannot be under-reserved ~4× by CJK/JSON docs.
+  const rerankChars = input.query.length + input.documents.reduce((s, d) => s + d.length, 0);
+  const reservation = tracker?.reserve({
+    modelId: modelStr, estimatedInputTokens: Math.ceil(rerankChars / (recipe.touchpoints.embedding?.chars_per_token ?? 4)), maxOutputTokens: 0, kind: 'rerank', label: 'gateway.rerank',
+  });
 
   // Timeout via AbortController; merges with caller-supplied signal.
   const ctrl = new AbortController();
   const timeoutMs = input.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS;
-  const t = setTimeout(() => ctrl.abort(new Error('rerank timed out')), timeoutMs);
+  let timedOut = false;
+  const t = setTimeout(() => { timedOut = true; ctrl.abort(new Error('rerank timed out')); }, timeoutMs);
   if (input.signal) {
     if (input.signal.aborted) ctrl.abort(input.signal.reason);
     else input.signal.addEventListener('abort', () => ctrl.abort(input.signal!.reason), { once: true });
   }
 
   let _rerankRecorded = false;
-  const _rerankRecord = (): void => {
-    if (!tracker || _rerankRecorded) return;
+  const _rerankRecord = (failed: boolean): void => {
+    if (_rerankRecorded) return;
     _rerankRecorded = true;
-    try {
-      const totalChars = input.query.length + input.documents.reduce((s, d) => s + d.length, 0);
-      tracker.record({
-        modelId: modelStr,
-        inputTokens: Math.ceil(totalChars / 4),
-        outputTokens: 0,
-        kind: 'rerank',
-        label: 'gateway.rerank',
-      });
-    } catch {
-      // BudgetExhausted (TX1) suppressed; surfaces on next reserve().
-    }
+    const totalChars = input.query.length + input.documents.reduce((s, d) => s + d.length, 0);
+    recordOnTracker(tracker, {
+      modelId: modelStr,
+      reservation,
+      inputTokens: Math.ceil(totalChars / 4),
+      outputTokens: 0,
+      kind: 'rerank',
+      label: 'gateway.rerank',
+      estimated: true,
+      failed,
+    });
   };
   try {
     const transport: RerankTransport = _rerankTransport ?? ((u, init) => fetch(u, init));
-    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr }, () => transport(url, {
+    const maxInputTokens = rerankRequestMaxInputTokens(input.query, input.documents);
+    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens, estimatedInputTokens: Math.ceil(rerankChars / (recipe.touchpoints.embedding?.chars_per_token ?? 4)) }, () => transport(url, {
       method: 'POST',
       headers,
       body,
@@ -4449,7 +4474,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
           : 'unknown';
       throw new RerankError(msg, reason, resp.status);
     }
-    const json: any = await resp.json();
+    const json: any = await resp.json().catch((err: unknown) => { throw timedOut ? err : new RerankError('rerank: malformed response (body is not JSON)', 'unknown'); });
     // v0.46.3: two response dialects share the item shape {index,
       // `results[]`, Voyage's REST returns `data[]` ({object: "list", data:
     // [...]}, live-wire verified 2026-08-15; Voyage's Python SDK renames it
@@ -4466,24 +4491,32 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
       index: typeof r.index === 'number' ? r.index : 0,
       relevanceScore: typeof r.relevance_score === 'number' ? r.relevance_score : 0,
     }));
-    _rerankRecord();
+    _rerankRecord(false);
     return mapped;
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
-    _rerankRecord();
+    _rerankRecord(true);
     if (err instanceof RerankError) throw err;
-    // AbortError on timeout — classify cleanly.
-    if (err && typeof err === 'object' && (err as any).name === 'AbortError') {
-      const msg = (err as Error).message || 'rerank aborted';
-      throw new RerankError(msg, msg.toLowerCase().includes('timed out') ? 'timeout' : 'unknown');
-    }
-    // Network errors (DNS, connection refused, etc.) become network class.
+    // fetch rejects with the abort reason itself (a plain Error, not an AbortError), so the flag is the tell.
+    if (timedOut) throw new RerankError(`rerank timed out after ${timeoutMs}ms`, 'timeout');
+    if (err && typeof err === 'object' && (err as any).name === 'AbortError') throw new RerankError((err as Error).message || 'rerank aborted', 'unknown');
+    // No HTTP response at all (connection refused, DNS, reset) is `unreachable`; a provider 5xx is `network`.
     const msg = err instanceof Error ? err.message : String(err);
-    throw new RerankError(`rerank: ${msg}`, 'network');
+    throw new RerankError(`rerank: ${msg}`, 'unreachable');
   } finally {
     clearTimeout(t);
+    tracker?.release(reservation);
   }
 }
+
+// ---- Decide (System One; logic in src/core/ai/decide/) ----
+
+let _decideTransport: RerankTransport | null = null;
+/** Test seam for System One decide requests (same shape as the rerank seam). */
+export function __setDecideTransportForTests(fn: RerankTransport | null): void { _decideTransport = fn; }
+export function decideTransport(): RerankTransport { return _decideTransport ?? ((u, init) => fetch(u, init)); }
+/** One logical typed decision; see src/core/ai/decide/index.ts and docs/architecture/decide.md. */
+export function decide(req: DecideRequest, ctx: DecideContext): Promise<DecideResult> { return runDecide(req, ctx); }
 
 // ---- Future touchpoint stubs ----
 

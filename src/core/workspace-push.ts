@@ -1,4 +1,6 @@
-import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
+import { assertManagedFilesystemWrite, isManagedFilesystemPath, managedFilesystemRootFor } from './persistence/filesystem-guard.ts';
+import { OWNERSHIP_MARKER_GLOBS } from './persistence/root-metadata.ts';
+import { OperationError } from './ops/contract.ts';
 /**
  * workspace-push.ts — the `gbrain sources push` core: scan-gated
  * add → commit → pull → push for an agent-workspace repo
@@ -52,12 +54,12 @@ import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts'
  */
 
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { createHash, randomBytes } from 'crypto';
-import { execFileSync } from 'child_process';
-import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, detectDefaultBranch, divergenceSafePull } from './git-remote.ts';
+import { execFileSync, spawn } from './spawn.ts';
+import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, detectDefaultBranch, divergenceSafePull, type PullStrategy } from './git-remote.ts';
 import { loadConfigFileOnly } from './config.ts';
 import { ensureGbrainHome } from './gbrain-home.ts';
 import { invalidateBackupStatus, loadBackupStatus } from './backup/status-file.ts';
@@ -69,10 +71,13 @@ import {
 } from './repo-visibility.ts';
 import { isProcessAlive } from './pglite-lock.ts';
 import {
-  loadWorkspaceAllowlist, matchesGlob, pathAllowlisted, scanText,
+  ALLOWLIST_FINGERPRINT_MIN_HEX, loadWorkspaceAllowlist, matchesGlob, pathAllowlisted, scanText,
   SCAN_ALLOW_FILENAME, SCAN_MAX_FILE_BYTES,
   type SecretFinding,
 } from './secret-scan.ts';
+import { scanTextStream } from './secret-scan-stream.ts';
+import { shellQuote } from './mcp-registration.ts';
+import { gitChildEnv } from './git-env.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -102,9 +107,43 @@ export interface WorkspacePushResult {
   denyMatches?: string[];
   /** Untracked deny-glob matches excluded from staging (kept on disk). */
   excludedUntracked?: string[];
-  findings?: SecretFinding[];
+  findings?: PushSecretFinding[];
   /** Staged paths the secret scan could not read (fail-closed block reason). */
   unscannable?: string[];
+}
+
+/** Troubleshooting section for push refusals (DX-8 in docs/guides/write-refusals.md). */
+export const SECRET_SCAN_REFUSAL_DOCS =
+  'https://github.com/garrytan/gbrain/blob/master/docs/guides/write-refusals.md#secret-scan-refusals-and-redaction';
+
+/**
+ * An allowlist line that suppressed a private key's header-only value before
+ * the scanner claimed the key body too. The line no longer matches; the
+ * finding's current fingerprint is the reviewed replacement.
+ */
+export interface StaleAllowlistEntry {
+  entry: string;
+  replacement: string;
+}
+
+/**
+ * A blocking finding plus everything needed to act on it from any working
+ * directory (DX-3/ENG-11). The guidance rides here, not in `reason`, because
+ * `reason` is clipped to 140 chars by `sanitizePushReason` on every status
+ * surface.
+ */
+export interface PushSecretFinding extends SecretFinding {
+  file: string;
+  /** The gbrain version that added or changed the rule, when the scanner reports one. */
+  since?: string;
+  /** Absolute path of the `.gbrain-scan-allow` file the gate reads. */
+  allowlistPath: string;
+  /** Shell command appending this finding's fingerprint to the allowlist. */
+  allowCommand: string;
+  /** Shell command re-running this push, runnable from any directory. */
+  retryCommand: string;
+  docs: string;
+  staleAllowlistEntry?: StaleAllowlistEntry;
 }
 
 export interface WorkspacePushOpts {
@@ -112,6 +151,8 @@ export interface WorkspacePushOpts {
   dir: string;
   /** Branch to pull/push; default `detectDefaultBranch(root)`. */
   branch?: string;
+  /** How the pre-push pull reconciles divergence (`sources.config.pull_strategy`, #5429); default rebase. */
+  pullStrategy?: PullStrategy;
   /** Escape hatch for self-hosted git: skip the gh privacy verification [G8]. Logged. */
   allowUnverifiedRemote?: boolean;
   commitMessage?: string;
@@ -123,13 +164,28 @@ export interface WorkspacePushOpts {
   holdLockMs?: number;
 }
 
-/** Deny-glob backstop list [G6]. Matched with secret-scan's glob dialect. */
+/**
+ * Deny-glob backstop list [G6]. Matched with secret-scan's glob dialect.
+ * #5186: ownership markers (`OWNERSHIP_MARKER_GLOBS`) and the bootstrap lock
+ * are denied like credentials; the ownership token never reaches a remote.
+ */
 export const PUSH_DENY_GLOBS: readonly string[] = [
-  '*.pglite', '.env*', '*.pem', '*.key', '.gbrain/**',
+  '*.pglite', '.env*', '*.pem', '*.key', '.gbrain/**', ...OWNERSHIP_MARKER_GLOBS, '.gbrain-bootstrap.lock/**',
 ];
 
-/** Files larger than this are neither scanned nor considered text candidates. */
+/**
+ * Staged blobs up to this size are read whole and scanned in memory; larger
+ * ones are streamed through the windowed scan (secret-scan-stream.ts) up to
+ * PUSH_STREAM_SCAN_MAX_BYTES.
+ */
 export const PUSH_MAX_SCAN_BYTES = SCAN_MAX_FILE_BYTES;
+
+/**
+ * Hard ceiling of the streamed pre-push scan: a staged blob over it blocks the
+ * push as unscannable. Above the largest canonical file (a 256 MiB page plus
+ * its frontmatter).
+ */
+export const PUSH_STREAM_SCAN_MAX_BYTES = 512 * 1024 ** 2;
 
 // ── Cross-platform push lock [CX2-6, G14/A5] ────────────────────────────────
 
@@ -153,7 +209,9 @@ export type PushLockResult =
   | { acquired: false; holderPid: number | null };
 
 export function pushLockDir(repoRoot: string): string {
-  const hash = createHash('sha256').update(repoRoot).digest('hex').slice(0, 16);
+  let canonical = repoRoot;
+  try { canonical = realpathSync(repoRoot); } catch { /* absent or unresolvable: hash the raw path */ }
+  const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 16);
   return join(ensureGbrainHome(), 'locks', `push-${hash}.lock`);
 }
 
@@ -254,7 +312,7 @@ function git(
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: opts.timeoutMs ?? 60_000,
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, ...(opts.auth ? GIT_ENV_AUTH : GIT_ENV) },
+    env: gitChildEnv({ ...(opts.auth ? GIT_ENV_AUTH : GIT_ENV) }),
   }).toString();
 }
 
@@ -272,7 +330,7 @@ function gitBuffer(root: string, args: string[], timeoutMs = 60_000): Buffer {
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitChildEnv({ ...GIT_ENV }),
   });
 }
 
@@ -299,6 +357,117 @@ export function resolveWorkspaceRoot(dir: string): string | null {
 function listZ(root: string, args: string[]): string[] {
   const out = git(root, [...args, '-z']);
   return out.split('\0').filter((s) => s.length > 0);
+}
+
+/**
+ * Index blob id and size of each of `paths` (stage 0 entries only), from one
+ * `ls-files -s` and one `cat-file --batch-check`. Empty on any git error: a
+ * path missing here takes the whole-blob read, which fails closed.
+ */
+function stagedBlobSizes(root: string, paths: readonly string[]): Map<string, { oid: string; size: number }> {
+  const out = new Map<string, { oid: string; size: number }>();
+  try {
+    const wanted = new Set(paths);
+    const entries = listZ(root, ['ls-files', '-s']).flatMap((rec) => {
+      const m = /^(\d{6}) ([0-9a-f]+) 0\t(.*)$/s.exec(rec);
+      return m && m[1] !== '160000' && wanted.has(m[3]!) ? [{ oid: m[2]!, path: m[3]! }] : [];
+    });
+    if (entries.length === 0) return out;
+    const batch = execFileSync('git', ['-C', root, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], {
+      input: entries.map((e) => e.oid).join('\n') + '\n',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60_000,
+      maxBuffer: 64 * 1024 * 1024,
+      env: gitChildEnv({ ...GIT_ENV }),
+    }).toString();
+    const sizes = new Map<string, number>();
+    for (const line of batch.split('\n')) {
+      const [oid, type, size] = line.split(' ');
+      if (type === 'blob') sizes.set(oid!, Number(size));
+    }
+    for (const e of entries) {
+      const size = sizes.get(e.oid);
+      if (size !== undefined) out.set(e.path, { oid: e.oid, size });
+    }
+  } catch {
+    out.clear();
+  }
+  return out;
+}
+
+/**
+ * Stream one staged blob (`git cat-file blob <oid>`) through the windowed
+ * scan, never holding it whole. Throws when git fails, exceeds 10 minutes, or
+ * delivers a byte count other than the index recorded.
+ */
+async function scanStagedBlobStreamed(root: string, blob: { oid: string; size: number }, allowlist: string[]): Promise<SecretFinding[]> {
+  const child = spawn('git', ['-C', root, 'cat-file', 'blob', blob.oid], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: gitChildEnv({ ...GIT_ENV }),
+  });
+  const exited = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  exited.catch(() => {});
+  let stderr = '';
+  child.stderr.on('data', (d: Buffer) => { stderr = (stderr + d.toString()).slice(0, 200); });
+  let bytes = 0;
+  async function* counted(): AsyncGenerator<Uint8Array> {
+    for await (const chunk of child.stdout) {
+      bytes += (chunk as Buffer).length;
+      yield chunk as Buffer;
+    }
+  }
+  const timer = setTimeout(() => child.kill('SIGKILL'), 600_000);
+  try {
+    const findings = await scanTextStream(counted(), { allowlist });
+    const code = await exited;
+    if (code !== 0) throw new Error(`git cat-file exited ${code}: ${stderr.trim()}`);
+    if (bytes !== blob.size) throw new Error(`read ${bytes} of ${blob.size} bytes`);
+    return findings;
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+}
+
+/**
+ * Read and scan one staged, non-deleted blob: its findings, or the
+ * `unscannable` entry naming why it cannot be proven clean (fail closed).
+ * Up to PUSH_MAX_SCAN_BYTES (or when its size is unknown) the blob is read
+ * whole; above it, streamed by oid up to PUSH_STREAM_SCAN_MAX_BYTES.
+ */
+async function scanStagedBlob(
+  root: string, rel: string, staged: { oid: string; size: number } | undefined, allowlist: string[],
+): Promise<SecretFinding[] | string> {
+  if (staged && staged.size > PUSH_MAX_SCAN_BYTES) {
+    if (staged.size > PUSH_STREAM_SCAN_MAX_BYTES) return `${rel} (${staged.size}B exceeds the ${PUSH_STREAM_SCAN_MAX_BYTES}B scan ceiling)`;
+    try {
+      return await scanStagedBlobStreamed(root, staged, allowlist);
+    } catch (e) {
+      return `${rel} (unreadable: ${(e as Error).message.slice(0, 80)})`;
+    }
+  }
+  let blob: Buffer;
+  try {
+    blob = gitBuffer(root, ['cat-file', '-p', `:${rel}`]);
+  } catch (e) {
+    // NOT a deletion (the caller checked) — we cannot prove this file is clean.
+    // A blob we can't read (missing index entry, over maxBuffer, git error)
+    // must never sail through the only pre-push secret gate.
+    return `${rel} (unreadable: ${(e as Error).message.slice(0, 80)})`;
+  }
+  if (blob.length > PUSH_MAX_SCAN_BYTES) {
+    // Its size was not looked up, and it is too big to scan in-memory → block rather than exempt.
+    return `${rel} (${blob.length}B exceeds the ${PUSH_MAX_SCAN_BYTES}B scan cap)`;
+  }
+  // Binary (NUL-sniffed) files are scanned ANYWAY — a NUL byte doesn't mean
+  // the blob is secret-free (an ASCII key can sit inside a "binary" file).
+  // Buffer.toString('utf-8') keeps ASCII runs intact so the named patterns
+  // still fire; invalid byte sequences become U+FFFD and simply don't match.
+  const text = blob.toString('utf-8');
+  return scanText(text, { allowlist });
 }
 
 /**
@@ -388,6 +557,8 @@ export interface PushStatusEntry {
   reason?: string;
   ahead?: number;
   repoRoot?: string;
+  /** #6083: machine code of a refusal (`writer_coordinator_required` on a managed worktree). */
+  code?: string;
   /** Absolute path of the status file (per-root announce-state keying). */
   file: string;
 }
@@ -459,6 +630,21 @@ export function readPushStatusForRoot(root: string): PushStatusEntry | null {
   return readPushStatuses().find((e) => e.repoRoot === root) ?? null;
 }
 
+/**
+ * #5432: the push-status record that belongs to workspace `ws`, or null. A
+ * record matches by its repoRoot (symlinks resolved on both sides); a single
+ * legacy record with no repoRoot is attributed to `ws`. Another root's record
+ * is never reported as this workspace's push state.
+ */
+export function pushStatusForWorkspace(entries: readonly PushStatusEntry[], ws: string): PushStatusEntry | null {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- comparison only: normalizes the operator's own push-status repoRoot and workspace path to compare them; nothing is read or written at the resolved path
+  const real = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+  const target = real(ws);
+  const own = entries.find((e) => e.repoRoot !== undefined && real(e.repoRoot) === target);
+  if (own) return own;
+  return entries.length === 1 && entries[0]!.repoRoot === undefined ? entries[0]! : null;
+}
+
 /** One aggregation for every status surface (SessionStart note, doctor,
  * banner counting): the failing entries and the stalest success timestamp. */
 /** Failure reasons carry remote-influenced text (git stderr → rung log →
@@ -471,6 +657,133 @@ export function sanitizePushReason(reason: string | undefined): string {
   return reason.replace(/[^\x20-\x7E]/g, ' ').replace(/[`$\\]/g, "'").slice(0, 140);
 }
 
+const PUSH_REASON_MAX_CHARS = 140;
+
+/**
+ * The `blocked_secrets` reason: a summary that `sanitizePushReason` passes
+ * through unclipped, so hook and doctor surfaces show the count, the first
+ * location and where the fix steps are. The location keeps its tail (file
+ * name and line) when the budget is short.
+ */
+export function blockedSecretsReason(findings: readonly PushSecretFinding[]): string {
+  const first = findings[0]!;
+  const head = `${findings.length} secret finding(s), first `;
+  const tail = ` [${first.pattern}]; nothing committed. Run gbrain sources push for fix steps`;
+  const budget = PUSH_REASON_MAX_CHARS - head.length - tail.length;
+  const loc = `${first.file}:${first.line}`;
+  const shown = loc.length <= budget ? loc : `...${loc.slice(-Math.max(1, budget - 3))}`;
+  return `${head}${shown}${tail}`.slice(0, PUSH_REASON_MAX_CHARS);
+}
+
+/**
+ * DX-4: before the scanner learned truncated key bodies, a private key with
+ * no END fence in view was claimed header-only, so an allowlist line could
+ * hold the fingerprint of the bare BEGIN header. The scanner reports that
+ * pre-wave fingerprint as `legacyFingerprint`; return the allowlist entry it
+ * matches, if any.
+ */
+function staleHeaderOnlyEntry(legacyFingerprint: string | undefined, allowlist: readonly string[]): string | undefined {
+  if (!legacyFingerprint) return undefined;
+  const legacyHex = legacyFingerprint.slice('sha256:'.length);
+  return allowlist.find((entry) => {
+    if (!entry.startsWith('sha256:')) return false;
+    const prefix = entry.slice('sha256:'.length).toLowerCase();
+    return prefix.length >= ALLOWLIST_FINGERPRINT_MIN_HEX && prefix.startsWith(legacyHex);
+  });
+}
+
+/** The exact `gbrain sources push` invocation that re-runs this push from any directory. */
+function pushRetryCommand(opts: WorkspacePushOpts): string {
+  return [
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- display only: the printed retry command names the caller's own workspace dir; nothing is read or written here.
+    'gbrain sources push --path', shellQuote(resolve(opts.dir)),
+    ...(opts.branch ? ['--branch', shellQuote(opts.branch)] : []),
+    ...(opts.allowUnverifiedRemote ? ['--allow-unverified-remote'] : []),
+  ].join(' ');
+}
+
+/** Attach the DX-3 refusal guidance to one file's findings; no value ever reaches the output. */
+export function buildPushFindings(input: {
+  file: string;
+  findings: readonly SecretFinding[];
+  allowlist: readonly string[];
+  allowlistPath: string;
+  retryCommand: string;
+}): PushSecretFinding[] {
+  return input.findings.map(({ legacyFingerprint, ...f }) => {
+    const out: PushSecretFinding = {
+      ...f,
+      file: input.file,
+      allowlistPath: input.allowlistPath,
+      allowCommand: `printf '\\n%s\\n' ${f.fingerprint} >> ${shellQuote(input.allowlistPath)}`,
+      retryCommand: input.retryCommand,
+      docs: SECRET_SCAN_REFUSAL_DOCS,
+    };
+    const entry = staleHeaderOnlyEntry(legacyFingerprint, input.allowlist);
+    if (entry) out.staleAllowlistEntry = { entry, replacement: f.fingerprint };
+    return out;
+  });
+}
+
+/**
+ * Human rendering of a `blocked_secrets` result for `gbrain sources push`.
+ * Every line comes from the structured findings, so the CLI text and the
+ * `--json` output carry the same commands.
+ */
+export function formatBlockedSecrets(findings: readonly PushSecretFinding[]): string[] {
+  const version = (since: string) => `gbrain v${since.replace(/^v/, '')}`;
+  const lines = ['PUSH BLOCKED — secret scan findings (nothing committed):'];
+  for (const f of findings) {
+    lines.push(`  ${f.file}:${f.line} [${f.pattern}] ${f.redactedPreview}`);
+    lines.push(`    fingerprint: ${f.fingerprint}`);
+    if (f.since) lines.push(`    rule [${f.pattern}] blocks pushes since ${version(f.since)}`);
+    if (f.staleAllowlistEntry) {
+      const { entry, replacement } = f.staleAllowlistEntry;
+      lines.push(
+        `    stale allowlist entry: ${entry} matched only this key's BEGIN header ` +
+          `${f.since ? `before ${version(f.since)}` : 'before this version'}; the fingerprint now covers the key body.`,
+      );
+      lines.push(`    if the key is a reviewed false positive, replace that line in ${shellQuote(f.allowlistPath)} with: ${replacement}`);
+    }
+    lines.push(`    allow this finding: ${f.allowCommand}`);
+  }
+  const first = findings[0];
+  if (!first) return lines;
+  lines.push(
+    'Remove a real credential from the file (and rotate it) first. Allowlist only a reviewed false positive',
+    `with the "allow this finding" command above (it appends to ${shellQuote(first.allowlistPath)}), then retry:`,
+    `  ${first.retryCommand}`,
+    `Docs: ${first.docs}`,
+  );
+  return lines;
+}
+
+/**
+ * #5799: a recorded push status that no longer describes a live legacy push.
+ * On a managed canonical worktree the legacy push is fenced
+ * (`writer_coordinator_required`) and the coordinator's git effect publishes
+ * page writes without ever writing push-status, so the refusal record (or a
+ * success from before the worktree was claimed) would feed the FAILING
+ * banner and the staleness note forever. True for a refusal record (its
+ * `code`, or the `reason` prefix an older record carries) and for any record
+ * whose root is a managed worktree now. A root whose marker cannot be read
+ * is not assumed managed.
+ */
+export function isSupersededPushStatus(entry: Pick<PushStatusEntry, 'code' | 'reason' | 'repoRoot'>): boolean {
+  if (entry.code === 'writer_coordinator_required' || entry.reason?.startsWith('writer_coordinator_required:')) return true;
+  if (entry.repoRoot === undefined) return false;
+  try {
+    return isManagedFilesystemPath(entry.repoRoot);
+  } catch {
+    return false;
+  }
+}
+
+/** The recorded statuses that still describe a live legacy push (#5799); the status surfaces read these. */
+export function livePushStatuses(entries: readonly PushStatusEntry[]): PushStatusEntry[] {
+  return entries.filter((e) => !isSupersededPushStatus(e));
+}
+
 export function summarizePushStatuses(entries: PushStatusEntry[]): {
   failing: PushStatusEntry[];
   stalestTs: number | null;
@@ -481,7 +794,7 @@ export function summarizePushStatuses(entries: PushStatusEntry[]): {
 }
 
 function writePushStatus(
-  status: { ts: string; ok: boolean; reason?: string; ahead?: number; repoRoot: string },
+  status: { ts: string; ok: boolean; reason?: string; ahead?: number; repoRoot: string; code?: string },
 ): void {
   try {
     const p = pushStatusPathForRoot(status.repoRoot);
@@ -509,15 +822,49 @@ export function aheadCount(root: string, branch: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/**
+ * #5606: `sources push` on a managed canonical worktree is refused with the
+ * managed equivalent named, not a bare "submit through the coordinator": the
+ * persistence owner's Git effect is the writer for page files, the writer
+ * verbs check and enable it, and files that are not pages are the operator's
+ * to push with plain git. Same code, so every surface that keys on it still does.
+ */
+export function managedPushRefusal(dir: string, root: string | null | undefined, cause: OperationError): OperationError {
+  const managed = managedFilesystemRootFor(root ?? dir) ?? managedFilesystemRootFor(dir);
+  const source = managed?.sourceId;
+  const name = source ?? '<source>';
+  const error = new OperationError('writer_coordinator_required',
+    `${managed?.root ?? root ?? dir} is the managed canonical worktree${source ? ` of source ${source}` : ''}; gbrain sources push is not its Git writer.`,
+    `Page writes there are committed and pushed by the persistence owner's Git effect, not by sources push. Check it with gbrain sources writer status${source ? ` ${source}` : ''} --json `
+    + `(git_durability, parked effects). If git_durability is off or unknown, enable it with gbrain sources writer git-durability ${name} --enable --dry-run, then the apply command it prints; `
+    + `after a push credential change, gbrain sources writer git-durability ${name} --pat-file <path> re-wires it and retries the parked pushes. `
+    + 'Files that are not gbrain pages (MEMORY.md, daily notes) are not published by the owner: review the diff and push them with plain git; the sources push secret scan does not run then.');
+  error.detail = cause.detail;
+  return error;
+}
+
 export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspacePushResult> {
-  assertManagedFilesystemWrite(opts.dir);
   const log = (line: string) => opts.logger?.(line);
 
   const root = resolveWorkspaceRoot(opts.dir);
+  try {
+    assertManagedFilesystemWrite(opts.dir);
+    if (root) assertManagedFilesystemWrite(root);
+  } catch (e) {
+    // #5198: the managed-worktree guard refuses before the lock and before
+    // finish(), so without this the previous success stays on record and every
+    // status surface calls a push that can never run "stale" instead of failing.
+    // No lock winner can be in flight here: the same guard refuses every legacy
+    // push of this root.
+    const refusal = e instanceof OperationError && e.code === 'writer_coordinator_required' ? managedPushRefusal(opts.dir, root, e) : e;
+    if (root && refusal instanceof OperationError) {
+      writePushStatus({ ts: new Date().toISOString(), ok: false, code: refusal.code, reason: `${refusal.code}: ${refusal.message}`, repoRoot: root });
+    }
+    throw refusal;
+  }
   if (!root) {
     return { ok: false, status: 'error', reason: `not a git repository: ${opts.dir}` };
   }
-  assertManagedFilesystemWrite(root);
   const branch = opts.branch || detectDefaultBranch(root);
 
   // ONE lock spans scan → stage → commit → pull → push [G14/A5, CX2-6].
@@ -632,10 +979,11 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // 4. secret scan over the STAGED content. This is the SOLE
     // block-secrets-before-they-leave control, so it FAILS CLOSED: the only
     // benign "no blob" case is a staged DELETION (removes content — nothing to
-    // leak); every OTHER unscannable case (cat-file error, oversized blob)
-    // BLOCKS the push naming the path, rather than silently exempting it.
-    // `git cat-file -p :<path>` reads the index blob verbatim (no filters) —
-    // exactly what a commit would record.
+    // leak); every OTHER unscannable case (cat-file error, a blob over
+    // PUSH_STREAM_SCAN_MAX_BYTES) BLOCKS the push naming the path, rather than
+    // silently exempting it. `git cat-file -p :<path>` reads the index blob
+    // verbatim (no filters) — exactly what a commit would record; a blob over
+    // PUSH_MAX_SCAN_BYTES is streamed by its index oid and scanned in windows.
     let stagedDeletions: Set<string>;
     try {
       stagedDeletions = new Set(listZ(root, ['diff', '--cached', '--name-only', '--diff-filter=D']));
@@ -646,46 +994,30 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
       stagedDeletions = new Set();
     }
     const allowlist = loadWorkspaceAllowlist(root);
-    const findings: SecretFinding[] = [];
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed filename under the resolved workspace root (same path loadWorkspaceAllowlist reads); used only in printed guidance.
+    const allowlistPath = join(root, SCAN_ALLOW_FILENAME);
+    const retryCommand = pushRetryCommand(opts);
+    const findings: PushSecretFinding[] = [];
     const unscannable: string[] = [];
+    const stagedBlobs = stagedBlobSizes(root, stagedForScan);
     for (const rel of stagedForScan) {
       if (pathAllowlisted(rel, allowlist)) continue; // user-declared safe path
       if (stagedDeletions.has(rel)) continue;        // deletion — no content to scan
-      let blob: Buffer;
-      try {
-        blob = gitBuffer(root, ['cat-file', '-p', `:${rel}`]);
-      } catch (e) {
-        // NOT a deletion (checked above) — we cannot prove this file is clean.
-        // A blob we can't read (missing index entry, over maxBuffer, git error)
-        // must never sail through the only pre-push secret gate.
-        unscannable.push(`${rel} (unreadable: ${(e as Error).message.slice(0, 80)})`);
+      const fileFindings = await scanStagedBlob(root, rel, stagedBlobs.get(rel), allowlist);
+      if (typeof fileFindings === 'string') {
+        unscannable.push(fileFindings);
         continue;
       }
-      if (blob.length > PUSH_MAX_SCAN_BYTES) {
-        // Too big to scan in-memory → block rather than exempt.
-        unscannable.push(`${rel} (${blob.length}B exceeds the ${PUSH_MAX_SCAN_BYTES}B scan cap)`);
-        continue;
-      }
-      // Binary (NUL-sniffed) files are scanned ANYWAY — a NUL byte doesn't mean
-      // the blob is secret-free (an ASCII key can sit inside a "binary" file).
-      // Buffer.toString('utf-8') keeps ASCII runs intact so the named patterns
-      // still fire; invalid byte sequences become U+FFFD and simply don't match.
-      for (const f of scanText(blob.toString('utf-8'), { allowlist })) {
-        findings.push({ ...f, file: rel });
+      if (fileFindings.length === 0) continue;
+      for (const f of buildPushFindings({ file: rel, findings: fileFindings, allowlist, allowlistPath, retryCommand })) {
+        findings.push(f);
       }
     }
     if (findings.length > 0) {
       // Restore the index to HEAD (disk files untouched) — a blocked push
       // leaves nothing staged and nothing committed, same as before.
       tryGit(root, ['reset', '-q']);
-      const summary = findings
-        .slice(0, 10)
-        .map((f) => `${f.file}:${f.line} [${f.pattern}]`)
-        .join(', ');
-      const reason =
-        `secret scan found ${findings.length} finding(s): ${summary}` +
-        `${findings.length > 10 ? ', …' : ''} — nothing committed. ` +
-        `Add a fingerprint or glob line to ${SCAN_ALLOW_FILENAME} to override a false positive.`;
+      const reason = blockedSecretsReason(findings);
       log(`PUSH BLOCKED: ${reason}`);
       return finish({
         ok: false, status: 'blocked_secrets', repoRoot: root, branch, findings, reason,
@@ -699,7 +1031,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
       const reason =
         `secret scan could not read ${unscannable.length} staged file(s): ${summary} — nothing committed. ` +
         `The pre-push secret gate fails closed: remove the file from the index (git rm --cached <path>), ` +
-        `keep it under the scan cap (${PUSH_MAX_SCAN_BYTES}B), or allowlist it in ${SCAN_ALLOW_FILENAME}.`;
+        `keep it under the scan ceiling (${PUSH_STREAM_SCAN_MAX_BYTES}B), or allowlist it in ${SCAN_ALLOW_FILENAME}.`;
       log(`PUSH BLOCKED: ${reason}`);
       return finish({
         ok: false, status: 'blocked_unscannable', repoRoot: root, branch, unscannable, reason,
@@ -770,7 +1102,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // 6. pull AFTER commit [CX2-7] — a dirty tree is impossible here short of
     // a mid-run writer, and divergenceSafePull handles that as skipped_dirty.
     try {
-      const pull = divergenceSafePull(root, branch);
+      const pull = divergenceSafePull(root, branch, { strategy: opts.pullStrategy });
       if (pull.status === 'conflict_aborted') {
         return finish({
           ok: false, status: 'pull_conflict', repoRoot: root, branch, committed,

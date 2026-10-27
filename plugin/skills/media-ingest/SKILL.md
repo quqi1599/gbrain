@@ -32,6 +32,7 @@ writes_to:
   - companies/
   - sources/
 upstream: media-ingest@fc834ee
+when_to_use: "Use when the user asks: \"watch this video\", \"process this YouTube link\", \"ingest this PDF\", \"save this podcast\", \"process this book\"."
 ---
 
 # Media Ingest Skill
@@ -136,6 +137,14 @@ Brain page created with summary, highlights, and entity cross-links. Report to u
 3. **Book OCR quality varies wildly.** Scanned PDFs often have garbled text. If OCR quality is <80% readable, flag to user rather than ingesting garbage.
 4. **Video transcript without speaker diarization is low-value.** If multiple speakers are present but no diarization is available, note this limitation prominently rather than attributing all speech to one person.
 5. **Large audio files (>2hr) can timeout transcription services.** Split into chunks before transcription if needed.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Transcription fails: write `[transcript unavailable]` and continue with metadata; never fabricate content.
+- A transient API failure (network, `timeout`, `rate_limited`): retry once. On an auth failure, abort and tell the user which provider key is missing.
+- `file_upload` refused (size, path outside the allowed root): tell the user the raw file was not stored and keep a pointer in the page.
 
 ## Anti-Patterns
 

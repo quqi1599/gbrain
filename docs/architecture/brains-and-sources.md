@@ -41,6 +41,14 @@ AND under `source=gstack` — they're different pages.
 Routing: `--source <id>`, `GBRAIN_SOURCE`, `.gbrain-source` dotfile, or
 registered `local_path` match in the `sources` table.
 
+A few commands have their own `--source` option for provenance:
+`timeline-add`, `ontology-add`, `takes add|update|supersede` and the raw-data
+operations. On those, `--source` is the provenance value (a slug, URL or
+source name) and never picks the repo, on a local brain, through a running
+`gbrain serve` or on a thin client. The write goes to the source that
+`GBRAIN_SOURCE`, `.gbrain-source` or the defaults select, and the JSON result
+names it in `source_id`.
+
 ### When does each axis move?
 
 | You want to | Adjust |
@@ -294,11 +302,24 @@ gbrain extract links --source db                      # re-extract once; --stale
 
 Without the flag, an isolated (`federated=false`) source only writes edges
 whose both endpoints live in that source; a federated source may also link
-into the configured default source (`sources.default`). With the flag on, a
-target that exists only in other sources resolves to the lexicographically
-smallest source id, so repeated extracts converge on the same row. The read
-side is unchanged: a federated caller's source grant still scopes every link
-read.
+into the configured default source (`sources.default`) and follow an
+explicit `[[source:slug]]` reference. With the flag on, a target that exists
+only in other sources resolves to the lexicographically smallest source id,
+so repeated extracts converge on the same row.
+
+Every automatic writer applies that one policy: `put_page` and `capture`
+(link preparation), the managed stale pass, the source reconciliation sweep
+and `extract links --source db`. A local write resolves a cross-source
+wikilink only under `link_resolution.cross_source` or from a federated origin
+source; the drops it counts come back in the write receipt as
+`auto_links.skipped_cross_source`. An outbound edge always originates in the
+page's own source (canonical attendance, which points at the person, is the
+one edge whose far endpoint may live elsewhere), and a derived edge records
+whether its reference was authored qualified (`links.resolution_type`:
+`qualified` for `[[source:slug]]`, `unqualified` otherwise). The read side is
+unchanged: a federated caller's source grant still scopes both endpoints of
+every link read, and the entity card confines an untrusted caller's edges to
+the card's own source.
 
 ## What confines remote callers (and what does not)
 
@@ -325,8 +346,11 @@ counting. Graph enrichment uses the same source and page-visibility policy.
 
 **Page-level `visibility: private` is enforced for remote callers by default.**
 The exact frontmatter value `private` hides that concrete page row;
-`visibility: local`, absent visibility, and other values do not. Trusted local
-CLI callers retain access. Operator settings can opt out of private-page
+`visibility: local`, absent visibility, and other values do not, except on
+derived pages: an extracted atom or synthesized concept with no `visibility`
+is private, an atom whose origin page is private is hidden, and so is a
+synthesized concept built from a private atom. Trusted local CLI callers
+retain access. Operator settings can opt out of private-page
 filtering, so source grants remain an independent boundary: keep content in an
 ungranted source when remote callers must have no access to that source.
 

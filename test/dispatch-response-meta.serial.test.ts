@@ -37,6 +37,8 @@ const { dispatchToolCall } = await import('../src/mcp/dispatch.ts');
 
 const engineStub = {
   getConfig: async () => null,
+  // Cat 40 Hard F2: the strict keyword count every search reports (no matches here).
+  countKeywordPages: async () => 0,
   executeRaw: async (sql: string) => sql.includes('AS pending') ? [{ pending: false }] : [],
 } as unknown as BrainEngine;
 
@@ -65,11 +67,15 @@ describe('dispatch response meta (WP2/D3/D8)', () => {
     expect(out.isError).toBeUndefined();
     // Body block 0 stays the bare array (deployed thin-clients parse only this).
     expect(JSON.parse(out.content[0].text)).toEqual([]);
-    // D8: the model-visible diagnosis block.
-    expect(out.content.length).toBe(2);
-    expect(out.content[1].text).toContain('0 results');
-    expect(out.content[1].text).toContain('retrieved 3');
-    expect(out.content[1].text).toContain('degraded: embed_unavailable');
+    // D8: the model-visible diagnosis block, then F3's degraded_recall notice
+    // (agent contract v1: a recall-affecting stage always rides a notice).
+    // F2: the keyword count line rides right after the rows, before the notices.
+    expect(out.content.length).toBe(4);
+    expect(out.content[1].text).toStartWith('[gbrain search] Rows are a ranked top-K');
+    expect(out.content[3].text).toStartWith('[gbrain notice degraded_recall kind=degraded]');
+    expect(out.content[2].text).toContain('0 results');
+    expect(out.content[2].text).toContain('retrieved 3');
+    expect(out.content[2].text).toContain('degraded: embed_unavailable');
     const retrieval = (out._meta as Record<string, any>).retrieval;
     expect(retrieval.returned_count).toBe(0);
     expect(retrieval.retrieved_count).toBe(3);
@@ -80,18 +86,22 @@ describe('dispatch response meta (WP2/D3/D8)', () => {
     nextResults = [];
     nextMeta = { vector_enabled: true, expansion_applied: false, detail_resolved: null };
     const out = await callSearch();
-    expect(out.content.length).toBe(2);
-    expect(out.content[1].text).toContain('clean miss');
+    expect(out.content.length).toBe(3);
+    expect(out.content[1].text).toContain('Keyword matches: 0 pages');
+    expect(out.content[2].text).toContain('clean miss');
     const retrieval = (out._meta as Record<string, any>).retrieval;
     expect(retrieval.degraded).toBeUndefined();
     expect(retrieval.vector_enabled).toBe(true);
   });
 
-  test('non-empty results → single block, _meta.retrieval still present (D3: on ALL responses)', async () => {
+  test('non-empty results → body + degraded_recall notice only, _meta.retrieval still present (D3: on ALL responses)', async () => {
     nextResults = [{ page_id: 1, source_id: 'default', slug: 'a', chunk_text: 'x' }];
     nextMeta = DEGRADED_META;
     const out = await callSearch();
-    expect(out.content.length).toBe(1);
+    // No empty-retrieval block; F3's degraded notice rides every affected HTTP call.
+    expect(out.content.length).toBe(3);
+    expect(out.content[1].text).toStartWith('[gbrain search] Rows are a ranked top-K');
+    expect(out.content[2].text).toStartWith('[gbrain notice degraded_recall kind=degraded]');
     const retrieval = (out._meta as Record<string, any>).retrieval;
     expect(retrieval.returned_count).toBe(1);
   });

@@ -160,9 +160,11 @@ describe('__all__ is never narrower than an unqualified read', () => {
     expect(federatedSearchScope(ctx, '__all__')).toEqual({
       sourceIds: ['default', 'src-a', 'src-b'],
     });
-    // Transport federation preserves unqualified reads; it does not grant an
-    // arbitrary explicit source to a caller without a durable source grant.
-    expect(() => federatedSearchScope(ctx, 'src-a')).toThrow('outside your granted sources');
+    // #5081 (CEO-A12): an explicit source inside the transport's federated
+    // set is admitted (never wider than the unqualified read above); any
+    // other explicit source is still refused.
+    expect(federatedSearchScope(ctx, 'src-a')).toEqual({ sourceId: 'src-a' });
+    expect(() => federatedSearchScope(ctx, 'src-z')).toThrow('outside your granted sources');
   });
 
   test('remote scalar scope stays pinned when no transport federation exists', () => {
@@ -196,14 +198,14 @@ describe('__all__ is never narrower than an unqualified read', () => {
 
 describe('cli makeContext — no silent default fallback for explicit --source', () => {
   test('--source __all__ produces ctx.sourceId __all__ (was: silent default)', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     const ctx = await makeContext(makeStub(['default']), { source: '__all__' });
     expect(ctx.sourceId).toBe('__all__');
     expect(ctx.remote).toBe(false);
   });
 
   test('an explicit --source that fails to resolve throws instead of becoming default', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     await expect(makeContext(makeStub(['default']), { source: 'ghost' }))
       .rejects.toThrow(/not found/);
     await expect(makeContext(makeStub(['default']), { source: 'my_source' }))
@@ -211,7 +213,7 @@ describe('cli makeContext — no silent default fallback for explicit --source',
   });
 
   test('ambient resolution failure still falls back silently (pre-init brains)', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     const broken = {
       kind: 'pglite',
       executeRaw: async () => { throw new Error('relation "sources" does not exist'); },

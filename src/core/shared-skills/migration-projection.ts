@@ -1,7 +1,8 @@
 import type { BrainEngine } from '../engine.ts';
 import type { ParsedMarkdown } from '../markdown.ts';
 import { OperationError } from '../ops/contract.ts';
-import { prepareCanonicalProjections } from '../persistence/canonical-projections.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { compileCanonicalProjections } from '../persistence/canonical-projections.ts';
 import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
 import { parseFactsFence } from '../facts-fence.ts';
 import { parseTakesFence } from '../takes-fence.ts';
@@ -26,8 +27,25 @@ function differences(stored: Row, expected: Row): string[] {
   });
 }
 
+/**
+ * A malformed fence refuses typed (`invalid_fence`) instead of being normalized here (#6188, E16):
+ * the fix is the fence repair preview of that page.
+ */
+function compileForExport(page: ParsedMarkdown, sourceId: string): void {
+  try {
+    compileCanonicalProjections(page, page.slug, sourceId);
+  } catch (error) {
+    if (!(error instanceof OperationError) || error.canonicalCode !== 'invalid_fence') throw error;
+    const argv = ['gbrain', 'repair', 'fences', '--source', sourceId, '--slug', page.slug];
+    error.suggestion = `Page ${page.slug} in source ${sourceId} was not exported: the fence the message names does not parse. Preview its repair with ${argv.join(' ')} `
+      + '(read-only; it names the exact edit when gbrain will not repair it), apply the plan it prints, then preview the export again.';
+    error.fix = readFix(`Previews the fence repair of ${page.slug}, read-only, with the apply command.`, { argv });
+    throw error;
+  }
+}
+
 export async function assertExportProjectionRoundtrip(engine: BrainEngine, page: ParsedMarkdown, pageId: number, sourceId: string): Promise<void> {
-  prepareCanonicalProjections(page, page.slug, sourceId);
+  compileForExport(page, sourceId);
   const fields = [page.compiled_truth, page.timeline];
   const facts = extractFactsFromFenceText(fields.flatMap(field => parseFactsFence(field).facts), page.slug, sourceId);
   const takes = fields.flatMap(field => parseTakesFence(field).takes);
@@ -63,7 +81,10 @@ export async function assertExportProjectionRoundtrip(engine: BrainEngine, page:
     if (!take || !base) { conflicts.push(`takes row ${stored.row_num}: missing canonical row`); continue; }
     let resolution: ReturnType<typeof deriveResolutionTuple> | null = null;
     if (take.resolvedQuality !== undefined) {
-      if (!take.resolvedBy) throw new OperationError('unsupported_export_data', `Canonical takes row ${take.rowNum} has a resolution without resolved_by. Restore the recorded resolver in the fence before export; no identity was inferred.`);
+      if (!take.resolvedBy) {
+        throw new OperationError('unsupported_export_data', `Canonical takes row ${take.rowNum} has a resolution without resolved_by. Restore the recorded resolver in the fence before export; no identity was inferred.`,
+          `Add the resolver to takes row ${take.rowNum}'s resolved_by column, then preview the export again; gbrain never guesses who resolved a take.`);
+      }
       resolution = deriveResolutionTuple({ quality: take.resolvedQuality, resolvedBy: take.resolvedBy });
     }
     const expected: Row = { ...base, resolved_at: take.resolvedAt ?? null, resolved_quality: resolution?.quality ?? null,
@@ -74,5 +95,8 @@ export async function assertExportProjectionRoundtrip(engine: BrainEngine, page:
     if (changed.length) conflicts.push(`takes row ${take.rowNum}: ${changed.join(', ')}`);
   }
   for (const take of takes) if (!storedTakes.some(row => row.row_num === take.rowNum)) conflicts.push(`takes row ${take.rowNum}: would insert a missing database row`);
-  if (conflicts.length) throw new OperationError('unsupported_export_data', `Canonical projection would change database fields (${conflicts.slice(0, 20).join('; ')}${conflicts.length > 20 ? '; additional rows differ' : ''}). Reconcile the source fences before export; no rows or files were changed.`);
+  if (conflicts.length) {
+    throw new OperationError('unsupported_export_data', `Canonical projection would change database fields (${conflicts.slice(0, 20).join('; ')}${conflicts.length > 20 ? '; additional rows differ' : ''}). Reconcile the source fences before export; no rows or files were changed.`,
+      'Make the page\'s Facts and Takes fences match the stored rows listed in the message (or leave the page database-only), then preview the export again.');
+  }
 }

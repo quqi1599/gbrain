@@ -8,16 +8,18 @@
  * (stdio + OAuth enabled-state coverage rides the hermetic e2e fixture,
  * test/e2e/ambient-writeback-lifecycle.serial.test.ts — those transports need
  * a real subprocess/app boot. The three existing byte-exact OFF pins are
- * test/e2e/serve-stdio-roundtrip.test.ts, test/http-transport.test.ts, and
- * test/e2e/connect-bearer.test.ts and run unchanged.)
+ * test/serve-stdio-roundtrip.test.ts, test/http-transport.test.ts, and
+ * test/connect-bearer.test.ts and run unchanged.)
  */
 import { describe, test, expect, afterAll } from 'bun:test';
 import { createHash } from 'node:crypto';
 
 import { buildAmbientWritebackSection } from '../src/core/facts/writeback-instructions.ts';
 import { GBRAIN_MCP_INSTRUCTIONS, buildMcpInstructions } from '../src/mcp/instructions.ts';
+import { contractFor } from './helpers/instructions-parity.ts';
 import { startHttpTransport } from '../src/mcp/http-transport.ts';
 import { RateLimiter } from '../src/mcp/rate-limit.ts';
+import { emptyHome, withEnv } from './helpers/with-env.ts';
 
 const BASE_OPTS = {
   mode: 'salient' as const,
@@ -72,6 +74,12 @@ describe('buildAmbientWritebackSection (F1 leaf — the single source)', () => {
     expect(priv).toContain('not by remote sessions');
   });
 
+  test('#5671 private posture states the remote read-back consequence in the instruction itself', () => {
+    const priv = buildAmbientWritebackSection({ ...BASE_OPTS, visibility: 'private' });
+    expect(priv).toContain('you, and every other MCP or HTTP session, cannot recall or forget a fact you save as private');
+    expect(buildAmbientWritebackSection(BASE_OPTS)).not.toContain('cannot recall');
+  });
+
   test('every requirement-3 bullet is present (skip-list, no assistant inference, no raw transcripts, provenance, one claim, scope, silence, durable-no-ttl)', () => {
     const s = buildAmbientWritebackSection(BASE_OPTS);
     expect(s).toContain('ONE claim per call');
@@ -96,9 +104,14 @@ describe('buildMcpInstructions composition', () => {
     expect(buildMcpInstructions({})).toBe(GBRAIN_MCP_INSTRUCTIONS);
     expect(buildMcpInstructions({ writeback: null })).toBe(GBRAIN_MCP_INSTRUCTIONS);
   });
-  test('enabled → base + blank line + section, base untouched', () => {
+  // #6170 replaced the "base untouched" pin on purpose: capped harnesses read only
+  // the first 2,048 characters, so the base carries a short writeback line.
+  test('enabled → base = contract with the writeback line in place of the opt-in line, then a blank line and the section last', () => {
     const out = buildMcpInstructions({ writeback: BASE_OPTS });
-    expect(out.startsWith(GBRAIN_MCP_INSTRUCTIONS + '\n\n')).toBe(true);
+    const line = `Ambient writeback is ON (${BASE_OPTS.mode}): unprompted, \`remember\` the user's preferences, corrections, decisions and commitments`;
+    const head = out.slice(0, out.length - buildAmbientWritebackSection(BASE_OPTS).length);
+    expect(head.endsWith('\n\n')).toBe(true);
+    expect(head.trimEnd()).toBe(GBRAIN_MCP_INSTRUCTIONS.replace('Automatic capture is opt-in.', `${line} (rules below).`));
     expect(out.endsWith(buildAmbientWritebackSection(BASE_OPTS))).toBe(true);
   });
 });
@@ -114,7 +127,11 @@ describe('legacy bearer transport serves the shared builder output (parity)', ()
   let stop: (() => void) | null = null;
   afterAll(() => stop?.());
 
-  test('enabled config → initialize carries base+section; config blip → last-known-good bundle; fresh engine off → base', async () => {
+  // The transport reads the process config (loadConfig) for its readiness tail. In a Postgres lane DATABASE_URL alone
+  // yields an env-derived config, so the tail ("Setup now …") appeared and parity broke whenever DATABASE_URL was set.
+  // This fake engine has no process config: pin that, independent of the lane's environment.
+  test('enabled config → initialize carries base+section; config blip → last-known-good bundle; fresh engine off → base', () =>
+    withEnv({ DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined, GBRAIN_HOME: emptyHome() }, async () => {
     const rows = new Map<string, string>([
       ['memory.auto_writeback', 'salient'],
       ['memory.auto_writeback_transient_ttl', '12h'],
@@ -126,7 +143,7 @@ describe('legacy bearer transport serves the shared builder output (parity)', ()
       kind: 'postgres',
       executeRaw: async (sql: string, params?: unknown[]) => {
         const norm = sql.replace(/\s+/g, ' ').trim().toLowerCase();
-        if (norm.startsWith('select id, name')) {
+        if (norm.startsWith('select id, name') || norm.startsWith('select * from access_tokens')) {
           const row = validTokens.get(params?.[0] as string);
           return row ? [{ ...row, permissions: { takes_holders: ['world'] } }] : [];
         }
@@ -159,14 +176,19 @@ describe('legacy bearer transport serves the shared builder output (parity)', ()
       return body.result?.instructions;
     };
 
-    const expected = buildMcpInstructions({
-      writeback: { mode: 'salient', transientTtl: '12h', visibility: 'private', extractFactsAvailable: true },
-    });
+    // F1: the contract is generated for this token's tools/list.
+    const listed = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    }).then(r => r.json() as Promise<{ result: { tools: Array<{ name: string }> } }>);
+    const expected = contractFor(listed.result.tools.map(t => t.name),
+      { mode: 'salient', transientTtl: '12h', visibility: 'private', extractFactsAvailable: true });
     expect(await init()).toBe(expected);
 
     // Mid-session config blip: the FULL last-known-good bundle keeps serving
     // (never base, never a mixed default) — OV2-8/F3 on a live transport.
     dbHealthy = false;
     expect(await init()).toBe(expected);
-  });
+  }));
 });

@@ -42,7 +42,7 @@ All eight addons are checked in, so source installs work with
 `bun install --frozen-lockfile --ignore-scripts`. They support x64 and arm64
 on Linux glibc (2.17 ABI baseline), Linux musl, macOS (13.0 deployment
 target), and Windows. The required CI matrix covers the repository's minimum
-Bun 1.3.11, Bun 1.3.13, and the release compiler, Bun 1.4.2. OS compatibility
+Bun, 1.4.4, which is also the release compiler. OS compatibility
 also requires the selected Bun version's own platform minimums.
 
 Node-API headers and their upstream license are vendored from Node
@@ -57,6 +57,81 @@ guard publishes the complete function table before any API call; missing
 exports refuse registration without borrowing another runtime's environment.
 The Windows IPC helpers link the OS-provided `bcrypt` CNG library and remain
 within Node-API v3 and the existing Windows platform minimum.
+
+## Export publication
+
+`export-publication.h` adds `beginExport(absoluteDestination)`,
+`publishExportFile(handle, relativePath, Buffer)`,
+`publishExportFileFrom(handle, relativePath, absoluteSource)`, `completeExport(handle)` and
+idempotent `closeExport(handle)`. `publishExportFileFrom` copies a staged regular
+file (an absolute path, leaf symlinks and reparse points refused) through 1 MiB
+reads into the same no-replace leaf publication, so a large page is never held
+whole in memory. `nativeExportPublisher()` loads these five synchronous methods
+asynchronously through the same literal addon imports.
+Export handles have their own registry and cleanup hook; they cannot be passed
+to lock operations, or vice versa. There is no filesystem fallback when the
+addon or an OS primitive is unavailable.
+
+The destination must be operator-controlled. Existing components are opened one
+at a time without following symlinks or Windows reparse points. Missing
+directories are created privately on POSIX and with inherited permissions on
+Windows. Windows retains ancestor handles without delete sharing and accepts
+absolute drive paths, not UNC/device namespaces. POSIX accepts absolute paths;
+macOS's conventional `/tmp` and `/var` symlink aliases must be supplied using
+their real directory paths. Relative publication paths use `/`, contain no
+empty/dot/parent components, and reject Windows device names, alternate streams,
+backslashes, control characters, and trailing dots/spaces on every platform.
+Components are limited to 255 UTF-8 bytes and walks to 256 components.
+
+Begin exclusively creates `.gbrain-export-status` and writes and flushes
+`GBRAIN EXPORT INCOMPLETE\n`. Existing markers are never removed or overwritten.
+Each file is fully written and flushed to a same-directory exclusive temporary
+file before publication. POSIX uses `linkat(..., 0)` followed by temporary-name
+removal and directory `fsync`; Windows uses `SetFileInformationByHandle` with
+`FileRenameInfo`, `ReplaceIfExists=FALSE`, a null `RootDirectory`, and the absolute
+destination path. Retained ancestor handles deny delete sharing throughout the
+rename, so destination components cannot be replaced. Existing files, hard-link
+aliases, directories and symlinks cannot be replaced. Windows files use `FILE_FLAG_WRITE_THROUGH` and
+`FlushFileBuffers`; this is not a claim of POSIX directory-fsync or whole-volume
+power-loss durability. Microsoft's contracts are documented in
+[FILE_RENAME_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
+and [FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers).
+
+A publication error permanently prevents completion on that handle. Complete
+appends and flushes `COMPLETE\n`; a failed completion attempts to truncate that
+append and flush the original incomplete marker, then refuses further use.
+As with all filesystem durability, a device that also refuses recovery writes
+cannot provide a guaranteed on-disk rollback. Close, finalization, process exit,
+and errors retain the marker and any already-published output; they never erase
+unknown or preexisting files. Successful completion does not implicitly close.
+
+Before each POSIX publication and completion, the addon reopens the retained
+destination and every ancestor component without following symlinks and compares
+their device/inode identities with the retained handles. It also verifies that
+the current marker name still identifies the retained regular file. Publication
+repeats these checks after staging, including its output-parent chain. A missing
+or replaced component or marker poisons the handle before further publication
+or completion, without modifying a replacement tree or marker. This detects
+topology changes between calls; it does not eliminate the race after the last
+identity check against a hostile equally privileged process.
+
+Staging names are `.gbrain-export-<128-bit-random-run-id>.tmp`. Ordinary failures
+remove only the staging file just created by the call. Synchronous publication
+allows at most one outstanding staging file per export; a crash can leave that
+one file (possibly partially written), plus completed output and the incomplete
+marker. Failed exports do not automatically retry or reclaim another run's
+leftovers. An operator can inspect and remove their failed destination before
+retrying. This is anchored confinement for operator-controlled directories, not
+a security claim against equally privileged hostile processes moving or editing
+the export tree or its retained ancestors.
+
+`bun test test/native-export-publication.test.ts test/native-export-faults.test.ts`
+checks real no-replace behavior, marker ownership, handle separation, component
+refusals, competing exporters, lifecycle, and permissions. The Linux/glibc-only
+fault suite compiles a test-only interposer to exercise write, flush, terminal
+flush and SIGKILL failures against the real addon; it is not linked into shipped
+binaries. Native macOS and Windows execution and the Darwin SDK ABI check are
+required separately; cross-compilation alone does not validate runtime behavior.
 
 Use the pinned Zig 0.14.1 compiler. Archive URLs, SHA-256 hashes and sizes
 are in `scripts/native/toolchain.json`; setup verifies them before extracting.
@@ -98,3 +173,41 @@ revision conflicts with typed receipts, exact replay, resident stdio/CLI IPC,
 and shutdown/reopen. Release CI runs it for both published Linux x64 and macOS
 arm64 artifacts. Child homes and credentials are isolated; the script never
 loads repository TypeScript or adjacent native files to satisfy the executable.
+
+## Tests and CI
+
+`bun test test/native-lock.test.ts test/scripts/native-lock-prebuilds.test.ts`
+checks real process exclusion, crash handoff, retained files, cancellation,
+missing-addon failure and source/binary manifest integrity. Tests use isolated
+temporary paths and never open an operator datastore. The required
+`native-locks.yml` lane rebuilds and executes all eight OS/architecture/libc
+targets on Bun 1.4.4, including native musl Docker userspace.
+Every pair also runs `bun scripts/native/compiled-smoke.ts` to prove compiled
+process locking. Release CI verifies the shipped CLI embeds the matching
+addon and runs the compiled smoke on its two release platforms. Rebuild
+instructions and the precise packaging/runtime distinction are above.
+Release compilation uses Bun 1.4.4; strict Darwin codesign verification must
+pass before publication. The native macOS 26.2 smoke is not macOS 27
+certification, and Linux fault injection is not a full native Windows backup
+create/restore test.
+
+The OpenClaw 2026.9.4 / Node 24.18.0 native-host fixture proves plugin startup,
+restarted-turn saved-page pointer retrieval and same-slug source isolation with
+a deterministic loopback provider:
+
+```bash
+GBRAIN_TEST_OPENCLAW_BIN=<absolute-installed-cli> \
+GBRAIN_TEST_OPENCLAW_DATABASE_URL=<isolated-postgres-test-db> \
+bun test test/openclaw-context-engine-native.serial.test.ts
+```
+
+The database user needs `CREATEDB`; fixtures create/drop unique databases
+rather than truncating shared rows. Real-provider recall and macOS 27 behavior
+remain unverified.
+
+`package.json` in this directory is a private package boundary, not a
+package: plugin hosts that derive a native-addon namespace from the nearest
+`package.json` above a `.node` file otherwise treat the whole checkout as one
+package and load slowly (#6026). It declares no entry points, is not a
+prebuild input, and must never move into `prebuilds/`, which holds exactly the
+eight addons.

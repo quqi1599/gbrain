@@ -18,6 +18,16 @@ export const nvidia: Recipe = {
   name: 'NVIDIA NIM',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'nvidia/nemotron-3-super-120b-a12b',
+    'nvidia/nv-embedqa-e5-v5',
+    'nvidia/llama-nemotron-embed-1b-v2',
+    'nvidia/nemotron-3-embed-8b',
+    'nvidia/nv-embed-v1',
+    'nvidia/nv-embedcode-7b-v1',
+  ],
   base_url_default: 'https://integrate.api.nvidia.com/v1',
   auth_env: {
     required: ['NVIDIA_API_KEY'],
@@ -26,6 +36,7 @@ export const nvidia: Recipe = {
   aliases: {
     'nv-embedqa-e5-v5': 'nvidia/nv-embedqa-e5-v5',
     'llama-nemotron-embed-1b-v2': 'nvidia/llama-nemotron-embed-1b-v2',
+    'nemotron-3-embed-8b': 'nvidia/nemotron-3-embed-8b',
     'nemotron-3-super': 'nvidia/nemotron-3-super-120b-a12b',
     'nemotron-3-super-120b-a12b': 'nvidia/nemotron-3-super-120b-a12b',
     'nv-embed-v1': 'nvidia/nv-embed-v1',
@@ -51,9 +62,17 @@ export const nvidia: Recipe = {
       models: [
         'nvidia/nv-embedqa-e5-v5',
         'nvidia/llama-nemotron-embed-1b-v2',
+        'nvidia/nemotron-3-embed-8b',
         'nvidia/nv-embed-v1',
         'nvidia/nv-embedcode-7b-v1',
       ],
+      // PR #5921 (@abudhi19): Nemotron-3-Embed-8B answers 4096 wide whatever `dimensions` asks; its card documents
+      // 2048/1024 as "keep the first coordinates, then L2-normalize", which the gateway applies (fitMatryoshkaPrefix).
+      // Keys are folded ids; the Hugging Face / vLLM served name carries a -bf16 suffix.
+      matryoshka: {
+        'nvidia/nemotron-3-embed-8b': { native: 4096, prefixes: [1024, 2048] },
+        'nvidia/nemotron-3-embed-8b-bf16': { native: 4096, prefixes: [1024, 2048] },
+      },
       // Default to the lightest tested hosted model. Larger NVIDIA models are
       // supported via explicit embedding_dimensions (2048 or 4096).
       default_dims: 1024,

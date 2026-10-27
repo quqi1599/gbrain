@@ -17,6 +17,7 @@ import { assertLegacySkillFilesystemWrite, assertLegacySkillWriter } from '../sk
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { BrainEngine } from '../engine.ts';
+import { sanitizeEcho, type ModelsPlanEntry, type SkillOptModels } from './models-plan.ts';
 import { runSkillOpt } from './orchestrator.ts';
 import type { RunReceipt, SkillOptOpts } from './types.ts';
 
@@ -25,12 +26,22 @@ export interface BatchAllOpts {
   skillsDir: string;
   /** Per-skill budget (each skill gets its own tracker). */
   perSkillMaxCostUsd: number;
+  /** `user` when either cap came from a flag (refuses unpriced models), `default` otherwise (#5563). Default `user`. */
+  maxCostSource?: 'user' | 'default';
   /** Brain-wide cumulative ceiling. */
   brainWideMaxCostUsd: number;
   /** Common knobs threaded to each skill. */
   optimizerModel: string;
   targetModel: string;
   judgeModel: string;
+  /** Role provenance (resolveSkillOptModels); absent -> `unknown`. */
+  models?: SkillOptModels;
+  /** `--models-strict`, applied to every skill's run. */
+  modelsStrict?: boolean;
+  /** Invocation banner the caller printed; each skill prints only differing rows. */
+  modelsBannerBaseline?: ModelsPlanEntry[];
+  /** Explicit optimizer output cap (`--reflect-max-tokens`). */
+  reflectMaxTokens?: number;
   epochs: number;
   batchSize: number;
   lr: number;
@@ -99,6 +110,10 @@ export async function runBatchAll(opts: BatchAllOpts): Promise<BatchAllResult> {
       optimizerModel: opts.optimizerModel,
       targetModel: opts.targetModel,
       judgeModel: opts.judgeModel,
+      ...(opts.models ? { models: opts.models } : {}),
+      ...(opts.modelsStrict ? { modelsStrict: true } : {}),
+      ...(opts.modelsBannerBaseline ? { modelsBannerBaseline: opts.modelsBannerBaseline } : {}),
+      ...(opts.reflectMaxTokens !== undefined ? { reflectMaxTokens: opts.reflectMaxTokens } : {}),
       mode: 'patch',
       dryRun: opts.dryRun,
       noMutate: opts.noMutate,
@@ -106,6 +121,7 @@ export async function runBatchAll(opts: BatchAllOpts): Promise<BatchAllResult> {
       bootstrapReviewed: false,
       json: true,
       maxCostUsd: cap,
+      maxCostSource: opts.maxCostSource ?? 'user',
       maxRuntimeMin: 30,
       force: opts.force,
     };
@@ -143,6 +159,12 @@ export interface FleetOpts {
   targetModels: string[];
   optimizerModel: string;
   judgeModel: string;
+  /** Optimizer + judge provenance; each fleet run's target is `--target-models`. */
+  models?: Pick<SkillOptModels, 'optimizer' | 'judge'>;
+  /** `--models-strict`, applied to every fleet run. */
+  modelsStrict?: boolean;
+  /** Explicit optimizer output cap (`--reflect-max-tokens`). */
+  reflectMaxTokens?: number;
   epochs: number;
   batchSize: number;
   lr: number;
@@ -155,6 +177,8 @@ export interface FleetOpts {
   /** F11: optional held-out test set (one skill, so a single path is valid here). */
   heldOutPath?: string;
   maxCostUsd: number;
+  /** See SkillOptOpts.maxCostSource. Default `user`. */
+  maxCostSource?: 'user' | 'default';
   maxRuntimeMin: number;
   force: boolean;
 }
@@ -227,6 +251,11 @@ export async function runFleet(opts: FleetOpts): Promise<FleetResult> {
       optimizerModel: opts.optimizerModel,
       targetModel,
       judgeModel: opts.judgeModel,
+      ...(opts.models ? {
+        models: { ...opts.models, target: { model: sanitizeEcho(targetModel), source: 'cli_flag' as const, origin: '--target-models' } },
+      } : {}),
+      ...(opts.modelsStrict ? { modelsStrict: true } : {}),
+      ...(opts.reflectMaxTokens !== undefined ? { reflectMaxTokens: opts.reflectMaxTokens } : {}),
       mode: 'patch',
       dryRun: opts.dryRun,
       noMutate,
@@ -235,6 +264,7 @@ export async function runFleet(opts: FleetOpts): Promise<FleetResult> {
       ...(opts.heldOutPath ? { heldOutPath: opts.heldOutPath } : {}),
       json: true,
       maxCostUsd: opts.maxCostUsd,
+      maxCostSource: opts.maxCostSource ?? 'user',
       maxRuntimeMin: opts.maxRuntimeMin,
       force: opts.force,
     };

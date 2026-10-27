@@ -30,10 +30,11 @@
  *   4. else → disabled (policy skill carries; doctor reports it)
  */
 
-import { homedir } from 'node:os';
+import { proactiveEligibility } from '../eligibility/registry.ts';
+import { renderTrustedInline } from '../eligibility/labels.ts';
 import { join } from 'node:path';
 import { mkdirSync, appendFileSync } from 'node:fs';
-import { loadConfig, isEnvDisabled, type GBrainConfig } from '../config.ts';
+import { gbrainPath, loadConfig, isEnvDisabled, type GBrainConfig } from '../config.ts';
 import type { BrainEngine } from '../engine.ts';
 import {
   extractCandidates,
@@ -52,6 +53,7 @@ import {
   type VolunteeredPage,
 } from './volunteer.ts';
 import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } from './resolve-ipc.ts';
+import { loadContextModule } from './load-warning.ts';
 
 /** Per-turn resolver options shared by every rung of the ladder. */
 export interface ResolveEntitiesOpts {
@@ -134,7 +136,6 @@ const TIMEOUT_MS = 1500; // generous per-turn ceiling; the work is usually <100m
  * arm rather than start work the timeout will immediately discard.
  */
 const MIN_VOLUNTEER_BUDGET_MS = 50;
-const HEARTBEAT_PATH = join(homedir(), '.gbrain', 'integrations', 'retrieval-reflex', 'heartbeat.jsonl');
 
 /**
  * File-plane + env gate. Default ON. DB-plane does NOT gate (assemble() is sync).
@@ -272,11 +273,11 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
       const engine = await getPostgresEngine(cfg);
       if (engine) {
         if (pointers.length) {
-          const { logDeliveredReflexPointers } = await import('./retrieval-reflex.ts');
+          const { logDeliveredReflexPointers } = await loadContextModule('src/core/context/retrieval-reflex.ts', () => import('./retrieval-reflex.ts'));
           logDeliveredReflexPointers(engine, pointers);
         }
         if (volunteered.length) {
-          const { volunteerEventRowsFrom, logVolunteerEventsFireAndForget } = await import('./volunteer-events.ts');
+          const { volunteerEventRowsFrom, logVolunteerEventsFireAndForget } = await loadContextModule('src/core/context/volunteer-events.ts', () => import('./volunteer-events.ts'));
           logVolunteerEventsFireAndForget(
             engine,
             volunteerEventRowsFrom(volunteered, { channel: 'openclaw' }),
@@ -305,7 +306,7 @@ export function renderReflexAddition(
   const lines: string[] = pointerText ? [pointerText, ''] : [];
   lines.push('## Brain pages the brain volunteers');
   for (const v of volunteered) {
-    const syn = v.synopsis ? ` — ${v.synopsis}` : '';
+    const syn = v.trust_tier ? ` — ${renderTrustedInline(v.synopsis, { trust_tier: v.trust_tier, origin: v.origin ?? 'legacy' })}` : v.synopsis ? ` — ${v.synopsis}` : '';
     lines.push(`- **${v.display}** → \`${v.slug}\` (${v.confidence.toFixed(2)}, ${v.rationale})${syn}`);
   }
   return lines.join('\n');
@@ -331,9 +332,10 @@ async function resolve(
   if (isPostgres(cfg)) {
     const engine = await getPostgresEngine(cfg);
     if (!engine) return null;
-    const { resolveSourceId } = await import('../source-resolver.ts');
+    const { resolveSourceId } = await loadContextModule('src/core/source-resolver.ts', () => import('../source-resolver.ts'));
     const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
-    return resolveEntitiesToPointers(engine, sourceId, candidates, opts);
+    // #5575 (CEO-20): the OpenClaw context engine's direct rung is a proactive surface.
+    return resolveEntitiesToPointers(engine, sourceId, candidates, { ...opts, eligibility: await proactiveEligibility({ engine }, 'context_engine') });
   }
   // 4. Disabled (PGLite with no serve / unknown engine). Policy skill carries.
   return null;
@@ -370,7 +372,7 @@ async function getPostgresEngine(cfg: GBrainConfig | null): Promise<BrainEngine 
   if (_pgPending) return _pgPending;
   _pgPending = (async () => {
     try {
-      const { createEngine } = await import('../engine-factory.ts');
+      const { createEngine } = await loadContextModule('src/core/engine-factory.ts', () => import('../engine-factory.ts'));
       const engineConfig = {
         engine: 'postgres' as const,
         database_url: cfg?.database_url,
@@ -416,10 +418,11 @@ export async function disposeReflex(): Promise<void> {
 
 function writeHeartbeat(cfg: GBrainConfig | null, count: number): void {
   try {
-    mkdirSync(join(homedir(), '.gbrain', 'integrations', 'retrieval-reflex'), { recursive: true });
+    const dir = gbrainPath('integrations', 'retrieval-reflex');
+    mkdirSync(dir, { recursive: true });
     const engine = cfg?.engine ?? 'unknown';
     appendFileSync(
-      HEARTBEAT_PATH,
+      join(dir, 'heartbeat.jsonl'),
       JSON.stringify({ ts: new Date().toISOString(), event: 'inject', pointers: count, engine }) + '\n',
     );
   } catch {

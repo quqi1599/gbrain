@@ -22,6 +22,7 @@ import type { MinionJobInput, SubagentHandlerData, AggregatorHandlerData } from 
 import { resolveSourceId, isResolverUserError, ALL_SOURCES } from '../core/source-resolver.ts';
 import { fetchSource } from '../core/sources-load.ts';
 import { runAgentLogs } from './agent-logs.ts';
+import { TIMEOUT_EXIT_CODE } from '../core/exit-codes.ts';
 
 // ── arg parsing helpers ────────────────────────────────────
 
@@ -153,7 +154,10 @@ interface RunFlags {
 }
 
 /** No-value switches that may also trail the prompt and get hoisted out (#1738). */
-const BOOLEAN_TAIL_FLAGS = new Set(['--follow', '--no-follow', '--detach']);
+export const BOOLEAN_TAIL_FLAGS = new Set(['--follow', '--no-follow', '--detach']);
+
+/** Flags parseRunFlags reads with their value in the next argument (the CLI entry's = scan reads the flag zone through this). */
+export const RUN_VALUE_FLAGS = new Set(['--subagent-def', '--model', '--max-turns', '--tools', '--timeout-ms', '--source', '--fanout-manifest']);
 
 function applyBooleanFlag(flags: RunFlags, a: string): void {
   if (a === '--follow') flags.follow = true;
@@ -480,7 +484,7 @@ async function followJob(engine: BrainEngine, queue: MinionQueue, jobId: number,
     } catch (e) {
       if (e instanceof TimeoutError) {
         process.stderr.write(`[gbrain agent] timeout after ${e.elapsedMs}ms — job is still running. Check with: gbrain jobs get ${jobId}\n`);
-        process.exit(3);
+        process.exit(TIMEOUT_EXIT_CODE);
       }
       throw e;
     }

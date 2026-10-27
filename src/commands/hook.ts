@@ -24,7 +24,8 @@
  * doctor/status read surface.
  *
  * Events:
- *   session-start  digest to stdout from FILE reads only (≤1.5s) [A3,G4,B3,B4]
+ *   session-start  digest to stdout from FILE reads only (≤1.5s; ≤4s while a
+ *                  setup-wired harness's serve starts) [A3,G4,B3,B4]
  *   user-prompt    stdin hook JSON → IPC turn_context → additionalContext
  *                  JSON on stdout (≤800ms, ≤10000 chars) [ENG-1,S3#8,A9]
  *   stop           append to the per-session live buffer + 7-day GC [G15]
@@ -34,7 +35,6 @@
  */
 
 import {
-  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
@@ -46,7 +46,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn } from '../core/spawn.ts';
+import { gitChildEnv } from '../core/git-env.ts';
 import { ensureGbrainHome, resolveGbrainHome } from '../core/gbrain-home.ts';
 import { loadConfig, type GBrainConfig } from '../core/config.ts';
 import {
@@ -54,11 +55,11 @@ import {
   readIpcSecretForConfig,
   requestTurnContext,
   requestContextPack,
-  resolveSocketPathForConfig,
-  CONTEXT_PACK_CLIENT_TIMEOUT_MS,
+  hookResolveSocketForConfig,
   type TurnContextResponse,
   type ContextPackResponse,
 } from '../core/context/resolve-ipc.ts';
+import { contextSourceId, requestSessionStartPack, sessionStartAwaitsServe } from '../core/context/session-start-pack.ts';
 import type { WindowTurn } from '../core/context/entity-salience.ts';
 import {
   confineTranscriptPath,
@@ -70,11 +71,18 @@ import {
   bankWritebackTurn,
   decideCorpusMode,
   gcCorpusArtifacts,
+  gcCorpusTurnFiles,
+  CORPUS_FAILURE_SUFFIX, CORPUS_PROGRESS_SUFFIX,
+  CORPUS_PROGRESS_LOCK_SUFFIX,
   HARVEST_RECEIPT_SUFFIX,
   segmentHash,
+  sessionCorpusFileName,
 } from '../core/context/corpus-segments.ts';
+import { openSessionCorpus } from '../core/context/corpus-source.ts';
+import { hookLaneLabel, resolveSeat, seatReasonHint, writeSeatSidecar } from '../core/context/seat.ts';
 import { gateWritebackTurn, WRITEBACK_SKIP_REASONS } from '../core/facts/writeback-gate.ts';
 import { resolveWritebackConfigFromFile } from '../core/facts/writeback-config.ts';
+import { recordCaptureIfOff } from '../core/context/capture-consent.ts';
 import { memorableGateAllowed, recordAndRelayReceipt, redactedToolCallsJson } from '../core/context/hook-heartbeat.ts';
 import { captureSpecFor } from '../core/transcripts/capture-spec.ts';
 import {
@@ -85,10 +93,13 @@ import {
   type HookHeartbeatEntry,
 } from '../core/context/hook-heartbeat.ts';
 import { CLAUDE_HOOK_OUTPUT_CAP_CHARS } from '../core/bootstrap/host-specs.ts';
+import { composeSessionStartOutput } from '../core/context/session-start-output.ts';
+import { claudeCodePressure } from '../core/context/pressure.ts';
 import { readManifest, readReceipt, type InstallReceipt } from '../core/bootstrap/format.ts';
 import { githubOwnerRepoString } from '../core/repo-visibility.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
 import {
+  livePushStatuses,
   readPushStatuses,
   readPushStatusForRoot,
   sanitizePushReason,
@@ -105,11 +116,17 @@ import {
   recordBackupSpawn,
 } from '../core/backup/status-file.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
+import { isClaudeCliSelfTranscriptPath } from '../core/ai/providers/claude-cli-scratch.ts';
+import { withoutPhysicalRootMetadata } from '../core/persistence/root-metadata.ts';
+import { HOOK_SUBCOMMANDS as HOOK_EVENTS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+import { isManagedFilesystemPath } from '../core/persistence/filesystem-guard.ts';
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
 /** session-start self-deadline (plan D5). */
 export const SESSION_START_DEADLINE_MS = 1500;
+/** session-start self-deadline while the harness's serve starts (session-start-pack.ts); under the 5s harness timeout. */
+export const SESSION_START_SERVE_WAIT_DEADLINE_MS = 4000;
 /** user-prompt hard self-deadline (plan D5/ENG-1). */
 export const USER_PROMPT_DEADLINE_MS = 800;
 /** MEMORY.md digest budget [A3]. */
@@ -225,16 +242,19 @@ export interface HookIo {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
+export { HOOK_EVENTS, HOOK_EVENTS as SUBCOMMANDS };
+export const printUsage = (): void => { process.stdout.write(`${USAGE}\n`); };
+
 const USAGE = `Usage: gbrain hook <event>
 
 Events (wired into .claude/settings.local.json by gbrain bootstrap):
-  session-start   print the greeting digest (MEMORY.md sections, last session,
-                  push status, hook health) to stdout
+  session-start   print the greeting digest (MEMORY.md sections, push status,
+                  hook health) to stdout
   user-prompt     read hook JSON on stdin, request per-turn context from a
                   running 'gbrain serve' over IPC, print additionalContext JSON
                   (--harness <claude-code|codex|opencode> sets the feedback-loop
                   channel; default claude-code, unknown values fall back to the default)
-  stop            append to the per-session live buffer
+  stop            bank the writeback backstop and spawn the workspace push
   session-end     ingest the session transcript into the dream corpus
                   (secret-scanned), prune old corpus files, push the workspace
   compact         (PreCompact) bank the window's standing entities into the
@@ -248,7 +268,7 @@ All events fail open: errors exit 0 with empty stdout and a heartbeat entry at
 /** Dispatch a hook event. Returns the process exit code (0 for every runtime path). */
 export async function runHook(args: string[], io: HookIo = {}): Promise<number> {
   const event = args[0];
-  if (event === '--help' || event === '-h' || event === 'help') {
+  if (subcommandHelpRequested(args, ROUTERS.hook)) {
     write(io, USAGE + '\n');
     return 0;
   }
@@ -260,7 +280,7 @@ export async function runHook(args: string[], io: HookIo = {}): Promise<number> 
     const v = args[harnessIdx + 1];
     if (v === 'claude-code' || v === 'codex' || v === 'opencode') io = { ...io, harness: v };
   }
-  if (!event || !['session-start', 'user-prompt', 'stop', 'session-end', 'compact'].includes(event)) {
+  if (!event || !(HOOK_EVENTS as readonly string[]).includes(event)) {
     process.stderr.write(USAGE + '\n');
     return 1;
   }
@@ -422,7 +442,7 @@ function ensureDir0700(dir: string): string {
   return dir;
 }
 
-function sanitizeSessionId(id: unknown): string {
+export function sanitizeSessionId(id: unknown): string {
   // Leading dashes are stripped so the id can never be parsed as a FLAG by a
   // downstream argv consumer (the detached memorable spawn passes it as a
   // positional value) — hook stdin is untrusted input.
@@ -473,6 +493,7 @@ async function hookSessionStart(io: HookIo): Promise<number> {
   let outcome: HookHeartbeatEntry['outcome'] = 'ok';
   let reason: string | undefined;
   const out: string[] = [];
+  const coreBox: { core: { text: string; revision: string; chars_used: number } | null; reason?: string } = { core: null };
   // Deferred nag records: fire ONLY after the digest actually reached stdout
   // (record-after-write — a deadline-suppressed note must re-fire next time).
   const deferredRecords: Array<() => void> = [];
@@ -480,15 +501,14 @@ async function hookSessionStart(io: HookIo): Promise<number> {
   try {
     const j = await readStdinJson(io, 250);
     const ws = io.cwd ?? (typeof j?.cwd === 'string' ? (j.cwd as string) : process.cwd());
+    const awaitServe = sessionStartAwaitsServe(j?.source, io.harness ?? 'claude-code', ws);
+    const deadlineMs = awaitServe ? SESSION_START_SERVE_WAIT_DEADLINE_MS : SESSION_START_DEADLINE_MS;
+    let serveNotReady = false;
 
     const work = (async () => {
       // 1. MEMORY.md digest — allowlisted sections only, ≤3KB [A3].
       const digest = memoryDigest(join(ws, 'MEMORY.md'));
       if (digest) out.push(digest);
-
-      // 2. Last-session line from the stop-buffer dir [G15 consumer].
-      const last = await lastSessionLine();
-      if (last) out.push(last);
 
       // 3. Push staleness [B4].
       const pushNote = await pushStatusNote();
@@ -529,47 +549,39 @@ async function hookSessionStart(io: HookIo): Promise<number> {
       //    digest above must never be hostage to the brain being down.
       try {
         const cfg = loadConfig();
-        // Engine-uniform (#4245): same config-keyed socket/secret resolution
-        // as the user-prompt and compact arms (PGLite data dir; Postgres
-        // hash12(database_url) run-dir). Null → silent skip, as before.
-        const packSocket = resolveSocketPathForConfig(cfg);
-        if (packSocket) {
-          const secret = readIpcSecretForConfig(cfg);
-          if (secret) {
-            // Same sanitizer as the compact banking path — a raw vs sanitized
-            // id would split the cursor key and the warm pack would miss the
-            // banked entities (adversarial review).
-            const sessionId = sanitizeSessionId(j?.session_id);
-            const trigger = typeof j?.source === 'string' ? `session-start:${j.source as string}` : 'session-start';
-            // Clamp the IPC timeout to the REMAINING hook deadline (minus a
-            // 100ms write margin) so the pack call can never be the thing
-            // that blows SESSION_START_DEADLINE_MS.
-            const remaining = SESSION_START_DEADLINE_MS - (Date.now() - t0) - 100;
-            if (remaining > 100) {
-              const res = await requestContextPack(packSocket, {
-                secret,
-                ...(sessionId ? { sessionId } : {}),
-                ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
-                trigger,
-              }, { timeoutMs: Math.min(CONTEXT_PACK_CLIENT_TIMEOUT_MS, remaining) });
-              if (res !== IPC_UNAVAILABLE && !('degraded' in res)) {
-                const pack = res as ContextPackResponse;
-                if (pack.ok && pack.block?.text) out.push(pack.block.text);
-              }
-            }
-          }
-        }
+        if (sanitizeSessionId(j?.session_id) !== 'unknown') await sessionCorpus(io, cfg, sanitizeSessionId(j?.session_id), ws); // #6268: freeze at start
+        // Engine-uniform (#4245): same config-keyed socket/secret resolution as the
+        // user-prompt and compact arms; IPC timeout clamped to the remaining deadline.
+        // Same session-id sanitizer as compact banking (a raw id splits the cursor key).
+        serveNotReady = awaitServe; // still true if the deadline fires mid-wait
+        const sourceId = await contextSource(io, cfg, j?.session_id, ws);
+        const res = await requestSessionStartPack(cfg, {
+          sourceId,
+          sessionId: sanitizeSessionId(j?.session_id),
+          trigger: typeof j?.source === 'string' ? `session-start:${j.source as string}` : 'session-start',
+          deadlineAt: t0 + deadlineMs,
+          awaitServe,
+        });
+        serveNotReady = res.serveNotReady;
+        if (res.ipcUnavailable && outcome === 'ok') { outcome = 'degraded'; reason = 'ipc_unavailable'; }
+        const pack = res.pack;
+        if (pack && !pack.ok && pack.error === 'source_mismatch' && outcome === 'ok') { outcome = 'degraded'; reason = 'source_mismatch'; } // #5941
+        if (pack?.ok && pack.degradedReason === 'server_budget' && outcome === 'ok') { outcome = 'degraded'; reason = 'server_budget'; }
+        if (pack?.ok && pack.block?.text) out.push(pack.block.text);
+        if (pack?.ok && pack.block?.core && process.env.GBRAIN_CORE !== '0') coreBox.core = pack.block.core;
+        else if (pack?.ok && !pack.block?.core) coreBox.reason = 'stale_serve_no_core';
       } catch { /* fail-open: no pack, digest stands alone */ }
     })();
 
-    const res = await withDeadline(SESSION_START_DEADLINE_MS, work);
-    if (res === DEADLINE && outcome === 'ok') {
+    const res = await withDeadline(deadlineMs, work);
+    if ((res === DEADLINE || serveNotReady) && outcome === 'ok') {
       outcome = 'degraded';
-      reason = 'deadline';
+      reason = serveNotReady ? 'serve_not_ready' : 'deadline';
     }
     // Print whatever accumulated before the deadline — a partial digest
     // beats an empty one (the deadline bounds latency, not usefulness).
-    const text = out.filter(Boolean).join('\n\n');
+    // Always-loaded core first; digest/pack trimmed to the cap (session-start-output.ts).
+    const text = composeSessionStartOutput(coreBox.core?.text ?? '', out.filter(Boolean));
     if (text) {
       write(io, text + '\n');
       for (const record of deferredRecords) {
@@ -588,8 +600,9 @@ async function hookSessionStart(io: HookIo): Promise<number> {
     ts: new Date().toISOString(),
     event: 'session-start',
     outcome,
-    ...(reason ? { reason } : {}),
+    ...(reason ? { reason } : coreBox.reason ? { reason: coreBox.reason } : {}),
     duration_ms: Date.now() - t0,
+    ...(coreBox.core ? { core_chars: coreBox.core.chars_used, core_revision: coreBox.core.revision } : {}),
   });
   return 0;
 }
@@ -636,37 +649,12 @@ async function liveBufferDir(): Promise<string> {
   return ensureDir0700(join(home, 'transcripts', 'live'));
 }
 
-async function lastSessionLine(): Promise<string | null> {
-  try {
-    const dir = await liveBufferDir();
-    let newest: { path: string; mtime: number } | null = null;
-    for (const name of readdirSync(dir)) {
-      if (!name.endsWith('.txt')) continue;
-      const p = join(dir, name);
-      const st = statSync(p);
-      if (!newest || st.mtimeMs > newest.mtime) newest = { path: p, mtime: st.mtimeMs };
-    }
-    if (!newest) return null;
-    const lines = readFileSync(newest.path, 'utf8').split('\n').filter((l) => l.trim());
-    const last = lines[lines.length - 1];
-    if (!last) return null;
-    try {
-      const e = JSON.parse(last) as { ts?: string; exchange?: string };
-      const snippet = typeof e.exchange === 'string' ? ` — ${e.exchange.slice(0, 200)}` : '';
-      return `Last session activity: ${e.ts ?? 'unknown time'}${snippet}`;
-    } catch {
-      return `Last session activity: ${last.slice(0, 200)}`;
-    }
-  } catch {
-    return null;
-  }
-}
-
 async function pushStatusNote(): Promise<string | null> {
   try {
     // One reader + one aggregation for every status surface [D8]; per-root
     // files [D13] so one workspace's success can't mask another's failure.
-    const entries = readPushStatuses();
+    // #5799: a managed root's records are the fenced legacy push, not this note's subject.
+    const entries = livePushStatuses(readPushStatuses());
     if (entries.length === 0) return null;
     const { failing, stalestTs } = summarizePushStatuses(entries);
     if (failing.length > 0) {
@@ -730,7 +718,7 @@ function tryExecAsync(bin: string, args: string[], timeoutMs = HOOK_GIT_TIMEOUT_
       execFile(
         bin,
         args,
-        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: process.env },
+        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: gitChildEnv() },
         (err, stdout) => resolve(err ? null : stdout.toString().trim()),
       );
     } catch {
@@ -833,6 +821,7 @@ async function dirtyTreePush(
     const root = await resolveBootstrapWorkspaceRoot(ws);
     if (!root) return null;
     if (!(await treeNeedsPush(root))) return null; // clean + up to date → nothing to recover
+    if (isManagedFilesystemPath(root)) return { reason: 'push_managed_coordinator' };
     // There IS unpushed work. Defer until the repo phase verified privacy +
     // recorded repo_url — never recover-push to an unverified origin
     // (create-repo-first race). Only fires when work actually exists (P2-1).
@@ -872,7 +861,7 @@ async function treeNeedsPush(root: string): Promise<boolean> {
   // doesn't resolve yet (never pushed), any commit past the empty tree counts
   // as needs-push.
   const status = await tryExecAsync('git', ['-C', root, 'status', '--porcelain']);
-  if ((status ?? '') !== '') return true;
+  if (withoutPhysicalRootMetadata(status ?? '') !== '') return true;
   const branch = await tryExecAsync('git', ['-C', root, 'branch', '--show-current']);
   const b = (branch ?? '').trim();
   if (b) {
@@ -959,6 +948,7 @@ async function stopPushIfDue(ws: string, io: HookIo): Promise<string> {
   // verified the origin and recorded repo_url (create-repo-first race).
   if (!(await repoPhaseComplete(root))) return 'push_deferred_repo_pending';
   if (!(await treeNeedsPush(root))) return 'push_clean';
+  if (isManagedFilesystemPath(root)) return 'push_managed_coordinator';
   try {
     // Written BEFORE the spawn so repeated fail-fast children stay debounced
     // on the healthy path; the [D20] failing-status bypass handles retries.
@@ -994,7 +984,8 @@ interface PushAnnounceState {
  */
 function pendingPushFailureBanner(): { text: string; record: () => void } | null {
   try {
-    const failing = readPushStatuses().filter((e) => e.ok === false);
+    // #5799: a refusal recorded on a managed root is not a failing push; the outbox publishes there.
+    const failing = livePushStatuses(readPushStatuses()).filter((e) => e.ok === false);
     if (failing.length === 0) return null;
     const now = Date.now();
     const due = failing.filter((e) => {
@@ -1100,6 +1091,7 @@ interface UserPromptOutcome {
   outcome: HookHeartbeatEntry['outcome'];
   reason?: string;
   turns?: number;
+  pressure_pct?: number;
 }
 
 async function hookUserPrompt(io: HookIo): Promise<number> {
@@ -1131,13 +1123,19 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     // path aborts the event (heartbeat + empty stdout), never "best effort".
     let turns: WindowTurn[] = [];
     let priorContextText: string | undefined;
+    let transcriptPath: string | undefined;
     if (j.transcript_path !== undefined && j.transcript_path !== null) {
-      const conf = confineTranscriptPath(j.transcript_path, {
+      const conf = captureSpecFor(io.harness).confine(j.transcript_path, { // #5941: codex rollouts live under CODEX_HOME/sessions
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        // #5701: bounded tail read below — the 50MiB whole-file gate must not
+        // reject a long session before it runs (full rationale in
+        // claude-code-jsonl.ts's confinement).
+        allowOversize: true,
       });
       if (!conf.ok) return { outcome: 'degraded', reason: `transcript_${conf.reason}` };
+      transcriptPath = conf.path;
       try {
-        const parsed = parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES });
+        const parsed = captureSpecFor(io.harness).parse(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES });
         turns = parsed.turns.slice(-USER_PROMPT_WINDOW_TURNS);
         // Cross-turn dedupe: feed the blocks WE previously injected this
         // session back as priorContextText (slug-only suppression + volunteer
@@ -1180,15 +1178,15 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     // Postgres off hash12(database_url) under ~/.gbrain/run. Null = no
     // keying material at all (no config, thin-client remote) — ENGINE-FREE
     // means no direct-engine fallback here; pull-mode covers it.
-    const socketPath = resolveSocketPathForConfig(cfg);
+    const sessionId = typeof j.session_id === 'string' ? j.session_id : undefined;
+    const sourceId = await contextSource(io, cfg, sessionId, io.cwd ?? (typeof j.cwd === 'string' ? j.cwd : process.cwd()));
+    const socketPath = await hookResolveSocketForConfig(cfg, sourceId);
     if (!socketPath) {
       return { outcome: 'degraded', reason: 'no_pglite_path' };
     }
     const secret = readIpcSecretForConfig(cfg);
     if (!secret) return { outcome: 'degraded', reason: 'no_serve' };
 
-    const sessionId = typeof j.session_id === 'string' ? j.session_id : undefined;
-    const sourceId = process.env.GBRAIN_SOURCE || undefined;
     const res = await requestTurnContext(socketPath, {
       secret,
       window: turns,
@@ -1212,8 +1210,10 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     if (!resp.ok) {
       return { outcome: 'degraded', reason: reasonCode(resp.error ?? 'server_error'), turns: turns.length };
     }
-    const text = resp.block?.text ?? '';
-    if (!text) return { outcome: 'ok', reason: 'empty_block', turns: turns.length };
+    // Context-pressure notice (pressure.ts) leads the block so the cap loop never trims it.
+    const pressure = transcriptPath && io.harness !== 'codex' ? claudeCodePressure(resp.block?.pressure, transcriptPath, sessionId) : null;
+    const text = [pressure?.notice, resp.block?.text].filter(Boolean).join('\n\n');
+    if (!text) return resp.degradedReason === 'server_budget' ? { outcome: 'degraded', reason: 'server_budget', turns: turns.length } : { outcome: 'ok', reason: 'empty_block', turns: turns.length };
 
     // [ENG-1] The 10000-char harness cap applies to the WHOLE stdout payload;
     // the block is budgeted ≤8KB server-side, but JSON escaping inflates, so
@@ -1243,10 +1243,9 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     // were never injected. Record it so the doctor's heartbeat reconciliation
     // (and a future reconciler) can see the divergence — outcome stays ok
     // (context WAS injected), the reason carries the signal.
-    if (blockText.length < text.length) {
-      return { outcome: 'ok', reason: 'trimmed', turns: turns.length };
-    }
-    return { outcome: 'ok', turns: turns.length };
+    const pct = pressure?.notice ? { pressure_pct: pressure.percent } : {};
+    if (blockText.length < text.length) return { outcome: 'ok', reason: 'trimmed', turns: turns.length, ...pct };
+    return { outcome: 'ok', turns: turns.length, ...pct };
   })();
 
   let result: UserPromptOutcome;
@@ -1284,6 +1283,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     ...(result.reason ? { reason: result.reason } : {}),
     duration_ms: Date.now() - t0,
     ...(result.turns !== undefined ? { turns: result.turns } : {}),
+    ...(result.pressure_pct !== undefined ? { pressure_pct: result.pressure_pct } : {}),
   });
   return 0;
 }
@@ -1325,6 +1325,7 @@ async function hookCompact(io: HookIo): Promise<number> {
   let reason: string | undefined;
   let segment: string | undefined;
   let flushAck: string | undefined;
+  let seatReasons: string[] = [];
 
   const work = (async () => {
     const j = await readStdinJson(io, 300);
@@ -1334,11 +1335,17 @@ async function hookCompact(io: HookIo): Promise<number> {
     let turns: WindowTurn[] = [];
     let boundaryTurnIndexes: number[] = [];
     let allTurns: WindowTurn[] = [];
+    let transcriptPath: string | undefined;
     if (j.transcript_path !== undefined && j.transcript_path !== null) {
       const conf = confineTranscriptPath(j.transcript_path, {
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        // #5701: bounded tail read below — the 50MiB whole-file gate must not
+        // reject a long session before it runs (full rationale in
+        // claude-code-jsonl.ts's confinement).
+        allowOversize: true,
       });
       if (!conf.ok) { outcome = 'degraded'; reason = `transcript_${conf.reason}`; return; }
+      transcriptPath = conf.path;
       try {
         const parsed = parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES });
         allTurns = parsed.turns;
@@ -1365,10 +1372,14 @@ async function hookCompact(io: HookIo): Promise<number> {
     // any IPC. Written for EVERY engine config (the sweep backstop harvests it
     // when serve/IPC is unavailable). Per-step deadline degrades — a scan that
     // can't finish skips the segment ENTIRELY (never write unscanned content).
-    const banked = await bankCompactSegment(await corpusDir(cfg), sessionId, allTurns, boundaryTurnIndexes, {
+    const { dir, stamp, source } = await sessionCorpus(io, cfg, sessionId, io.cwd ?? (typeof j.cwd === 'string' ? j.cwd : process.cwd()));
+    seatReasons = captureSeat(io, dir, sessionId, transcriptPath);
+    const banked = await bankCompactSegment(dir, sessionId, allTurns, boundaryTurnIndexes, {
       remainingMs: remaining,
       minScanMs: SEGMENT_MIN_BUDGET_MS,
       minWriteMs: SEGMENT_WRITE_MIN_BUDGET_MS,
+      beforeWrite: (file, text) => { recordCaptureIfOff(cfg, file, text, source); },
+      stamp,
     });
     segment = banked.segment;
     const flushCorpusFile = banked.flushCorpusFile;
@@ -1378,7 +1389,7 @@ async function hookCompact(io: HookIo): Promise<number> {
     // leftover database_path must not probe the PGLite socket (the resolver
     // checks engine first); a Postgres brain probes its hash12(database_url)
     // run-dir socket instead. Null = no keying material → degrade.
-    const compactSocket = resolveSocketPathForConfig(cfg);
+    const compactSocket = await hookResolveSocketForConfig(cfg, source);
     if (!compactSocket) { outcome = 'degraded'; reason = 'no_pglite_path'; return; }
     const secret = readIpcSecretForConfig(cfg);
     if (!secret) { outcome = 'degraded'; reason = 'no_serve'; return; }
@@ -1391,7 +1402,7 @@ async function hookCompact(io: HookIo): Promise<number> {
       bankOnly: true,
       trigger: 'compact-bank',
       ...(flushCorpusFile ? { flushCorpusFile } : {}),
-      ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+      ...(source ? { sourceId: source } : {}),
     });
     if (res === IPC_UNAVAILABLE) { outcome = 'degraded'; reason = 'ipc_unavailable'; return; }
     if ('degraded' in res && res.degraded === 'stale_serve') { outcome = 'degraded'; reason = 'stale_serve'; return; }
@@ -1414,11 +1425,14 @@ async function hookCompact(io: HookIo): Promise<number> {
     outcome = 'error';
     reason = errorCode(e); // fail-open: exit 0
   }
+  if (outcome === 'ok' && seatReasons.length) { outcome = 'degraded'; reason = seatReasons[0]; }
+  const hint = seatReasonHint(reason);
   await writeHeartbeat(io, {
     ts: new Date().toISOString(),
     event: 'compact',
     outcome,
     ...(reason ? { reason } : {}),
+    ...(hint ? { hint } : {}),
     duration_ms: Date.now() - t0,
     ...(segment ? { segment } : {}),
     ...(flushAck ? { flush: flushAck } : {}),
@@ -1435,16 +1449,9 @@ async function hookStop(io: HookIo): Promise<number> {
   let j: Record<string, unknown> | null = null;
   try {
     j = await readStdinJson(io, 300);
-    const sessionId = sanitizeSessionId(j?.session_id);
-    const dir = await liveBufferDir();
-    const exchange = firstString(j, ['last_assistant_message', 'lastAssistantMessage', 'prompt']);
-    const entry = {
-      ts: new Date().toISOString(),
-      session_id: sessionId,
-      ...(exchange ? { exchange: exchange.slice(0, 400) } : {}),
-    };
-    appendFileSync(join(dir, `${sessionId}.txt`), JSON.stringify(entry) + '\n', { mode: 0o600 });
-    gcOldFiles(dir, STOP_BUFFER_RETENTION_MS);
+    // #5558: stop no longer buffers assistant text; GC drains any buffers
+    // older binaries left behind.
+    gcOldFiles(await liveBufferDir(), STOP_BUFFER_RETENTION_MS);
   } catch (e) {
     outcome = 'error';
     reason = errorCode(e);
@@ -1471,8 +1478,15 @@ async function hookStop(io: HookIo): Promise<number> {
       if (tp === undefined || tp === null) return 'no_transcript';
       const conf = confineTranscriptPath(tp as string, {
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        // #5701: bounded tail reads (128KB probe, then the 2MB cap).
+        allowOversize: true,
       });
       if (!conf.ok) return `transcript_${conf.reason}`;
+      // #5820: the SessionEnd guard's fingerprint (#5413) — a turn from
+      // gbrain's own claude-cli subprocess is never banked, or extracting it
+      // spawns another claude-cli call that banks again.
+      const ws = io.cwd ?? (typeof j?.cwd === 'string' ? j.cwd : process.cwd());
+      if (isClaudeCliSelfTranscriptPath(conf.path) || isClaudeCliSelfTranscriptPath(ws)) return 'self_capture';
       const findLastUser = (parsed: ReturnType<typeof parseTranscript>): WindowTurn | undefined => {
         const index = parsed.genuineUserTurnIndexes.at(-1);
         return index === undefined ? undefined : parsed.turns[index];
@@ -1501,19 +1515,17 @@ async function hookStop(io: HookIo): Promise<number> {
       if (!lastUser || !lastUser.text) return 'no_user_turn';
       const gated = gateWritebackTurn(lastUser.text);
       if (!gated.ok) return gated.reason;
-      const banked = await bankWritebackTurn(
-        await corpusDir(cfg), sid, gated.normalized, gated.hash24,
-        // Bank the session's source IN THE NAME so the sweep fallback files
-        // the turn into the same source the IPC lane below would have.
-        process.env.GBRAIN_SOURCE ?? null,
-      );
+      const { dir, stamp, source } = await sessionCorpus(io, cfg, sid, ws);
+      captureSeat(io, dir, sid, conf.path); // #4618: the seat precedes the banked turn file
+      // The session's source rides IN THE NAME so the sweep fallback files the turn where the IPC lane below would.
+      const banked = await bankWritebackTurn(dir, sid, gated.normalized, gated.hash24, stamp);
       if (banked.status !== 'wb_banked' && banked.status !== 'wb_dup') return banked.status;
       if (banked.status === 'wb_dup') return 'wb_dup';
       // Prompt-harvest ask over the compact-bank IPC lane — sourceId rides
       // exactly like the compact call (OV2-9/OV-A6); every failure below is
       // degraded-not-blocking: the banked file is the durable artifact and
       // the sweep extracts it when serve is away.
-      const socket = resolveSocketPathForConfig(cfg);
+      const socket = await hookResolveSocketForConfig(cfg, source);
       if (!socket) return 'no_pglite_path';
       const secret = readIpcSecretForConfig(cfg);
       if (!secret) return 'no_serve';
@@ -1523,7 +1535,7 @@ async function hookStop(io: HookIo): Promise<number> {
         bankOnly: true,
         trigger: 'writeback-bank',
         ...(banked.flushCorpusFile ? { flushCorpusFile: banked.flushCorpusFile } : {}),
-        ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+        ...(source ? { sourceId: source } : {}),
       });
       if (res === IPC_UNAVAILABLE) return 'ipc_unavailable';
       if ('degraded' in res && res.degraded === 'stale_serve') return 'stale_serve';
@@ -1549,7 +1561,7 @@ async function hookStop(io: HookIo): Promise<number> {
     // skipped-vs-failed counters and any alerting stay honest.
     const wbByDesign =
       wbReason === 'wb_scheduled' || wbReason === 'wb_banked' || wbReason === 'wb_dup' ||
-      wbReason === 'no_user_turn' || wbReason.startsWith('flush_skip_') ||
+      wbReason === 'no_user_turn' || wbReason === 'self_capture' || wbReason.startsWith('flush_skip_') ||
       (WRITEBACK_SKIP_REASONS as readonly string[]).includes(wbReason);
     await writeHeartbeat(io, {
       ts: new Date().toISOString(),
@@ -1583,15 +1595,6 @@ async function hookStop(io: HookIo): Promise<number> {
   return 0;
 }
 
-function firstString(j: Record<string, unknown> | null, keys: string[]): string | null {
-  if (!j) return null;
-  for (const k of keys) {
-    const v = j[k];
-    if (typeof v === 'string' && v.trim()) return v;
-  }
-  return null;
-}
-
 function gcOldFiles(dir: string, maxAgeMs: number): void {
   try {
     const cutoff = Date.now() - maxAgeMs;
@@ -1619,12 +1622,33 @@ async function corpusDir(cfg: GBrainConfig | null): Promise<string> {
   return ensureDir0700(join(home, 'transcripts', 'corpus'));
 }
 
+/** #6268: the session's spool dir and frozen source stamp (`source` unset while unresolved). */
+const sessionCorpus = async (io: HookIo, cfg: GBrainConfig | null, sessionId: string, cwd: string) =>
+  openSessionCorpus(await corpusDir(cfg), sessionId, { cwd, harness: io.harness ?? 'claude-code' });
+
+/** #5941: the context arms' source (session-start-pack.ts `contextSourceId`): the session's frozen record when there is a session id. */
+const contextSource = (io: HookIo, cfg: GBrainConfig | null, rawSessionId: unknown, cwd: string) => {
+  const sid = sanitizeSessionId(rawSessionId);
+  return contextSourceId(sid !== 'unknown' ? () => sessionCorpus(io, cfg, sid, cwd) : null, cwd);
+};
+
 function corpusRetentionDays(cfg: GBrainConfig | null): number {
   // Key is plan-defined [G15] but not yet in the GBrainConfig type (config.ts
   // is another lane's file) — read tolerantly.
   const synth = cfg?.dream?.synthesize as Record<string, unknown> | undefined;
   const v = synth?.corpus_retention_days;
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : CORPUS_RETENTION_DAYS_DEFAULT;
+}
+
+/** #4618: record the session's seat sidecar; returns heartbeat reason codes. Never throws. */
+function captureSeat(io: HookIo, dir: string, sessionId: string, transcriptPath: string | undefined): string[] {
+  const harness = io.harness ?? 'claude-code';
+  try {
+    const seat = resolveSeat({ env: process.env, harness, transcriptPath });
+    return seat ? writeSeatSidecar(dir, sessionId, seat, { harness, hookLane: hookLaneLabel(process.env.GBRAIN_HOOK_LANE) }) : [];
+  } catch {
+    return ['seat_write_failed'];
+  }
 }
 
 async function hookSessionEnd(io: HookIo): Promise<number> {
@@ -1665,7 +1689,8 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
     // (today's behavior, pinned by the capture-spec golden test).
     const spec = captureSpecFor(io.harness);
     const rootOpt = io.transcriptRoot ? { root: io.transcriptRoot } : {};
-    let conf = spec.confine(j?.transcript_path, { ...rootOpt });
+    // #5701: every spec parser reads a bounded window (claude tail, codex head+tail).
+    let conf = spec.confine(j?.transcript_path, { ...rootOpt, allowOversize: true });
     // A newest-mtime discovery with NO session-id match is a guess: on a
     // machine with concurrent sessions it can be a different, still-RUNNING
     // rollout. Fine for the local corpus (overwritten on the real session
@@ -1685,6 +1710,18 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
     }
     if (!conf.ok) {
       degrade(`transcript_${conf.reason}`);
+    } else if (conf.absent) {
+      degrade('transcript_unreadable');
+    } else if (
+      isClaudeCliSelfTranscriptPath(conf.path) ||
+      (ws !== undefined && isClaudeCliSelfTranscriptPath(ws))
+    ) {
+      // #5413: this session is gbrain's OWN claude-cli subprocess (the
+      // scratch cwd fingerprint appears in the transcript path or the
+      // payload cwd). Writing it to the dream corpus is a self-ingestion
+      // feedback loop — extraction prompts and page content re-enter as
+      // "conversations", and synthesize mints duplicate idea pages.
+      segmentMode = 'self_transcript';
     } else {
       const parsed = spec.parse(conf.path, { collectToolCalls: memorableAllowed });
       if (sessionId === 'unknown') {
@@ -1696,7 +1733,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
       }
       turnsN = parsed.turns.length;
       bytesN = parsed.bytesRead;
-      if (bytesN > 0 && turnsN === 0) {
+      if (bytesN > 0 && turnsN === 0 && parsed.recognizedOnly) {
+        reason = 'empty_session'; // opened and closed with no prompt: nothing to bank, not drift
+      } else if (bytesN > 0 && turnsN === 0) {
         // [G3] LOUD: the host format drifted under us — heartbeat error +
         // status file surfaced at the next session-start.
         outcome = 'error';
@@ -1712,7 +1751,16 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           /* status telemetry best-effort */
         }
       } else if (turnsN > 0) {
-        const dir = await corpusDir(cfg);
+        // E-N4: assistant turns with not one user turn is how #5163 (a host
+        // renamed its user-turn record) banked half-sessions silently. The
+        // corpus is still written; the heartbeat says the human side is gone.
+        // Whole-file reads only: a bounded tail of a long agentic run can
+        // legitimately hold assistant turns alone.
+        if (parsed.genuineUserTurnIndexes.length === 0 && bytesN >= conf.size) degrade('no_user_turns');
+        const { root, dir, stamp, source } = await sessionCorpus(io, cfg, sessionId, ws ?? process.cwd());
+        // #4618: the seat is recorded BEFORE any corpus file of this session
+        // is renamed into place, so a sweep never sees one without its seat.
+        deferredReasons.push(...captureSeat(io, dir, sessionId, conf.path));
         // Cathedral 5 dedup contract: when EVERY non-empty boundary window's
         // redacted hash is banked in the segment ledger (exact-set), write
         // only the post-last-boundary REMAINDER; any mismatch ⇒ full
@@ -1753,8 +1801,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           // the rename so the sweep re-processes the appended transcript (a
           // resumed session's new turns were being permanently skipped when the
           // completion sidecar survived the overwrite).
-          const corpusFile = join(dir, `${sessionId}.txt`);
+          const corpusFile = join(dir, sessionCorpusFileName(sessionId, stamp));
           const tmpCorpus = `${corpusFile}.tmp-${process.pid}`;
+          recordCaptureIfOff(cfg, corpusFile, text, source); // #6091, before the rename
           writeFileSync(tmpCorpus, text, { mode: 0o600 });
           renameSync(tmpCorpus, corpusFile);
           // Additive signal for a local third-party consumer (never gbrain
@@ -1800,12 +1849,10 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           }
         }
         const retentionMs = corpusRetentionDays(cfg) * 24 * 60 * 60 * 1000;
-        gcOldFiles(dir, retentionMs); // [G15]
-        gcCorpusArtifacts(dir, retentionMs, [
-          CORPUS_INGESTED_SUFFIX,
-          CORPUS_CLAIM_SUFFIX,
-          HARVEST_RECEIPT_SUFFIX,
-        ]);
+        for (const gcDir of [dir, root]) { // the spool and the legacy top level
+          gcCorpusTurnFiles(gcDir, retentionMs); // [G15]; un-ingested turns kept longer (E-N1)
+          gcCorpusArtifacts(gcDir, retentionMs, [CORPUS_INGESTED_SUFFIX, CORPUS_CLAIM_SUFFIX, CORPUS_PROGRESS_SUFFIX, CORPUS_PROGRESS_LOCK_SUFFIX, HARVEST_RECEIPT_SUFFIX, CORPUS_FAILURE_SUFFIX], [dir, root]); // #6611
+        }
       }
     }
   } catch (e) {
@@ -1822,7 +1869,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
   try {
     if (ws) {
       const root = await resolveBootstrapWorkspaceRoot(ws);
-      if (root && (await repoPhaseComplete(root))) {
+      if (root && isManagedFilesystemPath(root)) {
+        if (outcome === 'ok' && !reason) reason = 'push_managed_coordinator';
+      } else if (root && (await repoPhaseComplete(root))) {
         try {
           (io.spawnPush ?? spawnDetachedPush)(root);
           if (outcome === 'ok' && !reason) reason = 'push_spawned';
@@ -1865,12 +1914,14 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
   // Deferred reasons apply LAST — visible when nothing about THIS session
   // degraded, never masking a current-session reason.
   for (const r of deferredReasons) degrade(r);
+  const hint = seatReasonHint(reason);
 
   await writeHeartbeat(io, {
     ts: new Date().toISOString(),
     event: 'session-end',
     outcome,
     ...(reason ? { reason } : {}),
+    ...(hint ? { hint } : {}),
     duration_ms: Date.now() - t0,
     ...(turnsN !== undefined ? { turns: turnsN } : {}),
     ...(bytesN !== undefined ? { bytes: bytesN } : {}),

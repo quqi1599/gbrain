@@ -23,6 +23,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { setCliExitVerdict } from '../src/core/cli-force-exit.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -51,6 +52,7 @@ import {
 } from '../src/core/bootstrap/host-specs.ts';
 import { AMBIENT_WRITEBACK_BLOCK_BEGIN } from '../src/core/bootstrap/instructions-block.ts';
 import type { ExecRunner } from '../src/core/bootstrap/repo.ts';
+import { buildClaudeHookCommand } from '../src/core/bootstrap/hooks.ts';
 import type { ConnectProbeResult } from '../src/core/connect-probe.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 import { VERSION } from '../src/version.ts';
@@ -147,6 +149,7 @@ function makeFake(opts: {
       });
     }) as unknown as typeof fetch,
     probeIdentity: async (_url: string, probeToken: string): Promise<ConnectProbeResult> => {
+      if (!health.ok) return { ok: false, reason: 'unreachable', message: 'fetch failed: ECONNREFUSED' };
       // Token-aware like a REAL serve: only tokens this fixture knows about
       // authenticate — the apply-time canary (a random same-format token)
       // must fail with reason 'auth' or every apply trips the impostor guard.
@@ -216,6 +219,8 @@ describe('parseHarnessArgs', () => {
     expect(parseHarnessArgs(['--source', 'Not Valid']).error).toMatch(/invalid --source/);
     expect(parseHarnessArgs(['--source', '__all__']).error).toMatch(/invalid --source/);
     expect(parseHarnessArgs(['--source', 'wiki']).source).toBe('wiki');
+    expect(parseHarnessArgs(['--refresh-skills']).refreshSkills).toBe(true);
+    expect(parseHarnessArgs(['--refresh-skills', '--status']).error).toMatch(/--refresh-skills alone/);
   });
   test('--project is repeatable and resolved', () => {
     const f = parseHarnessArgs(['--project', '/a', '--project', '/b']);
@@ -226,11 +231,40 @@ describe('parseHarnessArgs', () => {
 describe('consent gate', () => {
   test('non-TTY without --yes refuses BEFORE any mutation (no mint, no files)', async () => {
     const f = makeFake();
-    const code = await applyHarness(parseHarnessArgs([]), f.deps);
-    expect(code).toBe(2);
-    expect(f.err.join('\n')).toMatch(/pass --yes/);
+    let stdout = '';
+    const write = process.stdout.write;
+    process.stdout.write = ((c: string | Uint8Array) => { stdout += String(c); return true; }) as typeof process.stdout.write;
+    let code: number;
+    try {
+      code = await applyHarness(parseHarnessArgs(['--json']), f.deps);
+    } finally {
+      process.stdout.write = write;
+      setCliExitVerdict(0);
+    }
+    // C6: exit 3 with the consent payload (was exit 2 with a 'pass --yes' line).
+    expect(code).toBe(3);
+    const payload = JSON.parse(stdout);
+    expect(payload).toMatchObject({ code: 'confirmation_required', effects: ['persistent_install', 'credentials'] });
+    expect(payload.fix.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--json', '--yes']);
+    expect(payload.user_message).toContain('bootstrap harness --remove');
     expect(existsSync(f.userSettings)).toBe(false);
     expect(existsSync(f.codexConfig)).toBe(false);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('C6: a declined or EOF prompt (TTY) is a refusal, exit 3, nothing written', async () => {
+    const f = makeFake();
+    const write = process.stdout.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    let code: number;
+    try {
+      code = await applyHarness(parseHarnessArgs([]), { ...f.deps, isTTY: true, prompt: async () => '' });
+    } finally {
+      process.stdout.write = write;
+      setCliExitVerdict(0);
+    }
+    expect(code).toBe(3);
+    expect(existsSync(f.userSettings)).toBe(false);
     expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
   });
 
@@ -318,6 +352,19 @@ describe('full apply', () => {
     expect(code).toBe(0);
     const hooks = readJson(f.userSettings).hooks as Record<string, unknown>;
     expect(Object.keys(hooks).sort()).toEqual(['PreCompact', 'SessionStart', 'UserPromptSubmit']);
+  });
+
+  test('#5893 re-run mints each host from the token it replaces, carrying its grants', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(), f.deps)).toBe(0);
+    const first = readHarnessReceiptState(f.home);
+    if (first.state !== 'ok') throw new Error('expected a receipt');
+    expect(f.mintCalls.slice(0, 3).every(call => (call as { carry?: unknown }).carry === undefined)).toBe(true);
+    expect(await applyHarness(flags(['--source', 'wiki']), f.deps)).toBe(0);
+    const carried = f.mintCalls.slice(3).map(call => (call as { name: string; carry?: { fromId: string; explicitSource: boolean; policyAdded: string[] } }));
+    expect(carried.map(call => call.carry?.fromId)).toEqual(
+      carried.map(call => first.receipt.harness_tokens![call.name.replace('bootstrap-harness-', '') as HarnessTarget['host']]!.id));
+    expect(carried.every(call => call.carry?.explicitSource === true && call.carry.policyAdded.length === 0)).toBe(true);
   });
 
   test('re-run rotates mint-first [C7]: one entry per event, previous token revoked by id AFTER confirm', async () => {
@@ -412,6 +459,25 @@ describe('full apply', () => {
     );
     expect(code2).toBe(0);
     expect(readFileSync(f2.codexConfig, 'utf8')).toContain('http://192.168.1.50:3131/mcp');
+  });
+
+  test('registrar mode wires no Codex capture hook, the same recorded consent as the Claude lane (MCP only)', async () => {
+    const f = makeFake();
+    const code = await applyHarness(flags(['--url', 'http://192.168.1.50:3131/mcp', '--token', TOKEN_A, '--harness', 'codex']), f.deps);
+    expect(code).toBe(0);
+    expect(f.out.join('\n')).toContain('No hooks are wired by this invocation.');
+    expect(existsSync(join(dirname(f.codexConfig), 'hooks.json'))).toBe(false);
+    expect(readFileSync(f.codexConfig, 'utf8')).not.toContain('gbrain:codex-hooks-trust');
+  });
+
+  test('--no-capture declines the Codex SessionEnd capture hook (capture is its own consent item)', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex', '--no-capture']), f.deps)).toBe(0);
+    expect(existsSync(join(dirname(f.codexConfig), 'hooks.json'))).toBe(false);
+    const g = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex']), g.deps)).toBe(0);
+    expect(g.out.join('\n')).toMatch(/Codex session-transcript capture/);
+    expect(readFileSync(join(dirname(g.codexConfig), 'hooks.json'), 'utf8')).toContain('hook session-end --harness codex');
   });
 
   test('--project must exist [F4]', async () => {
@@ -679,6 +745,41 @@ describe('outside-voice hardening (X-batch)', () => {
     await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.not.toThrow(/pass --source/);
     expect(f.mintCalls).toHaveLength(0);
     expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  // #6661 (D25): the refusal's pre-mint carries the harness grant; a bare `--scopes read,write` token got join_brain refused.
+  test('LIVE_SERVE refusal prints the stop/mint/rescope/start/--token sequence with the full harness grant', async () => {
+    const f = makeFake({
+      pgliteLive: true,
+      hookSourceError: new Error("GBrain's local database is already open through `gbrain serve` (MCP, PID 4242)."),
+    });
+    const err = await applyHarness(flags(['--harness', 'codex']), f.deps).then(() => null, (e: unknown) => e as { code: string; message: string; details: { steps: string[]; scopes: string[]; operations: string[] } });
+    expect(err?.code).toBe('LIVE_SERVE');
+    const { steps, scopes, operations } = err!.details;
+    expect(scopes).toEqual(['read', 'write', 'skills_member_self']);
+    expect(operations).toEqual(expect.arrayContaining(['join_brain', 'sync_brain_skills', 'leave_brain', 'put_page', 'query']));
+    const { operations: all } = await import('../src/core/operations.ts');
+    const byName = new Map(all.map(op => [op.name, op]));
+    expect(operations.filter(name => byName.get(name)?.localOnly || !['read', 'write'].includes(byName.get(name)?.scope ?? ''))).toEqual([]);
+    expect(steps).toEqual([
+      'stop the serve that holds this brain',
+      'gbrain auth create bootstrap-harness --scopes read,write,skills_member_self',
+      `gbrain auth rescope --token bootstrap-harness --operations ${operations.join(',')}`,
+      'start `gbrain serve --http` again',
+      're-run this `gbrain bootstrap harness` command with --token <the token step 2 printed>',
+    ]);
+    for (const step of steps) expect(err!.message).toContain(step);
+    expect(f.mintCalls).toHaveLength(0);
+  });
+
+  test('LIVE_SERVE refusal on a memory-only re-run with --source carries the memory-only grant and the source floor', async () => {
+    const f = makeFake({ pgliteLive: true, mintQueue: [] });
+    const err = await applyHarness(flags(['--harness', 'codex', '--skills', 'memory-only', '--source', 'wiki', '--token-name', 'hx']), f.deps)
+      .then(() => null, (e: unknown) => e as { code: string; details: { steps: string[]; operations: string[] } });
+    expect(err?.code).toBe('LIVE_SERVE');
+    expect(err!.details.steps[1]).toBe('gbrain auth create hx --scopes read,write');
+    expect(err!.details.steps[2]).toMatch(/^gbrain auth rescope --token hx --operations \S+ --sources wiki$/);
+    expect(err!.details.operations).not.toContain('join_brain');
   });
 
   test('live PGLite serve + --token + no --source: wires unpinned with a warning (the documented PGLite lane)', async () => {
@@ -1493,6 +1594,41 @@ describe('ambient-writeback instruction blocks (kind: instructions, WP3)', () =>
     expect(payload.instructions_blocks.find((p) => p.host === 'claude-code')?.probe).toBe('installed');
   });
 
+  // #5671: an explicitly-private brain default meets an HTTP harness — the
+  // wired sessions are remote readers, which only read world facts back.
+  const WB_PRIVATE = (): GBrainConfig => ({ engine: 'pglite', memory: { auto_writeback: 'salient', visibility_posture: 'private' } });
+  const PRIVATE_WARN = /WARNING: facts\.default_visibility is private, but this harness reads the brain over HTTP MCP/;
+
+  test('#5671 private default + HTTP harness → warning names the consequence and the fix before consent', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(), { ...f.deps, loadFileConfig: WB_PRIVATE })).toBe(0);
+    const err = f.err.join('\n');
+    expect(err).toMatch(PRIVATE_WARN);
+    expect(err).toContain('cannot recall');
+    expect(err).toContain('gbrain config set facts.default_visibility world');
+    // The installed block states the same consequence to the agent.
+    expect(readFileSync(memoryPath(f), 'utf8')).toContain('cannot recall or forget a fact you save as private');
+  });
+
+  test('#5671 private default warns even with writeback off (extract_facts and harvests still write private)', async () => {
+    const f = makeFake();
+    const PRIVATE_OFF = (): GBrainConfig => ({ engine: 'pglite', memory: { visibility_posture: 'private' } });
+    expect(await applyHarness(flags(), { ...f.deps, loadFileConfig: PRIVATE_OFF })).toBe(0);
+    expect(f.err.join('\n')).toMatch(PRIVATE_WARN);
+  });
+
+  test('#5671 world posture and registrar mode stay quiet', async () => {
+    const world = makeFake();
+    expect(await applyHarness(flags(), { ...world.deps, loadFileConfig: WB_ON })).toBe(0);
+    expect(world.err.join('\n')).not.toMatch(PRIVATE_WARN);
+    const registrar = makeFake();
+    expect(await applyHarness(
+      flags(['--url', 'http://192.168.1.50:3131/mcp', '--token', TOKEN_A, '--harness', 'codex']),
+      { ...registrar.deps, loadFileConfig: WB_PRIVATE },
+    )).toBe(0);
+    expect(registrar.err.join('\n')).not.toMatch(PRIVATE_WARN);
+  });
+
   test('default file-plane read honors GBRAIN_HOME: config.json with salient enables the target without an injected loader', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'gb-wb-home-'));
     mkdirSync(join(parent, '.gbrain'), { recursive: true });
@@ -1508,5 +1644,274 @@ describe('ambient-writeback instruction blocks (kind: instructions, WP3)', () =>
     // claude-only run: no codex target, no codex agents-file write.
     expect(existsSync(agentsPath(f))).toBe(false);
     expect(instrTargets(f.home).map((t) => t.host)).toEqual(['claude-code']);
+  });
+});
+
+// ── #6092 / #6171: hook entries the host stripped of their _gbrain marker ──
+
+/** Drop the `_gbrain` key from every hook entry, as a Claude Code settings rewrite can. */
+function stripMarkers(path: string): void {
+  const s = readJson(path);
+  for (const groups of Object.values((s.hooks ?? {}) as Record<string, Array<{ hooks?: Array<Record<string, unknown>> }>>)) {
+    for (const g of groups) for (const e of g.hooks ?? []) delete e._gbrain;
+  }
+  writeFileSync(path, JSON.stringify(s, null, 2));
+}
+
+function hookEntries(path: string, event: string): Array<Record<string, unknown>> {
+  const groups = ((readJson(path).hooks ?? {}) as Record<string, Array<{ hooks?: Array<Record<string, unknown>> }>>)[event] ?? [];
+  return groups.flatMap((g) => g.hooks ?? []);
+}
+
+function harnessReceipt(home: string): HarnessReceipt {
+  const state = readHarnessReceiptState(home);
+  if (state.state !== 'ok') throw new Error(`receipt ${state.state}`);
+  return state.receipt;
+}
+
+describe('harness hooks without their marker (#6092, #6171)', () => {
+  const CLAUDE = ['--harness', 'claude-code'];
+
+  test('apply → host strips markers → --remove exits 0, removes all five, lists them, consumes the receipt', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    const s = readJson(f.userSettings);
+    (s.hooks as Record<string, unknown[]>).SessionStart.push({ hooks: [{ type: 'command', command: 'echo mine' }] });
+    s.model = 'opus';
+    writeFileSync(f.userSettings, JSON.stringify(s, null, 2));
+    stripMarkers(f.userSettings);
+
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), f.deps)).toBe(0);
+    const after = readJson(f.userSettings);
+    expect(after.hooks).toEqual({ SessionStart: [{ hooks: [{ type: 'command', command: 'echo mine' }] }] });
+    expect(after.model).toBe('opus');
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+    const out = f.out.join('\n');
+    for (const event of CLAUDE_HOOK_EVENTS) expect(out).toContain(`removed unmarked hooks.${event} entry`);
+    expect(out).not.toContain('/opt/fake/gbrain hook');
+    expect(out).toMatch(/fully removed/);
+  });
+
+  test('apply → strip → re-apply converges to exactly one marked entry per event', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    stripMarkers(f.userSettings);
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    for (const event of CLAUDE_HOOK_EVENTS) {
+      const entries = hookEntries(f.userSettings, event);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!._gbrain).toBe(GBRAIN_HARNESS_MARKER_VALUE);
+    }
+    const hooks = harnessReceipt(f.home).targets.find((t) => t.kind === 'hooks');
+    expect(hooks?.launcher).toBe('/opt/fake/gbrain');
+    expect(hooks?.seat).toBe('');
+  });
+
+  test('a launcher recorded on the receipt is claimed after an upgrade moves the binary', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    stripMarkers(f.userSettings);
+    expect(await applyHarness(flags([...CLAUDE, '--gbrain-bin', '/opt/new/gbrain']), f.deps)).toBe(0);
+    for (const event of CLAUDE_HOOK_EVENTS) {
+      const entries = hookEntries(f.userSettings, event);
+      expect(entries).toHaveLength(1);
+      expect(String(entries[0]!.command)).toContain('/opt/new/gbrain hook');
+    }
+  });
+
+  test('another install\'s unmarked hooks (different launcher, not on the receipt) survive install and remove', async () => {
+    const f = makeFake();
+    const other = buildClaudeHookCommand('/opt/other-install/gbrain', 'Stop', { GBRAIN_SOURCE: 'default', GBRAIN_HOOK_LANE: 'harness' });
+    writeFileSync(f.userSettings, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: other }] }] } }));
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    expect(f.err.join('\n')).toContain('harness_hook_unowned');
+    expect(hookEntries(f.userSettings, 'Stop').map((e) => e.command)).toContain(other);
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), f.deps)).toBe(1);
+    expect(hookEntries(f.userSettings, 'Stop').map((e) => e.command)).toEqual([other]);
+  });
+
+  test('an edited lookalike keeps the hooks target failed (exit 1, harness_hook_unowned); a retry after the hand edit exits 0', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    const s = readJson(f.userSettings);
+    const stop = (s.hooks as Record<string, Array<{ hooks: Array<Record<string, unknown>> }>>).Stop[0]!.hooks[0]!;
+    delete stop._gbrain;
+    stop.command = `${String(stop.command)} | tee /tmp/stop.log`;
+    writeFileSync(f.userSettings, JSON.stringify(s, null, 2));
+
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), f.deps)).toBe(1);
+    expect(hookEntries(f.userSettings, 'Stop')).toHaveLength(1);
+    for (const event of CLAUDE_HOOK_EVENTS.filter((e) => e !== 'Stop')) expect(hookEntries(f.userSettings, event)).toHaveLength(0);
+    const hooks = harnessReceipt(f.home).targets.find((t) => t.kind === 'hooks');
+    expect(hooks?.state).toBe('failed');
+    expect(hooks?.error).toContain('harness_hook_unowned');
+    const err = f.err.join('\n');
+    expect(err).toContain('[gbrain notice harness_hook_unowned kind=safety]');
+    expect(err).toContain('next: tell_user_to_run');
+    expect(err).toContain('fix: gbrain bootstrap harness --remove');
+    expect(err).toContain('verify: gbrain bootstrap harness --status');
+    expect(f.out.join('\n')).not.toMatch(/fully removed/);
+
+    const fixed = readJson(f.userSettings);
+    delete (fixed.hooks as Record<string, unknown>).Stop;
+    writeFileSync(f.userSettings, JSON.stringify(fixed, null, 2));
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), f.deps)).toBe(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('--remove --dry-run lists what would go and writes nothing', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    stripMarkers(f.userSettings);
+    const settingsBefore = readFileSync(f.userSettings, 'utf8');
+    const receiptBefore = readFileSync(harnessReceiptPath(f.home), 'utf8');
+    const callsBefore = f.calls.length;
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--dry-run', '--yes']), f.deps)).toBe(0);
+    expect(readFileSync(f.userSettings, 'utf8')).toBe(settingsBefore);
+    expect(readFileSync(harnessReceiptPath(f.home), 'utf8')).toBe(receiptBefore);
+    expect(f.calls.length).toBe(callsBefore);
+    expect(f.revoked).toEqual([]);
+    const out = f.out.join('\n');
+    for (const event of CLAUDE_HOOK_EVENTS) expect(out).toContain(`would remove unmarked hooks.${event} entry`);
+    expect(out).toContain('would remove 5 harness hook entries');
+    expect(parseHarnessArgs(['--dry-run']).error).toMatch(/--remove --dry-run/);
+  });
+
+  test('apply → re-apply → --remove drops our mcp__gbrain; a pre-existing entry still survives', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags([...CLAUDE, '--no-hooks']), f.deps)).toBe(0);
+    expect(await applyHarness(flags([...CLAUDE, '--no-hooks']), f.deps)).toBe(0);
+    expect(harnessReceipt(f.home).targets.find((t) => t.kind === 'permission')?.mechanism).toBe('added');
+    expect(f.out.join('\n')).not.toMatch(/pre-existing/);
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), f.deps)).toBe(0);
+    expect(JSON.stringify(readJson(f.userSettings))).not.toContain('mcp__gbrain');
+
+    const g = makeFake();
+    writeFileSync(g.userSettings, JSON.stringify({ permissions: { allow: ['mcp__gbrain'] } }));
+    expect(await applyHarness(flags([...CLAUDE, '--no-hooks']), g.deps)).toBe(0);
+    expect(await applyHarness(flags([...CLAUDE, '--no-hooks']), g.deps)).toBe(0);
+    expect(harnessReceipt(g.home).targets.find((t) => t.kind === 'permission')?.mechanism).toBe('pre-existing');
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), g.deps)).toBe(0);
+    expect((readJson(g.userSettings).permissions as { allow: string[] }).allow).toEqual(['mcp__gbrain']);
+  });
+
+  test('a failed smoke on a re-run keeps the restored registration\'s pre-approval', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags([...CLAUDE, '--no-hooks']), f.deps)).toBe(0);
+    const deps: HarnessDeps = { ...f.deps, probeIdentity: async () => ({ ok: false, reason: 'auth', message: 'HTTP 401' }) };
+    expect(await applyHarness(flags([...CLAUDE, '--no-hooks']), deps)).toBe(1);
+    expect((readJson(f.userSettings).permissions as { allow: string[] }).allow).toEqual(['mcp__gbrain']);
+  });
+
+  test('cross-HOME guard: another install\'s UNMARKED user-scope hooks block --project wiring', async () => {
+    const f = makeFake();
+    const hooks = Object.fromEntries(CLAUDE_HOOK_EVENTS.map((e) => [e, [{ hooks: [{
+      type: 'command', command: buildClaudeHookCommand('/opt/other-home/gbrain', e, { GBRAIN_SOURCE: 'default', GBRAIN_HOOK_LANE: 'harness' }),
+    }] }]]));
+    writeFileSync(f.userSettings, JSON.stringify({ hooks }));
+    const project = mkdtempSync(join(tmpdir(), 'gb-harness-proj-'));
+    expect(await applyHarness(flags([...CLAUDE, '--project', project]), f.deps)).toBe(2);
+    expect(f.err.join('\n')).toMatch(/user-scope harness hooks already exist/);
+    expect(existsSync(join(project, '.claude', 'settings.local.json'))).toBe(false);
+  });
+
+  test('W4.8: cross-HOME guard counts an EDITED user-scope harness hook (appended redirect, wrapper) too', async () => {
+    for (const edit of [(c: string) => `${c} 2>/dev/null`, (c: string) => `timeout 5 ${c}`]) {
+      const f = makeFake();
+      const hooks = Object.fromEntries(CLAUDE_HOOK_EVENTS.map((e) => [e, [{ hooks: [{
+        type: 'command', command: edit(buildClaudeHookCommand('/opt/other-home/gbrain', e, { GBRAIN_HOOK_LANE: 'harness' })),
+      }] }]]));
+      writeFileSync(f.userSettings, JSON.stringify({ hooks }));
+      const project = mkdtempSync(join(tmpdir(), 'gb-harness-proj-'));
+      expect(await applyHarness(flags([...CLAUDE, '--project', project]), f.deps)).toBe(2);
+      expect(f.err.join('\n')).toMatch(/user-scope harness hooks already exist .*edited entries included/);
+      expect(existsSync(join(project, '.claude', 'settings.local.json'))).toBe(false);
+    }
+  });
+
+  test('W4.8: an unrelated user-scope hook does not block --project wiring', async () => {
+    const f = makeFake();
+    writeFileSync(f.userSettings, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo hello' }] }] } }));
+    const project = mkdtempSync(join(tmpdir(), 'gb-harness-proj-'));
+    expect(await applyHarness(flags([...CLAUDE, '--project', project]), f.deps)).toBe(0);
+  });
+
+  test('--status reports each hook carrier, counting unmarked entries as ours', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(CLAUDE), f.deps)).toBe(0);
+    stripMarkers(f.userSettings);
+    f.out.length = 0;
+    await statusHarness(parseHarnessArgs(['--status']), f.deps);
+    expect(f.out.join('\n')).toContain(`hook entries in ${f.userSettings}: 5 gbrain (5 without the _gbrain marker)`);
+  });
+});
+
+// #6661 option B: on PGLite a stopped serve is the normal state for a --token run, so nothing answering is
+// pending verification (exit 13, JSON status pending_verify) instead of a hard stop; everything else still fails.
+describe('--token on PGLite with no serve answering: pending_verify (#6661)', () => {
+  const pglite = () => ({ engine: 'pglite' } as GBrainConfig);
+
+  test('wires, skips the smoke without rolling back, records verify_pending and names the re-run as the fix', async () => {
+    const f = makeFake({ health: { ok: false } });
+    f.deps.loadFileConfig = pglite;
+    const code = await applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A, '--json']), f.deps);
+    expect(code).toBe(13);
+    const doc = JSON.parse(f.out.at(-1)!) as { status: string; code: string; smoke_ok: boolean; targets: HarnessTarget[]; fix: { argv: string[]; next: string; inputs: Array<{ name: string }>; verify: { argv: string[] } } };
+    expect(doc.status).toBe('pending_verify');
+    expect(doc.code).toBe('pending_verify');
+    expect(doc.smoke_ok).toBe(false);
+    expect(doc.targets.every(t => t.state === 'confirmed')).toBe(true);
+    expect(doc.fix.next).toBe('tell_user_to_run');
+    expect(doc.fix.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--yes', '--harness', 'codex', '--token', '<TOKEN>', '--source', 'default']);
+    expect(JSON.stringify(doc)).not.toContain(TOKEN_A);
+    expect(doc.fix.inputs.map(i => i.name)).toEqual(['TOKEN']);
+    expect(doc.fix.verify.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--status', '--json']);
+    expect(readFileSync(f.codexConfig, 'utf8')).toContain(`Authorization = "Bearer ${TOKEN_A}"`);
+    const state = readHarnessReceiptState(f.home);
+    expect(state.state === 'ok' && state.receipt.verify_pending?.reason).toBe('serve_unreachable');
+
+    // --status stays partial (exit 1) while pending, even once the serve answers and the token verifies.
+    f.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), f.deps)).toBe(1);
+    expect(JSON.parse(f.out.join('\n'))).toMatchObject({ status: 'partial', serve_ok: false, verify_pending: { reason: 'serve_unreachable' } });
+    const up = makeFake();
+    up.deps.gbrainHome = f.home;
+    up.deps.codexConfig = f.codexConfig;
+    up.deps.loadFileConfig = pglite;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), up.deps)).toBe(1);
+    expect(JSON.parse(up.out.join('\n'))).toMatchObject({ status: 'partial', serve_ok: true, token_verified: true });
+
+    // The fix's re-run with the serve up passes its smoke, writes a fresh receipt without the marker, and status is green.
+    const rerun = doc.fix.argv.slice(3).map(a => (a === '<TOKEN>' ? TOKEN_A : a));
+    expect(await applyHarness(parseHarnessArgs(rerun), up.deps)).toBe(0);
+    const after = readHarnessReceiptState(f.home);
+    expect(after.state === 'ok' && after.receipt.verify_pending).toBeUndefined();
+    up.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), up.deps)).toBe(0);
+  });
+
+  test('a serve that holds the brain but does not answer at this url (wrong --url/--port) still fails with no writes', async () => {
+    const f = makeFake({ health: { ok: false }, pgliteLive: true });
+    f.deps.loadFileConfig = pglite;
+    expect(await applyHarness(flags(['--harness', 'codex', '--port', '9999', '--token', TOKEN_A]), f.deps)).toBe(1);
+    expect(f.err.join('\n')).toMatch(/no healthy gbrain serve/);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('without --token, on Postgres, or when something non-gbrain answers, the health failure is still a hard stop', async () => {
+    const noToken = makeFake({ health: { ok: false } });
+    noToken.deps.loadFileConfig = pglite;
+    expect(await applyHarness(flags(['--harness', 'codex']), noToken.deps)).toBe(1);
+    const postgres = makeFake({ health: { ok: false } });
+    postgres.deps.loadFileConfig = () => ({ engine: 'postgres' } as GBrainConfig);
+    expect(await applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A]), postgres.deps)).toBe(1);
+    const answered = makeFake();
+    answered.deps.loadFileConfig = pglite;
+    answered.deps.fetchFn = (async () => new Response('nope', { status: 404 })) as unknown as typeof fetch;
+    expect(await applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A]), answered.deps)).toBe(1);
+    for (const f of [noToken, postgres, answered]) {
+      expect(f.err.join('\n')).toMatch(/no healthy gbrain serve/);
+      expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+    }
   });
 });

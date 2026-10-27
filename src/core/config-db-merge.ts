@@ -3,7 +3,7 @@
  *
  * DB-plane values that `gbrain config set` accepted for years, `config get`
  * echoed back, and NOTHING read: provider credentials, chat/expansion model
- * pins, the chat fallback chain, and flat `cycle.*` knobs. This module owns
+ * pins, the chat fallback chain and its refusal switch, and flat `cycle.*` knobs. This module owns
  * their sparse-merge into the loaded config — called by
  * `loadConfigWithEngine()` (src/core/config.ts) after its per-key merges,
  * with the same precedence: env > file > DB.
@@ -65,15 +65,96 @@ export interface DbPlaneEngineReader {
   ): Promise<T[]>;
 }
 
+/**
+ * The DB-plane `chat_fallback_chain` string: the comma-separated form the
+ * GBRAIN_CHAT_FALLBACK_CHAIN env var uses, or a JSON string array. `error`
+ * names why a JSON payload was rejected (doctor reports it); an empty chain
+ * is no chain.
+ */
+export function parseDbChatFallbackChain(raw: string): { chain?: string[]; error?: string } {
+  if (!raw.trim().startsWith('[')) {
+    const chain = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    return chain.length > 0 ? { chain } : {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === 'string')) return { error: 'is not a JSON array of strings' };
+    const chain = parsed.map((s) => s.trim()).filter(Boolean);
+    return chain.length > 0 ? { chain } : {};
+  } catch (err) {
+    return { error: `is not valid JSON (${(err as Error).message})` };
+  }
+}
+
 /** The flat scalar keys the batched read fetches (plus the `cycle.` prefix). */
 const DB_MERGED_SCALAR_KEYS: readonly string[] = [
   ...DB_MERGED_PROVIDER_KEY_FIELDS,
   'expansion_model',
   'chat_model',
   'chat_fallback_chain',
+  'chat_fallback_on_refusal',
 ];
 
 const CYCLE_PREFIX = 'cycle.';
+const CHAT_OPTIONS_PREFIX = 'provider_chat_options.';
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** A copy of a parsed JSON value with prototype-polluting keys dropped at every depth. */
+function withoutUnsafeKeys(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(withoutUnsafeKeys);
+  if (!isPlainRecord(v)) return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, child] of Object.entries(v)) if (!UNSAFE_KEYS.has(k)) out[k] = withoutUnsafeKeys(child);
+  return out;
+}
+
+/** Per-leaf merge: values already in `over` win; `under` fills the gaps. */
+function fillLeaves(over: Record<string, unknown>, under: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...over };
+  for (const [k, v] of Object.entries(under)) {
+    if (out[k] === undefined) out[k] = v;
+    else if (isPlainRecord(out[k]) && isPlainRecord(v)) out[k] = fillLeaves(out[k] as Record<string, unknown>, v);
+  }
+  return out;
+}
+
+/**
+ * #6290: split a dotted `provider_chat_options.<selector>.<path>` remainder.
+ * Model ids carry dots (`openai:gpt-5.4`), so the path starts at the first
+ * dot followed by a non-digit; `path` is empty when there is none.
+ */
+export function splitChatOptionsKey(rest: string): { selector: string; path: string[] } {
+  const m = /\.(?=[^0-9.])/.exec(rest);
+  if (!m) return { selector: rest, path: [] };
+  return { selector: rest.slice(0, m.index), path: rest.slice(m.index + 1).split('.') };
+}
+
+function parseJsonOrString(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return raw; }
+}
+
+/**
+ * `gbrain config set provider_chat_options.<selector> <value>` takes one JSON
+ * object per selector. A dotted leaf (`...<selector>.thinking.type disabled`)
+ * or a non-object value is refused with the exact JSON-form command.
+ */
+export function assertProviderChatOptionsSetValue(key: string, value: string): void {
+  const rest = key.slice(CHAT_OPTIONS_PREFIX.length);
+  const { selector, path } = splitChatOptionsKey(rest);
+  const parsed = parseJsonOrString(value);
+  if (selector && path.length === 0 && isPlainRecord(parsed)) return;
+  let leaf: unknown = parsed;
+  for (const segment of [...path].reverse()) leaf = { [segment]: leaf };
+  const example = isPlainRecord(leaf) ? JSON.stringify(leaf) : '{"thinking":{"type":"disabled"}}';
+  throw new Error(
+    `${key} takes one JSON object per selector (provider_chat_options.<provider> or provider_chat_options.<provider>:<model>); nothing was written. ` +
+    `Run: gbrain config set ${CHAT_OPTIONS_PREFIX}${selector || '<provider>'} '${example.replace(/'/g, `'\\''`)}'`,
+  );
+}
 
 /**
  * D2 remediation: this merge used to issue ~12 sequential `engine.getConfig`
@@ -116,7 +197,7 @@ async function readDbPlaneMergeValues(
   if (typeof engine.executeRaw === 'function') {
     try {
       const rows = await engine.executeRaw<{ key: string; value: string | null }>(
-        `SELECT key, value FROM config WHERE key = ANY($1) OR key LIKE 'cycle.%'`,
+        `SELECT key, value FROM config WHERE key = ANY($1) OR key LIKE 'cycle.%' OR key LIKE 'provider\\_chat\\_options.%'`,
         [[...DB_MERGED_SCALAR_KEYS]],
       );
       for (const row of rows) {
@@ -138,13 +219,14 @@ async function readDbPlaneMergeValues(
     }
     if (typeof engine.listConfigKeys === 'function') {
       try {
-        for (const key of await engine.listConfigKeys(CYCLE_PREFIX)) {
-          if (!key.startsWith(CYCLE_PREFIX)) continue;
+        // One listing for both prefixes (the fallback stays one round-trip per merge).
+        for (const key of await engine.listConfigKeys('')) {
+          if (!key.startsWith(CYCLE_PREFIX) && !key.startsWith(CHAT_OPTIONS_PREFIX)) continue;
           const v = await engine.getConfig(key).catch(() => undefined);
           if (v !== undefined && v !== null && v !== '') values.set(key, v);
         }
       } catch {
-        // quiet failure — no cycle merge this load
+        // quiet failure — no cycle / chat-options merge this load
       }
     }
   }
@@ -185,25 +267,15 @@ export async function applyDbPlaneReadSideMerge(
   if (merged.chat_fallback_chain === undefined) {
     const rawChain = values.get('chat_fallback_chain');
     if (rawChain !== undefined) {
-      let chain: string[] | undefined;
-      if (rawChain.trim().startsWith('[')) {
-        try {
-          const parsed = JSON.parse(rawChain);
-          if (Array.isArray(parsed) && parsed.every((x) => typeof x === 'string')) {
-            chain = parsed.map((s) => s.trim()).filter(Boolean);
-          } else {
-            console.warn('[gbrain] config: chat_fallback_chain DB value is not a JSON array of strings; ignoring');
-          }
-        } catch (err) {
-          console.warn(`[gbrain] config: chat_fallback_chain DB value is not valid JSON; ignoring (${(err as Error).message})`);
-        }
-      } else {
-        chain = rawChain.split(',').map((s) => s.trim()).filter(Boolean);
-      }
-      if (chain !== undefined && chain.length > 0) {
-        merged.chat_fallback_chain = chain;
-      }
+      const parsed = parseDbChatFallbackChain(rawChain);
+      if (parsed.error) console.warn(`[gbrain] config: chat_fallback_chain DB value ${parsed.error}; ignoring`);
+      if (parsed.chain) merged.chat_fallback_chain = parsed.chain;
     }
+  }
+  // chat_fallback_on_refusal — 'true' / 'false' (strict); any other DB value is ignored.
+  if (merged.chat_fallback_on_refusal === undefined) {
+    const rawOnRefusal = values.get('chat_fallback_on_refusal');
+    if (rawOnRefusal === 'true' || rawOnRefusal === 'false') merged.chat_fallback_on_refusal = rawOnRefusal === 'true';
   }
 
   // Flat cycle.* merge (#2137/#4297 read-side), fed by the same batched read
@@ -223,5 +295,37 @@ export async function applyDbPlaneReadSideMerge(
       if (nextCycle[leaf] === undefined) nextCycle[leaf] = value;
     }
     merged.cycle = nextCycle;
+  }
+
+  // #6290: provider_chat_options rows. Canonical form: one JSON object per
+  // selector. A legacy dotted-leaf row is read only when its selector has no
+  // dot (the split is then unambiguous); otherwise it is ignored with a
+  // value-free warning. File plane wins per leaf; prototype keys are dropped.
+  const dbChatOptions: Record<string, Record<string, unknown>> = {};
+  for (const key of [...values.keys()].sort()) {
+    if (!key.startsWith(CHAT_OPTIONS_PREFIX)) continue;
+    const rest = key.slice(CHAT_OPTIONS_PREFIX.length);
+    const parsed = withoutUnsafeKeys(parseJsonOrString(values.get(key)!));
+    let selector = rest;
+    let entry: unknown = parsed;
+    const split = splitChatOptionsKey(rest);
+    if (split.path.length > 0 || !isPlainRecord(parsed)) {
+      if (split.path.length === 0 || split.selector.includes('.') || !split.selector) {
+        console.warn(`[gbrain] config: ${key} is not a JSON object per selector; ignoring. Store it as gbrain config set ${CHAT_OPTIONS_PREFIX}<selector> '<json object>'.`);
+        continue;
+      }
+      if (split.path.some((segment) => UNSAFE_KEYS.has(segment))) continue;
+      selector = split.selector;
+      for (const segment of [...split.path].reverse()) entry = { [segment]: entry };
+    }
+    if (!selector || UNSAFE_KEYS.has(selector) || !isPlainRecord(entry)) continue;
+    dbChatOptions[selector] = fillLeaves(dbChatOptions[selector] ?? {}, entry);
+  }
+  if (Object.keys(dbChatOptions).length > 0) {
+    const next: Record<string, Record<string, unknown>> = { ...(merged.provider_chat_options ?? {}) };
+    for (const [selector, options] of Object.entries(dbChatOptions)) {
+      next[selector] = fillLeaves(isPlainRecord(next[selector]) ? next[selector] : {}, options);
+    }
+    merged.provider_chat_options = next;
   }
 }

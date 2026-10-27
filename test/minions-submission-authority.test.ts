@@ -14,6 +14,7 @@ import { readSourceFileSync, writeSourceFileSync, withSourceFilesystemLock } fro
 import { APPLICATION_AUTHORITY, assertNoUnreviewedJobs, assertRemoteJobControl, authorizeJobExecution, prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 const sandbox = mkdtempSync(join(tmpdir(), 'gbrain-job-authority-'));
 const root = join(sandbox, 'repo');
@@ -79,6 +80,18 @@ describe('generic remote job authority', () => {
     await expect(prepareRemoteJob(stdio, 'lint', {})).rejects.toThrow('persistent principal');
     await engine.executeRaw("UPDATE sources SET config = '{}'::jsonb, local_path = NULL WHERE id = 'default'");
     await expect(prepareRemoteJob(ctx(), 'lint', {})).rejects.toThrow('registered filesystem root');
+  }));
+
+  test('every authorization refusal names its own next step; a nested pull names the noPull form', () => isolated(async () => {
+    expectFunnelSuggestions('src/core/minions/submission-authority.ts', 'deny', 38);
+    const unsupported = envelopeFor(await caught(() => prepareRemoteJob(ctx(), 'embed', {})), 'stdio');
+    expect(unsupported).toMatchObject({ code: 'permission_denied' });
+    expect(unsupported.suggestion).toContain('Use the dedicated operation for embed work');
+    const nested = join(root, 'nested-pull'); mkdirSync(nested, { recursive: true });
+    await engine.executeRaw("UPDATE sources SET local_path = $1 WHERE id = 'default'", [nested]);
+    try {
+      expect(envelopeFor(await caught(() => prepareRemoteJob(ctx(), 'sync', { pull: true })), 'http').suggestion).toContain('{"noPull": true}');
+    } finally { await engine.executeRaw("UPDATE sources SET local_path = $1 WHERE id = 'default'", [root]); }
   }));
 
   test('nested source defaults no-pull and rejects explicit whole-worktree mutation', () => isolated(async () => {
@@ -167,6 +180,18 @@ describe('generic remote job authority', () => {
     const local = await queue.add('maintenance', {});
     await engine.executeRaw("UPDATE minion_jobs SET status = 'failed' WHERE id = $1", [local.id]);
     await expect(jobsOperations.find(op => op.name === 'retry_job')!.handler(ctx(), { id: local.id })).rejects.toThrow('submitting principal');
+  }));
+
+  test('#7241: a remote submit carrying __submitter never shows as a local submitter', () => isolated(async () => {
+    const operation = jobsOperations.find(op => op.name === 'submit_job')!;
+    await expect(operation.handler(ctx(), { name: 'lint', data: { __submitter: 'autopilot' } })).rejects.toThrow('unsupported');
+    const result = await operation.handler(ctx(), { name: 'lint', data: {} }) as Record<string, unknown>;
+    expect((await queue.getJob(result.id as number))?.data.__submitter).toBeUndefined();
+    await engine.executeRaw(`UPDATE minion_jobs SET data = data || '{"__submitter":"autopilot"}'::jsonb WHERE id = $1`, [result.id]);
+    const get = jobsOperations.find(op => op.name === 'get_job')!;
+    const host = { ...ctx(), remote: false, auth: undefined };
+    expect((await get.handler(host, { id: result.id }) as Record<string, unknown>).submitted_by)
+      .toEqual({ kind: 'mcp_client', id: 'client-a', principal_kind: 'oauth_client' });
   }));
 
   test('legacy preview is inert, CAS detects changes, exact IDs retain scheduling and dependencies', () => isolated(async () => {

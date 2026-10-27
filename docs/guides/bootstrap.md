@@ -39,6 +39,18 @@ follows is `BOOTSTRAP_FOR_AGENTS.md` at the repo root, fetched at the
 | Private GitHub repo | your account, created by `bootstrap repo` (or an empty repo you made yourself, adopted) | privacy verified via API |
 | Machine receipt | `~/.gbrain/bootstrap/receipt.json` | uninstall is keyed to it |
 
+**What session start shows:** the SessionStart hook prints your
+allowlisted MEMORY.md sections, push status and hook health, plus a warm
+context pack. It never shows another session's activity, and no setting
+turns that on. Session buffers that releases before v0.60.28.0 left in
+`~/.gbrain/transcripts/live/` are deleted by the stop hook once they are 7
+days old; you can also delete them by hand. If you set `GBRAIN_HOOKS=0` to
+hide the `Last session activity` line those releases printed, remove it from
+the environment the harness starts from (shell profile or service) after
+upgrading the `gbrain` the harness runs, then restart the harness:
+`GBRAIN_HOOKS=0` also turns off capture, session persistence and crash
+recovery.
+
 **What does NOT run:** anything while the harness is closed. Session-triggered
 schedules fire at turn/session boundaries only. True 24/7 operation is what a
 hosted brain provides — this is the honest desktop contract.
@@ -168,7 +180,7 @@ you'd apply to any journal: write what you'd be comfortable persisting.
 | Hooks (Claude Code) | pull protocol via AGENTS.md gates | automatic per-turn context + session-end persistence |
 | Codex (SessionEnd hook only, no MCP scope flag) | pull protocol + MCP tools + session-end capture (a trust-gated `hooks.json` entry bootstrap manages) | per-turn push (codex hooks are wired for SessionEnd only — per-turn context stays the pull protocol) + the ability to confine MCP reach to one folder (`codex mcp add` is always user-global) |
 | opencode (no wired hooks; scope INVERTED: user-global by default) | pull protocol (opencode reads AGENTS.md natively) + MCP tools; project scope available as an explicit opt-in | per-turn push (opencode ships a plugin/event system, but gbrain does not wire it yet). The project-scope default is deliberately NOT offered: opencode spawns project-config servers with no trust prompt, so a committed entry would auto-execute on every collaborator machine |
-| Bootstrap at all (plugin-only install) | MCP tools (`starter` surface, `--source-guard`) + the curated skill set via the codex/claude plugin (docs/mcp/CODEX.md) | identity files, hooks/push protocol, the private-repo body — the plugin is the lightweight lane; bootstrap is the full agent |
+| Bootstrap at all (plugin-only install) | MCP tools (`full` surface, `--source-guard`) + the curated skill set via the codex/claude plugin (docs/mcp/CODEX.md) | identity files, hooks/push protocol (the Codex and Claude Code plugins carry no hooks; the one plugin that pushes is the local OpenClaw context engine, `gbrain-context-engine` — see docs/guides/push-context.md), the private-repo body — the plugin is the lightweight lane; bootstrap is the full agent |
 | Memorable relay (declined or never disclosed) | everything — the integration is additive and off by default | replayable cross-session procedures via the third-party Memorable service (`docs/memorable-agents.md`) |
 | Ambient memory writeback (left off — the default) | everything — the feature is additive; agents still save when explicitly asked (`remember`) | unprompted capture of directly-stated user facts (instructions section, harness blocks, Stop-hook backstop — `docs/guides/ambient-writeback.md`). On Codex specifically, enabling it still has NO per-turn hook: real-time saves ride the instruction blocks; the SessionEnd→sweep lane is the delayed backstop |
 | Second simultaneous session | first session unaffected | second session's brain tools fail politely (one live serve per brain — v1 contract) |
@@ -269,13 +281,79 @@ mode wires them in one command, with no `agent.json` and no interview:
   and run even while a serve is live; the token revoke defers with exact
   instructions if a live PGLite serve holds the brain. `gbrain bootstrap
   uninstall` removes harness wiring first, automatically.
+  `gbrain bootstrap harness --remove --dry-run` lists what removal would do
+  (including each unmarked hook entry it would delete) and writes nothing.
+- Hook ownership survives a missing marker. Claude Code can drop keys it does
+  not know (the `_gbrain` marker) when it rewrites `settings.json`, so the
+  marker is advisory there and the command is the durable carrier. An entry
+  without the marker is this install's when its command is exactly the
+  harness hook gbrain writes for that event (`env … GBRAIN_HOOK_LANE=harness
+  <launcher> hook <event>`, nothing before or after) and its launcher, source
+  and seat match the running install or what the harness receipt recorded.
+  Re-running the install replaces such entries (one entry per event, never a
+  second set), and `--remove` deletes them, listing each by event and why it
+  matched. Anything else that merely looks like a harness hook is left alone
+  (see `harness_hook_unowned` below). `bootstrap_harness_health` in
+  `gbrain doctor` reads each receipt-named hook file: unmarked entries alone
+  are an `ok` note, duplicated events warn `harness_hook_duplicates`.
 - Everything is stated before it happens; non-interactive runs require
   `--yes`. Close active Claude Code sessions for the cleanest user-scope
   settings writes (the host also writes that file).
 
-PGLite note: minting needs the single-writer lock, so on a PGLite brain
-either pre-mint (`gbrain auth create bootstrap-harness --scopes read,write`
-while the serve is stopped) and pass `--token`, or stop/re-run/restart.
+PGLite note: minting needs the single-writer lock, and the health check
+needs the serve running, so on a PGLite brain the harness can't mint its own
+token. Pre-mint it with the harness grant while the serve is stopped, then
+pass `--token` (#6661). The `LIVE_SERVE` refusal prints these steps with the
+exact operation list:
+
+1. Stop the serve.
+2. `gbrain auth create bootstrap-harness --scopes read,write,skills_member_self`
+   (`--scopes read,write` under `--skills memory-only`; `skills_member_self`
+   is what lets the harness join shared skills).
+3. `gbrain auth rescope --token bootstrap-harness --operations <the printed list>`
+   (plus `--sources <id>` when you pass `--source`).
+4. Start `gbrain serve --http` again.
+5. Re-run `gbrain bootstrap harness` with `--token <value>`.
+
+<a id="pending-verify"></a>If the serve is still stopped when you run step 5, the run does not stop at
+the health check any more. On a PGLite brain with `--token`, when nothing
+answers at the serve URL and no serve holds the brain, the harness wires
+every target and ends with status `pending_verify` (exit 13, `"status":
+"pending_verify"` under `--json`): nothing failed, but the smoke test that
+proves the wiring needs the serve. The JSON `fix` is the completion step:
+start `gbrain serve --http`, then re-run the same command with the same
+`--token` (the printed argv shows `<TOKEN>` and pins the source this run
+resolved). That re-run needs no PGLite lock, so it works while the serve holds
+the brain. Until it passes its smoke test, `gbrain bootstrap harness --status`
+reports `"status": "partial"` and exits 1. A serve that holds the brain but
+doesn't answer at the URL you gave (a wrong `--url` or `--port`), anything
+else answering there, a run without `--token`, and a Postgres brain all still
+fail the health check with exit 1.
+
+<a id="cleanup-pending"></a>Each rotation leaves the old shared-skills
+enrollment with that enrollment's own credential, then revokes the
+credential: leave before revoke, because `leave_brain` is principal-owned and
+a revoked token can never leave. Each carried token id is revoked and cleared
+on its own, so one stuck enrollment no longer holds every other id on the
+receipt. An enrollment whose credential is already revoked (for example,
+revoked by hand before its leave finished) is inert: the run still removes it
+locally (adapter receipt, native router, unchanged owned files; edited files
+are retained) and records it as left with reason `credential_revoked`.
+
+While anything is still pending, the run exits `bootstrap_cleanup_pending`
+(exit 14, `"status": "cleanup_pending"` under `--json`) instead of 0. The
+JSON `cleanup` array lists each id with its token state (`active`,
+`revoked`, `missing`, `unknown`), its cleanup state (`revoke_pending`,
+`leave_pending`, `enrollment_retained`, `credential_unreadable`) and whether
+a re-run can finish it. When every id can, the `fix` re-runs the same command
+(`next: run`). When one cannot, the `fix` is the owner's step
+(`next: tell_user_to_run`): for a lost cleanup credential, restore it or
+revoke that token by id, after which the next re-run finishes the local
+cleanup; for an old enrollment kept because the current one is not ready,
+resolve the current enrollment first. `--status` exits 14 with the same list,
+and doctor's `bootstrap_harness_health` names each id as revoked (cleanup
+pending) or active.
+
 Postgres brains mint fine while the serve runs. A token you supply is never
 revoked by `--remove` or rotation (it is not the harness's to revoke) —
 retire it yourself with `gbrain auth revoke` when you're done with it.
@@ -285,6 +363,28 @@ binary without token scoping verifies every scoped token as FULL-ACCESS (its
 verify path never reads the scopes column). If you
 downgrade after a harness install, revoke the scoped tokens first
 (`gbrain auth revoke` with the id flag) and re-mint once you upgrade again.
+
+### harness_hook_unowned
+
+An entry under an event gbrain wires looks like gbrain's harness hook but is
+not this install's exact command: it was edited (an appended pipe or flag), or
+another install or launcher wrote it. gbrain never deletes it. `--remove`
+removes everything it does own, keeps the hooks target failed on the receipt,
+exits 1 and prints the file and event; it does not report the harness as
+removed while that entry remains. If the entry is a leftover, delete it from
+the named file by hand and run `gbrain bootstrap harness --remove` again; keep
+it only if you added it on purpose. `gbrain bootstrap harness --status` shows
+each hook file and the events holding such entries. Doctor reports the same
+finding as a warning on `bootstrap_harness_health`.
+
+### harness_hook_duplicates
+
+One event in a harness hook file is wired more than once by this install
+(marked or unmarked entries), so the hook fires twice per event. It is left
+behind when an older gbrain re-ran the install after the host had dropped the
+markers. The doctor fix re-runs `gbrain bootstrap harness` with the
+install's own `--project` and `--no-capture` choices; it rewrites the hook
+entries and rotates the harness token, so ask the user first.
 
 ## Multi-device
 
@@ -298,6 +398,47 @@ database backup, and do not clone live enrollment identities into an independent
 brain. Simultaneous editing from two machines is ordinary git conflict
 territory — `sources push` pulls divergence-safely (commit first, rebase pull,
 loud on conflicts).
+
+## Several agents, one brain (seats)
+
+When more than one agent feeds the same brain (two Claude Code homes, Claude
+Code and Codex side by side, or two people sharing a household brain), every
+captured session records which agent seat it came from, and pages the dream
+cycle synthesizes from it carry `seat: <label>` in their frontmatter next to
+`raw_source`. This is on by default and needs no setup.
+
+**Say to your agent:** *"Credit the sessions from this agent to the seat alice-desk"* —
+the agent runs `gbrain bootstrap hooks --harness claude-code --seat alice-desk`
+(or `gbrain bootstrap harness --seat alice-desk` for harness mode).
+
+**Say to your agent:** *"Which agent did this reflection come from?"* — the
+agent reads the page's `seat` frontmatter.
+
+- **Default seat.** Without a label, the seat is `home-<8 hex>`: a hash of the
+  agent's home directory (the Claude Code config directory, `CODEX_HOME`, or
+  the OpenClaw agent directory). The path itself never leaves the machine,
+  because page frontmatter may be committed to git.
+- **Named seat.** `--seat <label>` writes `GBRAIN_SEAT=<label>` into this
+  install's hook commands. A label is 1-64 characters of `a-z`, `0-9`, `.`,
+  `_` or `-`, starting with a letter or digit; uppercase is lowercased. A
+  re-install or `--repair` without `--seat` keeps the label; `--no-seat` goes
+  back to the default seat.
+- **Opt-out.** `--seat off` (or `GBRAIN_SEAT=off` in the agent's environment)
+  records no seat, so pages synthesized from those sessions carry none. Codex hooks and the committed cloud carrier do
+  not carry a label: set `GBRAIN_SEAT` in that environment instead (bootstrap
+  prints the exact line).
+- **Where it is recorded.** Each session gets one `<session-id>.seat.json`
+  next to its corpus file in `~/.gbrain/transcripts/corpus/`, written before
+  the corpus file and removed with the session's last corpus file. The first
+  seat recorded for a session is kept, even if the session is resumed from
+  another agent home.
+- **Hook health.** An invalid `GBRAIN_SEAT` falls back to the default seat
+  and records heartbeat reason `seat_label_invalid`; a resumed session from
+  another home records `seat_conflict`; an unwritable corpus dir records
+  `seat_write_failed`. Each heartbeat line carries a fixed `hint` with the fix.
+- **No re-synthesis.** Adding or changing a seat never re-runs synthesis of a
+  transcript that was already synthesized. A pattern page is credited to a
+  seat only when every reflection it was derived from shares that seat.
 
 ## Uninstall
 
@@ -314,6 +455,15 @@ One command: `gbrain doctor`. It covers hook health, push staleness, serve/lock
 collisions, schema state, and prints fixes. `gbrain bootstrap status --json` emits
 a support blob (versions, harness, last verify/push, hook failure rate) your agent
 can relay verbatim when you report a problem.
+
+Doctor's `bootstrap_last_verify` check reads the verify snapshots under
+`<home>/bootstrap/verify-*.json` and reports only when one exists: a brain that
+never ran `gbrain bootstrap verify` (a sole-writer deployment with no agent
+workspace, for example) has no snapshot and the check does not fire, so there is
+no not-applicable switch to set. Deleting those snapshot files returns the check
+to that silent state. `bootstrap verify` removes its two fixed-slug probe pages
+(`wiki/bootstrap-verify-probe`, `wiki/bootstrap-verify-probe-entity`) on every
+exit, including a roundtrip that fails at its first step.
 
 ## Real-agent e2e
 
@@ -365,7 +515,7 @@ burst with a millisecond timestamp, so unnecessary pauses become a measurable
 artifact (`computeStalls` → `stalls.md`) instead of a vibe. Same hermetic env as
 `agent-harness.ts`; pure helpers are unit-tested in `test/tty-harness.test.ts`
 (zero subprocesses, PTY smokes self-skip where `terminal:` is unavailable).
-The harness itself also backs one required-CI test: `test/init-picker-pty.serial.test.ts`
+The harness itself also backs one required-CI test: `test/init-picker-pty.test.ts`
 asserts the interactive `gbrain init` pickers under a real PTY (see the
 TTY decision table in `docs/TESTING.md`). The DX-exploration layer below stays
 an instrument — nothing in it asserts.

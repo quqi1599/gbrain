@@ -8,6 +8,7 @@
 
 import { statSync, readFileSync, rmSync } from 'fs';
 import { basename, extname, join } from 'path';
+import { invokeAI } from './ai/invocation-guard.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -124,11 +125,12 @@ async function transcribeFile(
   formData.append('response_format', 'verbose_json');
   if (config.language) formData.append('language', config.language);
 
-  const response = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}` },
-    body: formData,
-  });
+  const response = await invokeAI({ operation: 'transcription', kind: 'transcription', model: `${provider}:${model}` },
+    () => fetch(`${baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: formData,
+    }), () => null);
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -176,7 +178,7 @@ async function transcribeLargeFile(
   // shell metacharacters (`;`, `$()`, backticks, quotes) would be a command
   // injection if passed through a shell. Argument arrays bypass the shell
   // entirely, so audioPath is always a single literal argv element.
-  const { execFileSync } = await import('child_process');
+  const { execFileSync } = await import('./spawn.ts');
   const tmpDir = execFileSync('mktemp', ['-d']).toString().trim();
 
   try {
@@ -238,7 +240,7 @@ async function transcribeLargeFile(
 
 async function checkFfmpeg(): Promise<boolean> {
   try {
-    const { execFileSync } = await import('child_process');
+    const { execFileSync } = await import('./spawn.ts');
     execFileSync('ffmpeg', ['-version'], { stdio: 'pipe' });
     return true;
   } catch {

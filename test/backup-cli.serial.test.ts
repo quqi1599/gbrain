@@ -14,7 +14,7 @@
  * with the executeRaw idiom from test/backup-coverage.serial.test.ts —
  * no real PGLite, no real engine lock.
  */
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,6 +32,10 @@ import {
   saveBackupStatus,
   type BackupStatus,
 } from '../src/core/backup/status-file.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
+import * as snapshot from '../src/core/backup/snapshot.ts';
+import { pgliteBackupPreflight } from '../src/core/backup/preflight.ts';
+import * as fs from 'node:fs';
 
 /** The exact literal thrown by src/core/pglite-engine.ts on lock contention.
  * isLockError in src/commands/backup.ts matches on the leading substring —
@@ -314,7 +318,7 @@ describe('runBackupCli — PGLite lock fallback', () => {
   });
 
   test('source-text contract pin: pglite-engine still throws the literal isLockError matches', () => {
-    const engineSrc = readFileSync(join(import.meta.dir, '..', 'src', 'core', 'pglite-engine.ts'), 'utf-8');
+    const engineSrc = surfaceSource('pglite-engine');
     expect(engineSrc).toContain(LOCK_SUBSTRING);
     // And backup.ts matches on exactly that substring — drift on either side
     // silently breaks the serve-cohort fallback, so pin both.
@@ -374,6 +378,30 @@ describe('runBackupCli — disabled', () => {
     expect(r.stdout).toContain('backup check disabled — verdict from cache only');
     // …but no 'status' nag impression is recorded while disabled.
     expect(existsSync(nagPath)).toBe(false);
+  });
+});
+
+// #5505: rows coverage leaves without fix_argv still get a command.
+describe('runBackupCli status: fix commands for dirty and unverified rows', () => {
+  test('dirty repo, deduped dirty root, dirty workspace and unverified repo each name a fix', async () => {
+    process.env.GBRAIN_BACKUP_CHECK = '0'; // cache-only render, no compute
+    saveBackupStatus({
+      ...mkStatus('warn', new Date(Date.now() - 60_000).toISOString()),
+      assets: [
+        { kind: 'source_repo', id: 'dirty-src', state: 'dirty', detail: 'uncommitted changes', fix_argv: null },
+        { kind: 'source_repo', id: 'root-a, root-b', state: 'dirty', detail: 'uncommitted changes', fix_argv: null },
+        { kind: 'bootstrap_workspace', id: '/ws/example', state: 'dirty', detail: 'uncommitted changes', fix_argv: null },
+        { kind: 'source_repo', id: 'unverified-src', state: 'ok', configured_remote: true, fix_argv: null },
+      ],
+    });
+
+    const r = await run(['status'], thunkFor(stubEngine({})).connect);
+
+    expect(r.stdout).toContain('fix: gbrain sources push dirty-src');
+    expect(r.stdout).toContain('fix: gbrain sources push root-a\n');
+    expect(r.stdout).toContain('fix: gbrain sources push --path /ws/example');
+    expect(r.stdout).toContain('fix: gbrain backup check');
+    expect(r.stdout).toContain('Fix the ✗ and ⚠ rows above, then run: gbrain backup check');
   });
 });
 
@@ -439,5 +467,101 @@ describe('runBackupCli — nag impression', () => {
     const r = await run(['check'], connect);
     expect(r.exitCode).toBe(0);
     expect(existsSync(nagPath)).toBe(false);
+  });
+});
+
+// ── create/restore failure diagnostic (#5312) ────────────────────────────────
+
+describe('runBackupCli create — failure diagnostic for message-less errors (#5312)', () => {
+  async function failCreate(thrown: unknown, json: boolean) {
+    const spy = spyOn(snapshot, 'createPgliteBackup').mockImplementation(async () => { throw thrown; });
+    const fd1: string[] = [];
+    const realWriteSync = fs.writeSync;
+    const fdSpy = spyOn(fs, 'writeSync').mockImplementation(((fd: number, buf: Buffer, off = 0, len?: number) => {
+      if (fd !== 1) return (realWriteSync as (...a: unknown[]) => number)(fd, buf, off, len);
+      const end = len === undefined ? buf.length : off + len;
+      fd1.push(Buffer.from(buf).subarray(off, end).toString('utf8'));
+      return end - off;
+    }) as never);
+    const stderrChunks: string[] = [];
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: unknown }).write = (chunk: unknown) => { stderrChunks.push(String(chunk)); return true; };
+    try {
+      const args = ['create', '--output', join(tmp, 'out.gbrain-backup'), ...(json ? ['--json'] : [])];
+      const r = await run(args, async () => { throw new Error('create never connects'); });
+      return { ...r, stdout: `${r.stdout}${fd1.join('')}`, stderr: `${r.stderr}${stderrChunks.join('')}` };
+    } finally {
+      (process.stderr as { write: unknown }).write = origStderr;
+      fdSpy.mockRestore();
+      spy.mockRestore();
+    }
+  }
+
+  test('--json: a thrown {code:"EPERM"} gets a nonempty message, its legacy keys and the v1 contract', async () => {
+    const r = await failCreate({ code: 'EPERM' }, true);
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(r.stdout.trim());
+    expect(doc).toMatchObject({ ok: false, reason: 'EPERM', code: 'storage_error' });
+    expect(doc.message).toBe('Backup failed with no error message (code EPERM).');
+    expect(doc.why).toContain('gbrain backup create stopped');
+    expect(doc.fix).toMatchObject({ argv: ['gbrain', 'doctor', '--json'], next: 'run', verify: { argv: ['gbrain', 'doctor', '--json'] } });
+    expect(doc.retryable).toBe(false);
+  });
+
+  test('human: the same error renders code, message, fix and why, never undefined or [object Object]', async () => {
+    const r = await failCreate({ code: 'EPERM', errno: -1 }, false);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('Error [storage_error]: Backup failed with no error message (code EPERM, errno -1).');
+    expect(r.stderr).toContain('Fix: gbrain doctor --json');
+    expect(r.stderr).toContain('Why: gbrain backup create stopped');
+    expect(r.stderr).not.toContain('undefined');
+    expect(r.stderr).not.toContain('[object Object]');
+  });
+
+  test('a secret-bearing message-less object is described by safe fields only', async () => {
+    const secret = 'postgres://alice-example:hunter2-secret@db.example.invalid/brain';
+    const thrown = { name: 'ErrnoError', code: 'EIO', connection: secret, toString: () => secret };
+    for (const json of [true, false]) {
+      const r = await failCreate(thrown, json);
+      const out = `${r.stdout}${r.log}${r.stderr}`;
+      expect(out).toContain('Backup failed with no error message (ErrnoError, code EIO).');
+      expect(out).not.toContain('hunter2-secret');
+    }
+  });
+
+  test('#6649: a preflight refusal keeps its own code, fix and legacy reason instead of becoming storage_error', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'g6649-cli-'));
+    try {
+      const refusal = pgliteBackupPreflight(dir, join(dir, 'elsewhere', 'brain.pglite'), () => 0)!;
+      for (const json of [true, false]) {
+        const r = await failCreate(refusal, json);
+        expect(r.exitCode).toBe(1);
+        if (json) {
+          const doc = JSON.parse(r.stdout.trim());
+          expect(doc).toMatchObject({ ok: false, reason: 'unmanaged_database_path', code: 'unmanaged_database_path', class: 'host_only' });
+          expect(doc.fix).toMatchObject({ next: 'ask_user', verify: { argv: ['gbrain', 'doctor', '--json'] } });
+          expect(doc.fix.user_message).toContain('stop every gbrain writer');
+        } else {
+          expect(r.stderr).toContain('Error [unmanaged_database_path]');
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('an error message keeps its text with URL credentials redacted; retryable is preserved', async () => {
+    const err = Object.assign(new Error('dump failed for postgres://alice-example:hunter2-secret@db.example.invalid/brain'), { code: 'writers_active', retryable: true });
+    const r = await failCreate(err, true);
+    const doc = JSON.parse(r.stdout.trim());
+    expect(doc).toMatchObject({ ok: false, reason: 'writers_active', retryable: true });
+    expect(doc.message).toContain('dump failed for');
+    expect(JSON.stringify(doc)).not.toContain('hunter2-secret');
+  });
+
+  test('null and an empty object still produce a nonempty message', async () => {
+    for (const thrown of [null, {}]) {
+      const r = await failCreate(thrown, true);
+      const doc = JSON.parse(r.stdout.trim());
+      expect(doc).toMatchObject({ ok: false, reason: 'backup_failed', message: 'Backup failed with no error message.' });
+    }
   });
 });

@@ -23,6 +23,7 @@ import type {
 } from '../src/core/creds/vault.ts';
 import {
   CalendarClient,
+  CONTACT_PERSON_FIELDS,
   extractCalendarMethod,
   GmailClient,
   GoogleApiClient,
@@ -668,6 +669,71 @@ describe('GmailClient', () => {
     expect(third.labelIds).toEqual(['SENT']);
   });
 
+  test('#5586: getThread stamps RFC 3834 Auto-Submitted: any keyword but "no", case-insensitive, parameters and comments ignored', async () => {
+    const cases: Array<[string | null, boolean]> = [
+      ['auto-generated', true], ['Auto-Replied', true], [' AUTO-NOTIFIED ; owner-email="x@example.com"', true],
+      ['auto-generated (tracker)', true], ['x-custom-robot', true],
+      ['no', false], ['No', false], [' no ; reason=human', false], ['no (sent by a person)', false], ['', false], [null, false],
+    ];
+    const rawThread = {
+      id: '17aa9999ffff0000',
+      messages: cases.map(([value], i) => ({
+        id: `18c2f4a9b3d21f${String(i).padStart(2, '0')}`,
+        threadId: '17aa9999ffff0000',
+        labelIds: [],
+        internalDate: String(Date.parse('2026-08-10T09:00:00Z') + i * 60_000),
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'From', value: 'Tracker <tracker@example.com>' },
+            { name: 'To', value: 'a@example.com' },
+            { name: 'Subject', value: `Issue #${i}` },
+            ...(value === null ? [] : [{ name: i % 2 ? 'auto-submitted' : 'Auto-Submitted', value }]),
+          ],
+          body: { data: b64url('Status changed.') },
+        },
+      })),
+    };
+    const h = makeHarness(() => json(rawThread));
+    const thread = await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa9999ffff0000', 'a@example.com');
+    expect(thread.messages.map((m) => m.autoSubmitted)).toEqual(cases.map(([, expected]) => expected));
+  });
+
+  test('#5012: getThread captures Precedence, List-Id and Reply-To; absent headers read as human mail', async () => {
+    const headerSets: Array<Array<{ name: string; value: string }>> = [
+      [{ name: 'Precedence', value: ' Bulk ' }],
+      [{ name: 'list-id', value: 'Team updates <updates.example.com>' }],
+      [{ name: 'Reply-To', value: 'Alerts <no-reply@bank.example.com>, help@bank.example.com' }],
+      [],
+    ];
+    const rawThread = {
+      id: '17aa5555dddd0000',
+      messages: headerSets.map((extra, i) => ({
+        id: `18c2f4a9b3d21a${String(i).padStart(2, '0')}`,
+        threadId: '17aa5555dddd0000',
+        labelIds: [],
+        internalDate: String(Date.parse('2026-08-10T09:00:00Z') + i * 60_000),
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'From', value: 'Sender <sender@example.com>' },
+            { name: 'To', value: 'a@example.com' },
+            { name: 'Subject', value: `Notice ${i}` },
+            ...extra,
+          ],
+          body: { data: b64url('Your statement is ready.') },
+        },
+      })),
+    };
+    const h = makeHarness(() => json(rawThread));
+    const thread = await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa5555dddd0000', 'a@example.com');
+    const [bulk, list, replyTo, human] = thread.messages as unknown as Array<Record<string, unknown>>;
+    expect(bulk.precedence).toBe('bulk');
+    expect(list.listId).toBe(true);
+    expect(replyTo.replyTo).toEqual(['no-reply@bank.example.com', 'help@bank.example.com']);
+    expect([human.precedence, human.listId, human.replyTo]).toEqual(['', false, []]);
+  });
+
   test('getThread stamps calendarMethod from a real-shape text/calendar part; plain messages get null', async () => {
     const rawThread = {
       id: '17aa7777eeee8888',
@@ -755,6 +821,31 @@ describe('GmailClient', () => {
     const body = thread.messages[0].bodyText;
     expect(body.endsWith('[truncated]')).toBe(true);
     expect(body.length).toBe(8_000 + '\n[truncated]'.length);
+  });
+
+  // #5752: a cap that cuts a UTF-16 code unit leaves a lone surrogate, which
+  // Postgres rejects inside the managed request intent's jsonb.
+  const emojiThread = (mimeType: string, text: string) => ({
+    id: '17aa5555dddd7777',
+    messages: [{
+      id: '18c2f4a9b3d21e05', threadId: '17aa5555dddd7777', labelIds: [], internalDate: String(Date.parse('2026-08-10T09:00:00Z')),
+      payload: { mimeType, headers: [{ name: 'From', value: 'Charlie Example <charlie@example.com>' }, { name: 'Subject', value: 'Emoji' }],
+        body: { data: b64url(text) } },
+    }],
+  });
+  test('the 8KB body cap never splits a surrogate pair (#5752)', async () => {
+    const h = makeHarness(() => json(emojiThread('text/plain', 'x'.repeat(7_999) + '\u{1F600}' + 'y'.repeat(50))));
+    const body = (await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa5555dddd7777', 'a@example.com')).messages[0].bodyText;
+    expect(body.endsWith('[truncated]')).toBe(true);
+    expect(body.isWellFormed()).toBe(true);
+    expect(body.startsWith('x'.repeat(7_999))).toBe(true);
+  });
+  test('the HTML pre-truncation never splits a surrogate pair (#5752)', async () => {
+    const markup = '<b></b>'.repeat(Math.floor(127_999 / 7));
+    const html = markup + 'z'.repeat(127_999 - markup.length) + '\u{1F600}' + 'tail';
+    const h = makeHarness(() => json(emojiThread('text/html', html)));
+    const body = (await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa5555dddd7777', 'a@example.com')).messages[0].bodyText;
+    expect(body.isWellFormed()).toBe(true);
   });
 });
 
@@ -899,9 +990,44 @@ describe('CalendarClient', () => {
 // ── PeopleClient ─────────────────────────────────────────────────────────────
 
 describe('PeopleClient', () => {
+  test.each([null, {}, [null], ['invalid'], []])('malformed expiry details preserve typed errors: %j', async details => {
+    for (const expired of [true, false]) {
+      const h = makeHarness(() => json({ error: {
+        code: 400,
+        message: expired ? 'Sync token is expired.' : 'Invalid personFields',
+        details,
+      } }, 400));
+      const people = new PeopleClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID);
+      await expect(people.listConnections({ syncToken: 'stale' })).rejects.toBeInstanceOf(
+        expired ? GoogleCursorExpiredError : CredentialError,
+      );
+    }
+  });
+
+  test.each([
+    { message: 'Sync token is expired. Clear local cache and retry call without the sync token.' },
+    { details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'EXPIRED_SYNC_TOKEN' }] },
+  ])('HTTP 400 expired sync tokens surface cursor expiry: %j', async error => {
+    const h = makeHarness(() => json({ error: { code: 400, ...error } }, 400));
+    const people = new PeopleClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID);
+    await expect(people.listConnections({ syncToken: 'stale' })).rejects.toBeInstanceOf(GoogleCursorExpiredError);
+  });
+
+  test.each([
+    ['people', 'https://people.googleapis.com/v1/people/me/connections?syncToken=stale', { message: 'Invalid personFields' }],
+    ['people', 'https://people.googleapis.com/v1/people/me/connections', { message: 'Sync token is expired.' }],
+    ['gmail', 'https://gmail.googleapis.com/gmail/v1/users/me/history?syncToken=stale', { message: 'Sync token is expired.' }],
+    ['calendar-json', 'https://www.googleapis.com/calendar/v3/calendars/primary/events?syncToken=stale', { message: 'Sync token is expired.' }],
+    ['people', 'https://people.googleapis.com/v1/people/me/connections?syncToken=stale', { details: [{ reason: 'INVALID_ARGUMENT' }] }],
+  ] as const)('other HTTP 400 errors remain upstream failures: %s %s', async (api, url, error) => {
+    const h = makeHarness(() => json({ error: { code: 400, ...error } }, 400));
+    const client = new GoogleApiClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID);
+    await expect(client.fetchJSON(url, api)).rejects.toBeInstanceOf(CredentialError);
+  });
+
   test('listConnections requests personFields and normalizes contacts', async () => {
     const h = makeHarness((u) => {
-      expect(u.searchParams.get('personFields')).toBe('names,emailAddresses,organizations');
+      expect(u.searchParams.get('personFields')).toBe(CONTACT_PERSON_FIELDS);
       expect(u.searchParams.get('requestSyncToken')).toBe('true');
       return json({
         connections: [
@@ -927,8 +1053,10 @@ describe('PeopleClient', () => {
       resourceName: 'people/c000000001',
       displayName: 'Alice Example', // primary name wins
       emails: ['alice@example.com'], // trimmed, lowercased, non-addresses dropped
+      phones: [],
       organization: 'Acme Example',
       title: 'Engineer',
+      groups: [],
       deleted: false,
     });
     expect(contacts[1].deleted).toBe(true);
@@ -955,5 +1083,21 @@ describe('PeopleClient', () => {
     }
     expect(thrown).toBeInstanceOf(GoogleCursorExpiredError);
     expect((thrown as GoogleCursorExpiredError).status).toBe(410);
+  });
+});
+
+// ── Calendar event privacy (fail closed) ─────────────────────────────────────
+
+describe('CalendarClient event privacy', () => {
+  test('Google private and confidential events map to private; default and public do not', async () => {
+    const h = makeHarness(() => json({
+      items: ['private', 'confidential', 'default', 'public', undefined].map((visibility, i) => ({
+        id: `ev${i}`, summary: `Event ${i}`, start: { dateTime: '2026-10-01T10:00:00Z' }, end: { dateTime: '2026-10-01T11:00:00Z' },
+        ...(visibility ? { visibility } : {}),
+      })),
+      nextSyncToken: 'sync-1',
+    }));
+    const { events } = await new CalendarClient(h.tokens, h.fetchImpl).listEvents('a@example.com', { timeMinIso: '2026-09-01T00:00:00Z' });
+    expect(events.map((e) => [e.id, e.private])).toEqual([['ev0', true], ['ev1', true], ['ev2', false], ['ev3', false], ['ev4', false]]);
   });
 });

@@ -101,12 +101,25 @@ Testing-mode expiry — publishing to Production is the real fix.
 gbrain waiting --json        # the killer output: ranked people waiting
 gbrain loops done <id>       # user handled it
 gbrain loops drop <id>       # user is not going to do it
-gbrain loops mute sender <email>   # never track this sender again
+gbrain loops mute sender <email>   # never track this sender again (closes its open reply-owed loops)
+gbrain loops unmute sender <email> # undo; the loops it closed are re-checked on the next sync
+gbrain loops drop sender <email> --dry-run   # preview closing one sender's reply-owed loops
 ```
+
+- `waiting` may end with `withheld_noise`: open reply-owed loops from senders
+  whose mail is automated (bank or shipping alerts). Show the user each
+  `preview_command`, run it (`--dry-run` changes nothing), and drop only after
+  the user agrees: a drop cannot be undone. Offer `loops mute sender` when the
+  user wants a stop they can reverse.
 
 - `waiting` REFUSES on stale data (no successful sync in 24h) and names the
   exact fix (`gbrain sync --source <id>`). Run the sync, then retry. Only
   use `--stale-ok` when the user explicitly accepts stale results.
+- `completeness: "partial"` means some mail in the last 14 days is held after
+  repeated import failures (listed in `held`). Present the answer as partial:
+  name each held item (sender, and subject when shown) and its retry command
+  (`gbrain sources retry-held <id>`). Never say "you are clean" on a partial
+  answer.
 - When presenting loops, show: the counterparty, what's owed (summary), the
   evidence quote, the deep link (opens the exact Gmail thread in the right
   account), and the due date when present. The trusted-local result already
@@ -147,7 +160,7 @@ unanswered-thread detector is free and unaffected.
 
 ## Output Format
 
-When relaying `gbrain waiting`, present per counterparty, most urgent first:
+When relaying `gbrain waiting`, present per counterparty, most urgent first, then the `## No counterparty` section (loops that name no person) last:
 
 ```
 ## <Counterparty> (<N> open)
@@ -161,6 +174,14 @@ The trusted-local `--json` result already carries this as a paste-ready
 relay `[SHOW USER]` blocks verbatim and `error.problem` + `error.fix` on
 failures; never dump raw JSON envelopes at the user.
 
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Setup prints `[SHOW USER]` blocks: relay them verbatim, one message per block. `gbrain mcp expose` and `gbrain google` still exit 2 when they need the user's confirmation (documented legacy), so read the block, not just the exit code.
+- A Google credential error (`invalid_grant_revoked`, `consent_timeout`, `wrong_account_consented`, …) carries `{ code, problem, cause, fix }`: show the user the problem and fix; most fixes are "run it again" by the user.
+- `gbrain waiting` refuses on stale data or reports partial coverage from held items: run the sync it names, or `gbrain sources status <id>` then, after the user agrees, `gbrain sources retry-held <id>`.
+
 ## Anti-Patterns
 
 - **Paraphrasing a `[SHOW USER]` block.** The checklists carry load-bearing
@@ -172,6 +193,8 @@ failures; never dump raw JSON envelopes at the user.
 - **Answering "who is waiting on me" from `query`/`search`.** The open-loop
   record is `open_loops` / `gbrain waiting` — search results have no
   loop-state semantics and will happily surface answered threads.
+- **Dropping `completeness: "partial"`.** A partial answer with no loops is
+  not an empty inbox; say which items are held and how to re-attempt them.
 - **Bypassing the staleness refusal with `--stale-ok` silently.** Run the
   named `gbrain sync --source <id>` first; only pass `--stale-ok` when the
   user explicitly accepts possibly-outdated loops.

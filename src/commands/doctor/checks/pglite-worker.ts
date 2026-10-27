@@ -7,6 +7,14 @@
 import * as db from '../../../core/db.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
+import { agentFix } from '../check-fix.ts';
+import { exclusiveFix } from '../../../core/exclusive-fix.ts';
+import { peekLock } from '../../../core/pglite-lock.ts';
+
+/** Read-only diagnosis; it prints the plan-bound repair command the user approves. */
+function pgliteRepairPreview() {
+  return agentFix(['gbrain', 'pglite-repair', '--dry-run'], 'Diagnoses the PGLite store without changing it and prints the exact repair command, bound to this plan, for the user to approve.', 'pglite_data_dir');
+}
 
 // ≥2 failed repair attempts inside 7 days = the corruption keeps regenerating.
 const REPAIR_RECURRENCE_WINDOW_MS = 7 * 24 * 3600 * 1000;
@@ -54,6 +62,9 @@ export function computePgliteDataDirCheck(
           `Could not connect, and the PGLite data-dir lock is held by live PID ${diagnosis.lockHolderPid} — ` +
           `another gbrain process (often \`gbrain serve\`) has the brain open. Stop it and re-run.${backupNote}`,
         remediation_status: 'human_only',
+        ...(diagnosis.lockHolderPid ? { fix: exclusiveFix(agentFix(['gbrain', 'doctor', '--json'],
+          'Re-runs doctor once it has the brain to itself.', 'pglite_data_dir', { requires_exclusive: true }),
+        { pid: diagnosis.lockHolderPid, transport: peekLock(dataDir).http ? 'http' : 'stdio', is_self: false }) } : {}),
       };
     case 'missing':
       return {
@@ -79,8 +90,9 @@ export function computePgliteDataDirCheck(
         message:
           `PGLite failed to open and the data dir shows unclean-shutdown state (${diagnosis.detail}). ` +
           `This is the torn-WAL class behind issue #223 — repairable in place, data preserved: ` +
-          `\`gbrain pglite-repair --dry-run\` to diagnose, \`gbrain pglite-repair --yes\` to repair.${backupNote}${recurrence}`,
+          `\`gbrain pglite-repair --dry-run\` diagnoses it and prints the plan-bound repair command to run once the user approves.${backupNote}${recurrence}`,
         remediation_status: 'human_only',
+        fix: pgliteRepairPreview(),
       };
     case 'looks-healthy':
     default:
@@ -90,10 +102,11 @@ export function computePgliteDataDirCheck(
         message:
           `PGLite failed to open but the data dir layout validates (${diagnosis.detail}). ` +
           `IF the connect error mentions \`Aborted()\` this is likely torn WAL state — ` +
-          `\`gbrain pglite-repair --dry-run\` to diagnose, \`gbrain pglite-repair --yes\` to repair in place ` +
+          `\`gbrain pglite-repair --dry-run\` diagnoses it and prints the plan-bound in-place repair command to run once the user approves ` +
           `(repair discards the un-checkpointed WAL tail — don't run it for lock-contention or ` +
           `catalog-corruption errors; 58P01/pgvector load failures need \`gbrain reinit-pglite\` instead).${backupNote}${recurrence}`,
         remediation_status: 'human_only',
+        fix: pgliteRepairPreview(),
       };
   }
 }
@@ -220,6 +233,10 @@ export async function computeWorkerOomLoopCheck(
  *           rebuilds are throwing (genuinely not recovering).
  *   - warn: reaps>=10/hr, all recovered → pooler thrash (self-heal works but the
  *           cap is likely too low / concurrency too high).
+ *   - fail (#6543 A6): a connection serve's driver retired (stuck, desync,
+ *           closed under statements) could not reconnect.
+ *   - warn (#6543 A6): serve's driver retired a connection as stuck or
+ *           desynced in the last hour (statements failed with it).
  *   - else: null (quiet — a few reaps that all recovered is normal).
  *
  * Returns null on PGLite / no engine / audit-read failure. Exported so
@@ -229,7 +246,7 @@ export async function computePoolReapHealthCheck(
   engine: BrainEngine | null,
 ): Promise<Check | null> {
   if (!engine || engine.kind === 'pglite') return null;
-  let r: { reaps: number; recoveries: number; failures: number };
+  let r: { reaps: number; recoveries: number; failures: number; stuck: number; desyncs: number; connection_recoveries: number; connection_recovery_failures: number };
   try {
     const { readRecentPoolRecoveries } = await import('../../../core/audit/pool-recovery-audit.ts');
     r = readRecentPoolRecoveries(1);
@@ -252,6 +269,31 @@ export async function computePoolReapHealthCheck(
         `DB reconnect FAILED ${r.failures}× in last hour (${r.reaps} pooler reap(s) detected) ` +
         `— reconnect is throwing; ${fix}.`,
       details: { reaps: r.reaps, recoveries: r.recoveries, failures: r.failures, fix_hint: fix },
+    };
+  }
+  const incidents = { stuck: r.stuck, desyncs: r.desyncs, connection_recoveries: r.connection_recoveries, connection_recovery_failures: r.connection_recovery_failures };
+  if (r.connection_recovery_failures > 0) {
+    const fix = 'check DB reachability / credentials from the serve host (a retired connection cannot reconnect); see docs/ENGINES.md#pg-connection-recovery-failed';
+    return {
+      name: 'pool_reap_health',
+      status: 'fail',
+      message:
+        `gbrain serve could not reconnect a retired connection ${r.connection_recovery_failures}× in last hour ` +
+        `(${r.stuck} stuck, ${r.desyncs} desynced, ${r.connection_recoveries} recovered); ${fix}.`,
+      details: { reaps: r.reaps, recoveries: r.recoveries, failures: r.failures, ...incidents, fix_hint: fix },
+    };
+  }
+  if (r.stuck + r.desyncs > 0) {
+    const fix = r.desyncs > 0
+      ? 'a desynced pipeline usually means a transaction-mode pooler: set PGMAX_PIPELINE=0 for serve; see docs/ENGINES.md#pg-connection-stuck'
+      : 'a statement outlived its in-flight budget; the warn line names reason=age|idle and the statement; see docs/ENGINES.md#pg-connection-stuck';
+    return {
+      name: 'pool_reap_health',
+      status: 'warn',
+      message:
+        `gbrain serve retired ${r.stuck} stuck and ${r.desyncs} desynced connection(s) in last hour ` +
+        `(${r.connection_recoveries} recovered); ${fix}.`,
+      details: { reaps: r.reaps, recoveries: r.recoveries, failures: r.failures, ...incidents, fix_hint: fix },
     };
   }
   if (r.reaps >= 10) {

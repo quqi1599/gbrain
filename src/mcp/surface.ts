@@ -17,9 +17,11 @@
  * op stays uncallable even if a client guesses its name (tool-list filtering
  * alone leaves dispatch resolving the global catalog — codex c2).
  *
- * Resolution: --surface flag > config `mcp_surface` > 'full'. Why default
- * full: verbs/starter are for agents and quickstarts; full preserves existing
- * advanced tooling.
+ * Resolution: stdio GBRAIN_SURFACE > --surface flag > config `mcp_surface` >
+ * 'full' (resolveStdioSurface); `serve --http` ignores GBRAIN_SURFACE. Why
+ * default full: a bare `serve` keeps existing advanced tooling, and the
+ * registrations gbrain writes pin `REGISTRATION_SURFACE`
+ * (src/core/mcp-registration.ts) unless the user passes `--surface`.
  *
  * WP4 (D2 CEILING): on the OAuth HTTP transport the server-resolved surface is
  * a CEILING, not the final answer — each request resolves
@@ -30,11 +32,14 @@
  * an explicit `--surface` restart.
  */
 
-import type { Operation } from '../core/operations.ts';
+import type { OperationMeta, ParamDef } from '../core/ops/contract.ts';
+import type { Notice } from '../core/agent-output.ts';
 import type { GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
-import { BRAIN_TOOL_ALLOWLIST } from '../core/minions/tools/brain-allowlist.ts';
+import { opError } from '../core/ops/contract.ts';
+import { BRAIN_TOOL_ALLOWLIST } from '../core/minions/tools/brain-tool-allowlist.ts';
+import { flagValues } from '../core/direct-pool-profile.ts';
 
 export type McpSurface = 'verbs' | 'starter' | 'full';
 
@@ -96,9 +101,14 @@ export const STARTER_OPS: ReadonlySet<string> = new Set([
   // starter connect lanes retire the "unknown tool: capture" FAQ, which only
   // works if the starter surface actually lists it.
   'capture',
+  // #5616: the small-change companion of put_page (a direct literal, like
+  // capture, so subagents do not gain a new write tool).
+  'edit_page',
   'get_write_request', 'list_write_requests', 'cancel_write_request',
   'list_skills', 'get_skill', 'list_brain_skillpack', 'get_skill_asset',
   'join_brain', 'sync_brain_skills', 'leave_brain', 'put_skill', 'delete_skill',
+  // The dismissal for the coaching notices starter sessions receive (onboarding, features).
+  'mute_notice',
 ]);
 
 /**
@@ -124,40 +134,114 @@ export const ALWAYS_INCLUDED_STARTER_OPS: ReadonlySet<string> = new Set([
   'join_brain', 'sync_brain_skills', 'leave_brain', 'put_skill', 'delete_skill',
 ]);
 
-/** Strict flag parser — unknown values reject loudly (parseStdioIdleTimeout pattern). */
+/**
+ * Strict flag parser — unknown values reject loudly (parseStdioIdleTimeout pattern). `--surface=verbs` is the same flag
+ * (`flagValues`), and a repeated flag takes the narrowest value, so it never widens the ceiling.
+ */
 export function parseSurfaceFlag(args: string[]): McpSurface | null {
-  const idx = args.indexOf('--surface');
-  if (idx < 0) return null;
-  const raw = args[idx + 1];
-  if (raw === undefined || raw.startsWith('--')) {
-    throw new Error(`--surface requires a value: verbs | starter | full`);
+  const values = flagValues(args, '--surface');
+  if (!values.length) return null;
+  for (const raw of values) {
+    if (!raw || raw.startsWith('--')) {
+      throw opError('invalid_params', `--surface requires a value: verbs | starter | full`, 'Pass --surface verbs, --surface starter or --surface full (default full).');
+    }
+    if (!isMcpSurface(raw)) {
+      throw opError('invalid_params', `Unknown --surface "${raw}". Use: verbs (the 7 memory verbs) | starter (the ~20 daily-driver ops) | full (all operations, default)`,
+        'Pass --surface verbs (the 7 memory verbs), --surface starter (the ~20 daily-driver ops) or --surface full (all operations, default).');
+    }
   }
-  if (!isMcpSurface(raw)) {
-    throw new Error(`Unknown --surface "${raw}". Use: verbs (the 7 memory verbs) | starter (the ~20 daily-driver ops) | full (all operations, default)`);
-  }
-  return raw;
+  return (values as McpSurface[]).reduce(minSurface);
 }
 
-/** Flag > config `mcp_surface` > 'full'. */
+/**
+ * #4768: stdio access ceiling. `--access read-only` intersects the selected
+ * surface with operations that are read-scoped, non-mutating and need no
+ * capability scope, so tools/list, the capabilities resource, skill
+ * resources and dispatch all see one read-only set (`request_tools` is
+ * mutating, so discovery cannot widen it). It denies agent-requested
+ * mutations; owner maintenance (startup migrations, hook IPC banking) is a
+ * separate control. HTTP enforces per-token operation grants instead.
+ * `--access=read-only` is the same flag (`flagValues`); any read-only
+ * value wins, so a repeated flag never widens the ceiling.
+ */
+export type McpAccess = 'full' | 'read-only';
+
+export function parseAccessFlag(args: string[]): McpAccess {
+  const values = flagValues(args, '--access');
+  if (values.some(raw => raw !== 'full' && raw !== 'read-only')) {
+    throw opError('invalid_params', '--access takes read-only or full (default full); see docs/mcp/ADMIN.md#read-only-stdio-serve',
+      'Pass --access read-only or --access full (default full).', { docs: 'docs/mcp/ADMIN.md#read-only-stdio-serve' });
+  }
+  return values.includes('read-only') ? 'read-only' : 'full';
+}
+
+export function isReadOnlyOperation(op: Pick<OperationMeta, 'scope' | 'mutating' | 'requiredScopes'>): boolean {
+  return op.scope === 'read' && op.mutating !== true && !op.requiredScopes?.length;
+}
+
+export type SurfaceSource = 'env' | 'flag' | 'config' | 'default';
+
+/** How `serve` prints and `whoami` reports a surface source. */
+export const SURFACE_SOURCE_LABEL: Record<SurfaceSource, string> = {
+  env: 'env GBRAIN_SURFACE', flag: '--surface', config: 'config', default: 'default',
+};
+
+/** --surface flag > config `mcp_surface` > 'full', with where the answer came from. */
+export function resolveSurfaceWithSource(
+  flag: McpSurface | null,
+  config: Pick<GBrainConfig, 'mcp_surface'> | null | undefined,
+): { surface: McpSurface; source: SurfaceSource; invalidEnv?: string } {
+  if (flag) return { surface: flag, source: 'flag' };
+  if (config && isMcpSurface(config.mcp_surface)) return { surface: config.mcp_surface, source: 'config' };
+  return { surface: 'full', source: 'default' };
+}
+
+/** Flag > config `mcp_surface` > 'full' (`serve --http`; stdio adds GBRAIN_SURFACE via resolveStdioSurface). */
 export function resolveSurface(
   flag: McpSurface | null,
   config: Pick<GBrainConfig, 'mcp_surface'> | null | undefined,
 ): McpSurface {
-  if (flag) return flag;
-  if (config && isMcpSurface(config.mcp_surface)) return config.mcp_surface;
-  return 'full';
+  return resolveSurfaceWithSource(flag, config).surface;
 }
 
-export function filterOpsForSurface(ops: Operation[], surface: McpSurface): Operation[] {
+/**
+ * Stdio `serve`: GBRAIN_SURFACE > --surface > config `mcp_surface` > 'full',
+ * the plugin launcher's substitute-or-append semantics. An invalid env value
+ * never stops the server (that would end it before the handshake, where no
+ * agent sees it): it is ignored and returned as `invalidEnv`.
+ */
+export function resolveStdioSurface(
+  flag: McpSurface | null,
+  config: Pick<GBrainConfig, 'mcp_surface'> | null | undefined,
+  env: string | undefined = process.env.GBRAIN_SURFACE,
+): { surface: McpSurface; source: SurfaceSource; invalidEnv?: string } {
+  if (env === undefined || env === '') return resolveSurfaceWithSource(flag, config);
+  if (isMcpSurface(env)) return { surface: env, source: 'env' };
+  return { ...resolveSurfaceWithSource(flag, config), invalidEnv: env };
+}
+
+export function filterOpsForSurface<T extends OperationMeta>(ops: T[], surface: McpSurface): T[] {
   if (surface === 'full') return ops;
   // FROZEN: 'verbs' is EXACTLY `op.verb === true` (MEMORY_VERBS v1) — starter
   // extends the ladder above it and must never alter these semantics.
   if (surface === 'verbs') return ops.filter(op => op.verb === true);
-  return ops.filter(op => STARTER_OPS.has(op.name));
+  return ops.filter(op => STARTER_OPS.has(op.name)).map(starterParams);
+}
+
+/** Shared params a starter op leaves off its schema; the op keeps the shared definition, so every surface validates the same object. */
+const STARTER_HIDDEN_PARAMS: Readonly<Record<string, ReadonlySet<string>>> = { remember: new Set(['expected_revision', 'force']) };
+
+/** Starter ops advertise every param except the full-surface-only ones and their STARTER_HIDDEN_PARAMS. */
+function starterParams<T extends OperationMeta>(op: T): T {
+  const hidden = STARTER_HIDDEN_PARAMS[op.name];
+  const keep = ([name, p]: [string, ParamDef]) => !p.fullSurfaceOnly && !hidden?.has(name);
+  const params = Object.entries(op.params);
+  if (params.every(keep)) return op;
+  return { ...op, params: Object.fromEntries(params.filter(keep)) };
 }
 
 /** The fail-closed allow-set handed to dispatchToolCall. */
-export function allowedOpNames(ops: Operation[], surface: McpSurface): ReadonlySet<string> {
+export function allowedOpNames(ops: OperationMeta[], surface: McpSurface): ReadonlySet<string> {
   return new Set(filterOpsForSurface(ops, surface).map(o => o.name));
 }
 
@@ -255,6 +339,67 @@ export async function resolveDefaultClientSurface(
   return isMcpSurface(fileVal) ? fileVal : null;
 }
 
+
+/**
+ * `mcp.advertised_surface`: which tools `tools/list` shows. The callable set
+ * (the ceiling: --surface > mcp_surface > full, per-client rows on HTTP) is
+ * unchanged, so a tool outside the advertised list is still callable and
+ * `request_tools` returns its schema. The ceiling stays the security boundary;
+ * the advertised list is a context-cost choice. DB plane wins, file plane
+ * falls back; unset or unrecognized = advertise the whole callable set.
+ */
+export async function resolveAdvertisedSurface(engine: BrainEngine | null, config: GBrainConfig | null | undefined): Promise<McpSurface | null> {
+  if (engine) {
+    try {
+      const dbVal = await engine.getConfig('mcp.advertised_surface');
+      if (isMcpSurface(dbVal)) return dbVal;
+      if (dbVal != null) return null;
+    } catch { /* file plane decides */ }
+  }
+  const fileVal = (config?.mcp as Record<string, unknown> | undefined)?.advertised_surface;
+  return isMcpSurface(fileVal) ? fileVal : null;
+}
+
+/** The tools to list: the callable set narrowed to the advertised surface (never wider). */
+export function advertisedOps<T extends OperationMeta>(callable: T[], callableSurface: McpSurface, advertised: McpSurface | null): T[] {
+  if (!advertised || !surfaceWiderThan(callableSurface, advertised)) return callable;
+  const listed = new Set(filterOpsForSurface(callable, advertised).map(op => op.name));
+  return callable.filter(op => listed.has(op.name));
+}
+
+/**
+ * A stdio session's tool listing: the advertised surface, plus every tool
+ * `request_tools` described in this session (`reveal`), which notifies the
+ * client with tools/list_changed. Once the session widens (request_tools
+ * {surface}), the whole widened surface is listed. `mcp.advertised_surface` narrows only this
+ * listing; dispatch keeps the callable set.
+ */
+export function stdioToolListing(advertised: () => Promise<McpSurface | null>, session: { readonly surface: McpSurface },
+  server: { sendToolListChanged(): Promise<void> }) {
+  const revealed = new Set<string>();
+  const startSurface = session.surface;
+  const notify = () => { Promise.resolve(server.sendToolListChanged()).catch(() => { /* best-effort */ }); };
+  return {
+    async listed<T extends OperationMeta>(visible: T[]): Promise<T[]> {
+      // A session the agent widened with request_tools {surface} lists everything it asked for.
+      if (session.surface !== startSurface) return visible;
+      const listed = advertisedOps(visible, session.surface, await advertised());
+      return listed.length === visible.length ? visible : visible.filter(op => revealed.has(op.name) || listed.includes(op));
+    },
+    /** D2: whether tools/list shows this (callable) tool now. */
+    async isListed(op: OperationMeta): Promise<boolean> {
+      if (session.surface !== startSurface || revealed.has(op.name)) return true;
+      return advertisedOps([op], session.surface, await advertised()).length > 0;
+    },
+    reveal(names: string[]): void {
+      const before = revealed.size;
+      for (const name of names) revealed.add(name);
+      if (revealed.size > before) notify();
+    },
+  };
+}
+
+
 /**
  * D2 CEILING resolution — the per-request effective surface on the OAuth
  * HTTP transport:
@@ -276,4 +421,70 @@ export function effectiveSurfaceForClient(opts: {
 }): McpSurface {
   const requested = opts.clientSurface ?? opts.defaultSurface ?? opts.ceiling;
   return clampSurface(minSurface(opts.ceiling, requested), opts.warn);
+}
+
+// ---------------------------------------------------------------------------
+// Stdio session surface — one mutable allow-set per stdio server process
+// ---------------------------------------------------------------------------
+
+/**
+ * The stdio session's surface: tools/list, dispatch, the capabilities
+ * resource and `whoami` read the same object, so a `request_tools` widen is
+ * visible to all of them at once. Widening is session-scoped (nothing is
+ * written) and never passes `--access read-only`.
+ */
+export interface StdioSurfaceState {
+  surface: McpSurface;
+  readonly source: SurfaceSource;
+  readonly readOnly: boolean;
+  /** `mcp.allow_session_widen` as last resolved (boot, then each request_tools call). */
+  widenAllowed: boolean;
+  surfacedOps: OperationMeta[];
+  allowedOps: ReadonlySet<string> | undefined;
+  widen(to: McpSurface): { from: McpSurface; to: McpSurface; added: string[] };
+}
+
+export function createStdioSurfaceState(
+  ops: OperationMeta[],
+  init: { surface: McpSurface; source: SurfaceSource; readOnly: boolean; onWiden?: (change: { from: McpSurface; to: McpSurface; added: string[] }) => void },
+): StdioSurfaceState {
+  const compute = (surface: McpSurface) => {
+    const surfacedOps = filterOpsForSurface(ops, surface).filter(op => !init.readOnly || isReadOnlyOperation(op));
+    const allowedOps = init.readOnly ? new Set(surfacedOps.map(op => op.name)) : surface === 'full' ? undefined : allowedOpNames(ops, surface);
+    return { surface, surfacedOps, allowedOps };
+  };
+  const state: StdioSurfaceState = {
+    source: init.source,
+    readOnly: init.readOnly,
+    widenAllowed: true,
+    ...compute(init.surface),
+    widen(to) {
+      const from = state.surface;
+      const before = new Set(state.surfacedOps.map(op => op.name));
+      Object.assign(state, compute(to));
+      const change = { from, to, added: state.surfacedOps.filter(op => !before.has(op.name)).map(op => op.name) };
+      init.onWiden?.(change);
+      return change;
+    },
+  };
+  return state;
+}
+
+/** `mcp.allow_session_widen` (default true): DB plane, then the file plane (file only when `engine` is null). */
+export async function sessionWidenAllowed(engine: BrainEngine | null, config: GBrainConfig | null | undefined): Promise<boolean> {
+  const off = (v: unknown) => v === false || (typeof v === 'string' && /^(false|0|off|no)$/i.test(v.trim()));
+  try {
+    const dbVal = engine ? await engine.getConfig('mcp.allow_session_widen') : null;
+    if (dbVal != null) return !off(dbVal);
+  } catch { /* the file plane decides */ }
+  return !off(config?.mcp?.allow_session_widen);
+}
+
+/** The once-per-process `surface_env_invalid` info notice for an ignored GBRAIN_SURFACE value. */
+export function surfaceEnvInvalidNotice(raw: string, served: McpSurface, source: SurfaceSource): Notice {
+  return {
+    code: 'surface_env_invalid', kind: 'info',
+    why: `GBRAIN_SURFACE="${raw}" is not a tool surface (use verbs, starter or full), so this server ignored it and serves '${served}' (source: ${SURFACE_SOURCE_LABEL[source]}).`,
+    user_message: `The gbrain MCP server's GBRAIN_SURFACE setting ("${raw}") is not valid; it takes verbs, starter or full. Can you fix it in the env of your agent app's MCP server entry for gbrain?`,
+  };
 }

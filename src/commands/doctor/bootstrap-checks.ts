@@ -5,14 +5,18 @@
  */
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { execFileSync } from 'child_process';
+import { execFileSync } from '../../core/spawn.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { LATEST_VERSION } from '../../core/migrate.ts';
 // Agent-bootstrap doctor group (plan B2/B4/ENG-4 + one-live-serve note).
-import { readHarnessReceiptState, readReceipt } from '../../core/bootstrap/format.ts';
+import { readHarnessReceiptState, readReceipt, type HarnessReceipt } from '../../core/bootstrap/format.ts';
 import { probeLivePgliteHolder, resolveBrainDataDir } from '../../core/bootstrap/uninstall.ts';
 import { readRunbookStamp, hooksInstalled, listVerifyRuns } from '../../core/bootstrap/status.ts';
 import { resolveGbrainHome } from '../../core/gbrain-home.ts';
+import { isManagedFilesystemPath } from '../../core/persistence/filesystem-guard.ts';
+import { withoutPhysicalRootMetadata } from '../../core/persistence/root-metadata.ts';
+import { agentFix } from './check-fix.ts';
+import type { PushStatusEntry } from '../../core/workspace-push.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../../version.ts';
 import type { Check } from '../doctor.ts';
 
@@ -24,6 +28,78 @@ import type { Check } from '../doctor.ts';
  * `gbrain bootstrap` get ZERO checks from this group. Every probe is
  * fail-soft: a broken telemetry file degrades to a warn, never a throw.
  */
+/** #5878: warn when a shared-skills receipt epoch differs from this brain's membership row; true when it pushed. */
+async function pushSupersededEnrollmentCheck(checks: Check[], engine: BrainEngine | null, hr: HarnessReceipt): Promise<boolean> {
+  if (!engine) return false;
+  const { supersededEnrollments, SKILLS_REFRESH_COMMAND, SKILLS_EPOCH_DOCS } = await import('../../core/bootstrap/harness-skills.ts');
+  const superseded = await supersededEnrollments(engine, hr).catch(() => []);
+  if (superseded.length === 0) return false;
+  checks.push({
+    name: 'bootstrap_harness_health',
+    status: 'warn',
+    message: `shared skills enrollment superseded: ${superseded.map(e => `${e.host} receipt epoch ${e.local_epoch}, server epoch ${e.server_epoch}${e.active ? '' : ' (inactive)'}`).join('; ')} ` +
+      `— sessions get membership_inactive. Fix: ${SKILLS_REFRESH_COMMAND} (${SKILLS_EPOCH_DOCS}).`,
+    details: { code: 'shared_skills_epoch_superseded', fix: SKILLS_REFRESH_COMMAND, docs: SKILLS_EPOCH_DOCS, enrollments: superseded },
+  });
+  return true;
+}
+
+/** #5063: commits on the workspace's named branch that origin/<branch> lacks, counted whatever the push age (0 when unknown). */
+function commitsAheadOfOrigin(ws: string, branch: string): number {
+  if (!branch) return 0;
+  try {
+    return parseInt(execFileSync('git', ['-C', ws, 'rev-list', '--count', `origin/${branch}..HEAD`], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+    }).toString().trim(), 10) || 0;
+  } catch { return 0; }
+}
+
+/**
+ * #5371: one bootstrap_push_health finding. A managed canonical worktree
+ * refuses legacy bulk push, so there the remedy is the managed writer's
+ * read-only status probe; severity never changes, and an unmanaged root keeps
+ * `unmanagedRemedy`.
+ */
+function pushHealthCheck(root: string | null | undefined, status: 'warn' | 'fail', finding: string, unmanagedRemedy: string): Check {
+  if (!root || !isManagedFilesystemPath(root)) return { name: 'bootstrap_push_health', status, message: `${finding}${unmanagedRemedy}` };
+  return {
+    name: 'bootstrap_push_health', status,
+    message: `${finding} — ${root} is a managed canonical worktree, where legacy bulk push is not available. Inspect the managed writer with \`gbrain sources writer status --probe --json\`; changes must be written through gbrain (put_page or capture), direct file edits here are not published.`,
+    fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--probe', '--json'],
+      'A managed canonical worktree is published by its persistence owner, not by a workspace push; the probe shows whether that owner is running and publishing, and changes nothing.',
+      'bootstrap_push_health'),
+  };
+}
+
+/** #6083: a tree with nothing uncommitted (ownership metadata aside) on a named branch, 0 commits ahead of a configured origin. */
+function treeMatchesOrigin(root: string): boolean {
+  const g = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).toString().trim();
+  try {
+    g('remote', 'get-url', 'origin');
+    const branch = g('branch', '--show-current');
+    return branch !== '' && withoutPhysicalRootMetadata(g('status', '--porcelain')) === ''
+      && g('rev-list', '--count', `origin/${branch}..HEAD`) === '0';
+  } catch { return false; }
+}
+
+/**
+ * #6083: the recorded push failure finding. A failure whose tree now matches
+ * its origin is superseded (nothing is unpushed, and on a managed worktree
+ * nothing ever clears a refusal record); the first live failure decides.
+ */
+function recordedPushFailureCheck(failing: PushStatusEntry[], ws: string | null): Check {
+  const live = failing.filter((s) => !s.repoRoot || !treeMatchesOrigin(s.repoRoot));
+  if (live.length === 0) {
+    return { name: 'bootstrap_push_health', status: 'ok',
+      message: `last recorded push failed for ${failing.map((s) => s.repoRoot).join(', ')} (${failing[0]!.ts ?? 'unknown'}), but the tree matches its origin branch with nothing uncommitted; nothing to push` };
+  }
+  const s = live[0]!;
+  const target = s.repoRoot ?? ws ?? undefined;
+  const rest = live.length > 1 ? ` [+${live.length - 1} more workspace(s)]` : '';
+  return pushHealthCheck(target, 'warn', `last workspace push FAILED${target ? ` for ${target}` : ''} (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'}${rest}`,
+    ` — run \`gbrain sources push${target ? ` --path ${target}` : ''}\``);
+}
+
 export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise<Check[]> {
   const checks: Check[] = [];
   let home: string;
@@ -42,33 +118,13 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   // sole owner. "Enabled" is a CONFIG signal, not a health signal — the row
   // says so. Fail-soft like every probe in this group.
   try {
-    const {
-      codexPluginProvidesName,
-      claudePluginProvidesName,
-      codexAnyRegistrationExists,
-      claudeAnyRegistrationExists,
-    } = await import('../../core/bootstrap/harness.ts');
-    const { codexConfigPath, claudeUserSettingsPath, claudeUserMcpConfigPath } = await import('../../core/bootstrap/host-specs.ts');
-    const claudeUserMcpConfig = claudeUserMcpConfigPath();
-    const lanes: Array<{ harness: string; plugin: string; dup: boolean; disambiguate: string }> = [];
-    const codexPlugin = codexPluginProvidesName(codexConfigPath(), 'gbrain');
-    if (codexPlugin) {
-      lanes.push({
-        harness: 'codex',
-        plugin: codexPlugin,
-        dup: codexAnyRegistrationExists(codexConfigPath(), 'gbrain'),
-        disambiguate: 'keep one owner: `codex mcp remove gbrain` (drop the hand-wired entry) or `codex plugin remove gbrain@gbrain` (drop the plugin)',
-      });
-    }
-    const claudePlugin = claudePluginProvidesName(claudeUserSettingsPath(), 'gbrain');
-    if (claudePlugin) {
-      lanes.push({
-        harness: 'claude-code',
-        plugin: claudePlugin,
-        dup: claudeAnyRegistrationExists(claudeUserMcpConfig, 'gbrain', process.cwd()),
-        disambiguate: 'keep one owner: `claude mcp remove gbrain` (drop the hand-wired entry) or disable the plugin in Claude Code',
-      });
-    }
+    const { enabledPluginLanes, codexAnyRegistrationExists, claudeAnyRegistrationExists } = await import('../../core/bootstrap/plugin-lanes.ts');
+    const { codexConfigPath, claudeUserMcpConfigPath } = await import('../../core/bootstrap/host-specs.ts');
+    const lanes = enabledPluginLanes('gbrain').map((lane) => lane.harness === 'codex'
+      ? { ...lane, dup: codexAnyRegistrationExists(codexConfigPath(), 'gbrain'),
+          disambiguate: 'keep one owner: `codex mcp remove gbrain` (drop the hand-wired entry) or `codex plugin remove gbrain@gbrain` (drop the plugin)' }
+      : { ...lane, dup: claudeAnyRegistrationExists(claudeUserMcpConfigPath(), 'gbrain', process.cwd()),
+          disambiguate: 'keep one owner: `claude mcp remove gbrain` (drop the hand-wired entry) or disable the plugin in Claude Code' });
     for (const lane of lanes) {
       checks.push(
         lane.dup
@@ -93,7 +149,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
 
   const receipt = readReceipt(home);
   // One reader for every push-status surface [D8]; per-root files [D13].
-  const { readPushStatuses, pushStatusFilesExist } = await import('../../core/workspace-push.ts');
+  const { readPushStatuses, pushStatusFilesExist, pushStatusForWorkspace } = await import('../../core/workspace-push.ts');
   const pushStatuses = readPushStatuses();
   const statusFilesOnDisk = pushStatusFilesExist();
   const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
@@ -116,6 +172,8 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   // --status`'s job; doctor stays offline-cheap.
   if (harnessState.state === 'ok') {
     const hr = harnessState.receipt;
+    const { cleanupDoctorMessage, harnessCleanupReport, tokenStatesWith } = await import('../../core/bootstrap/harness-cleanup.ts');
+    let cleanup: Awaited<ReturnType<typeof harnessCleanupReport>> = [];
     const failed = hr.targets.filter((t) => t.state === 'failed');
     const pending = hr.targets.filter((t) => t.state === 'pending');
     if (failed.length > 0 || pending.length > 0) {
@@ -126,11 +184,13 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
           `harness wiring incomplete: ${failed.length} failed / ${pending.length} pending target(s)` +
           ` — re-run \`gbrain bootstrap harness\` to converge (details: gbrain bootstrap harness --status).`,
       });
-    } else if (hr.token.previous_ids && hr.token.previous_ids.length > 0) {
+    } else if ((cleanup = await harnessCleanupReport(hr, ids => engine ? tokenStatesWith(engine, ids) : Promise.resolve({}))).length > 0) {
+      // #6743: per id, a revoked credential awaiting enrollment cleanup reads apart from an active one (leave before revoke).
       checks.push({
         name: 'bootstrap_harness_health',
         status: 'fail',
-        message: `${hr.token.previous_ids.length} previous harness token(s) were never revoked (ids ${hr.token.previous_ids.join(', ')}) — re-run \`gbrain bootstrap harness\`, or run \`gbrain auth revoke\` with the id flag per id.`,
+        message: cleanupDoctorMessage(cleanup),
+        details: { code: 'bootstrap_cleanup_pending', cleanup },
       });
     } else if (hr.targets.length === 0 && hr.token.minted && hr.token.id !== undefined) {
       // Half-removed state: a remove under a live PGLite serve strips every
@@ -143,7 +203,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         status: 'fail',
         message: `harness removal pending: host wiring removed but the minted token (id ${hr.token.id}) is not yet revoked — stop the serve and re-run \`gbrain bootstrap harness\` with the remove flag, or run \`gbrain auth revoke\` with the id flag.`,
       });
-    } else {
+    } else if (!(await pushSupersededEnrollmentCheck(checks, engine, hr))) {
       try {
         const base = hr.url.replace(/\/mcp$/, '');
         const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(3000) });
@@ -169,6 +229,8 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         });
       }
     }
+    const { harnessHookCarrierChecks } = await import('./harness-hook-checks.ts');
+    checks.push(...harnessHookCarrierChecks(hr));
   } else if (harnessState.state !== 'absent') {
     checks.push({
       name: 'bootstrap_harness_health',
@@ -232,14 +294,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
       const { PUSH_STALE_MS } = await import('../hook.ts'); // hook.ts owns the threshold (single source)
       const failing = pushStatuses.filter((s) => s.ok === false);
       if (failing.length > 0) {
-        const s = failing[0]!;
-        const target = s.repoRoot ?? ws ?? undefined;
-        const rest = failing.length > 1 ? ` [+${failing.length - 1} more workspace(s)]` : '';
-        checks.push({
-          name: 'bootstrap_push_health',
-          status: 'warn',
-          message: `last workspace push FAILED${target ? ` for ${target}` : ''} (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'}${rest} — run \`gbrain sources push${target ? ` --path ${target}` : ''}\``,
-        });
+        checks.push(recordedPushFailureCheck(failing, ws));
       } else {
         const stamps = pushStatuses.map((s) => Date.parse(s.ts ?? '')).filter((t) => Number.isFinite(t));
         const stalest = stamps.length > 0 ? Math.min(...stamps) : NaN;
@@ -261,20 +316,19 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         // per-turn push [hook.ts]. `known` distinguishes "verified clean"
         // from "couldn't verify" (no receipt/workspace, or the git probe
         // itself failed): unverified must NOT be treated as clean below.
-        let dirty = false;
-        let known = false;
+        let dirty = false, known = false, ahead = 0;
         if (ws) {
           try {
-            const statusOut = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
+            const statusOut = withoutPhysicalRootMetadata(execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
               stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-            }).toString();
+            }).toString());
+            const branch = execFileSync('git', ['-C', ws, 'branch', '--show-current'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).toString().trim();
+            ahead = commitsAheadOfOrigin(ws, branch);
             if (statusOut.trim() !== '') {
               dirty = true;
               known = true;
             } else {
-              const branchOut = execFileSync('git', ['-C', ws, 'branch', '--show-current'], {
-                stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-              }).toString().trim();
+              const branchOut = branch;
               if (branchOut) {
                 try {
                   const aheadOut = execFileSync(
@@ -320,12 +374,9 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
             }
           } catch { dirty = false; known = false; }
         }
-        if (stale && dirty) {
-          checks.push({
-            name: 'bootstrap_push_health',
-            status: 'fail',
-            message: `last successful push ${staleIso} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
-          });
+        if (dirty && ws && Date.now() - Date.parse(pushStatusForWorkspace(pushStatuses, ws)?.ts ?? '') > PUSH_STALE_MS) { // #5432: this root's own receipt
+          checks.push(pushHealthCheck(ws, 'fail', `last successful push ${pushStatusForWorkspace(pushStatuses, ws)?.ts} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]`,
+            `. Run \`gbrain sources push --path ${ws}\`.`));
         } else if (stale && !targetMatchesWs) {
           // Multiple tracked push targets (or the one target names a
           // different repoRoot than `ws`) — the stale entry can't be
@@ -344,15 +395,14 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
           // the states that name a real fix.
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `no push activity since ${staleIso}; tree confirmed clean, nothing to push` });
         } else if (stale) {
-          checks.push({
-            name: 'bootstrap_push_health',
-            status: 'warn',
-            message: ws
-              ? `last successful push ${staleIso} (>48h ago); workspace tree state unverified (the git probe failed) — check ${ws} manually, or run \`gbrain sources push --path ${ws}\` to be safe`
-              : `last successful push ${staleIso} (>48h ago); workspace tree state unverified (no bootstrap receipt on this machine names a workspace to check) — check the workspace manually`,
-          });
+          checks.push(ws
+            ? pushHealthCheck(ws, 'warn', `last successful push ${staleIso} (>48h ago); workspace tree state unverified (the git probe failed)`,
+              ` — check ${ws} manually, or run \`gbrain sources push --path ${ws}\` to be safe`)
+            : { name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); workspace tree state unverified (no bootstrap receipt on this machine names a workspace to check) — check the workspace manually` });
         } else {
-          checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
+          // #5063: a recent successful push of something never certifies a tree that is still ahead.
+          checks.push(ahead > 0 ? pushHealthCheck(ws, 'warn', `last push ok (${staleIso}), but ${ws} has ${ahead} commit(s) not on origin — recent agent memory is unpushed`, `. Run \`gbrain sources push --path ${ws}\`.`)
+            : { name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
         }
       }
     } else if (statusFilesOnDisk) {
@@ -437,7 +487,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   try {
     const dataDir = resolveBrainDataDir(home);
     const holder = probeLivePgliteHolder(dataDir);
-    if (holder) {
+    if (holder && !holder.isSelf) {
       checks.push({
         name: 'bootstrap_serve_lock',
         status: holder.serve ? 'ok' : 'warn',

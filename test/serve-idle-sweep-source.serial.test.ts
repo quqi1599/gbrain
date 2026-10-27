@@ -90,6 +90,7 @@ describe('serve idle sweep source resolution (#4679)', () => {
       mcpStdio: false,
       bootTimeoutMs: 0,
       sweepEnabled: true,
+      factsDrain: false, // its own 10-minute timer is covered by test/facts-drain-scheduler.test.ts
     };
 
     process.chdir(dir);
@@ -107,5 +108,19 @@ describe('serve idle sweep source resolution (#4679)', () => {
 
     expect(sweepCalls.length).toBe(1);
     expect(sweepCalls[0].sourceId).toBe('wiki');
+  }, 20_000);
+
+  test('#7599: a read-only serve on Postgres arms no idle sweep; read-write, or on PGLite, it does', async () => {
+    const armed: string[] = [];
+    for (const [kind, args] of [['postgres', ['--access', 'read-only']], ['postgres', ['--access=read-only']], ['postgres', []], ['pglite', ['--access', 'read-only']]] as const) {
+      let timers = 0;
+      await withEnv({ GBRAIN_SOURCE: undefined }, () => runServe({ ...makeEngine(['default']), kind } as BrainEngine, [...args], {
+        stdin: new EventEmitter() as never, signals: new EventEmitter() as never, exit: () => {}, log: () => {}, startMcpServer: async () => {},
+        getParentPid: () => 1, probeWatchdog: () => true, setInterval: () => { timers++; return { unref() {} }; }, clearInterval: () => {},
+        mcpStdio: false, bootTimeoutMs: 0, sweepEnabled: true, factsDrain: false,
+      }));
+      armed.push(`${kind} ${args.join(' ') || 'read-write'}: ${timers}`);
+    }
+    expect(armed).toEqual(['postgres --access read-only: 0', 'postgres --access=read-only: 0', 'postgres read-write: 1', 'pglite --access read-only: 1']);
   }, 20_000);
 });

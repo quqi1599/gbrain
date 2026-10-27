@@ -20,7 +20,7 @@
 import { describe, test, expect } from 'bun:test';
 import { segmentDispatchBlocks, buildFlagRegistry, isValueOnlyImport, stripComments } from '../scripts/generate-flag-registry.ts';
 import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
-import { validateCommandFlags } from '../src/cli.ts';
+import { validateCommandFlags } from '../src/cli/main.ts';
 
 /**
  * The flags the plan names for `gbrain eval longmemeval`, plus a sample of
@@ -181,6 +181,12 @@ describe('segmentDispatchBlocks — every if/case shape is a marker for its comm
   test('committed registry: storage does not carry the phantom --multimodal (reindex still does)', () => {
     expect(CLI_FLAG_REGISTRY.storage).not.toContain('--multimodal');
     expect(CLI_FLAG_REGISTRY.reindex).toContain('--multimodal');
+  });
+
+  test('flag-equals.ts stays out of the scan, so auth does not borrow its table literals (#7619)', () => {
+    for (const registry of [CLI_FLAG_REGISTRY, buildFlagRegistry()]) {
+      for (const flag of ['--purge', '--pace', '--archived-at']) expect(registry.auth).not.toContain(flag);
+    }
   });
 
   test('committed registry: brainstorm/lsd do not carry the phantom --retry-judge (#4766)', () => {

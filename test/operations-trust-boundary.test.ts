@@ -102,7 +102,7 @@ describe('operations contract — every op has scope + correct mutability shape'
     // Remote-gated exception (#2598, same allowlist as test/oauth.test.ts):
     // `think` is read-scoped for OAuth/MCP because its handler forces
     // save/take OFF for remote callers before persistence — pinned by
-    // test/takes-mcp-allowlist.serial.test.ts. Local CLI can still persist.
+    // test/takes-mcp-allowlist.test.ts. Local CLI can still persist.
     // WP4/D9: request_tools is read-scoped + mutating — its only write (the
     // {surface} persist branch) self-enforces the D2 ceiling, the operator
     // lock, and a per-client rate limit (test/request-tools.test.ts pins all
@@ -246,6 +246,9 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'retain_skill_revision',
       'sources_inspect',
       'sync_brain',
+      // W9F item 8: the CLI delegates rebuild to a resident owner over IPC.
+      'takes_rebuild',
+      'takes_remove',
     ];
     const derived = operations.filter(o => o.localOnly).map(o => o.name).sort();
     expect(derived).toEqual(LOCAL_ONLY_SNAPSHOT);
@@ -480,8 +483,10 @@ describe('ops-module system-access containment — top-level fs/child_process im
   // GRANULARITY (the closest enforceable version of the file→ops mapping):
   //   - DETECTION is per-FILE and text-based: a static top-level ESM
   //     import/re-export of 'fs' / 'fs/promises' / 'child_process' (with or
-  //     without the node: prefix). Static import statements are top-level by
-  //     ESM grammar, so matching the `from '<specifier>'` clause is exact.
+  //     without the node: prefix), or of src/core/spawn.ts, the seam every
+  //     src/ subprocess launch goes through. Static import statements are
+  //     top-level by ESM grammar, so matching the `from '<specifier>'`
+  //     clause is exact.
   //     Lazy dynamic `await import('node:fs')` INSIDE a handler is
   //     deliberately out of scope (schema-packs.ts and skillopt.ts use that
   //     form today) — it is runtime-gated per call site, the same doctrine
@@ -517,7 +522,7 @@ describe('ops-module system-access containment — top-level fs/child_process im
   // import keyword at a line start) or commented-out imports (`//` and `*`
   // are not whitespace, so the line-start anchor excludes them).
   const SYSTEM_IMPORT_RE =
-    /(?:^|\n)\s*(?:import|export)\s+(?:[^;]*?\bfrom\s+)?['"](?:node:)?(?:fs|fs\/promises|child_process)['"]/;
+    /(?:^|\n)\s*(?:import|export)\s+(?:[^;]*?\bfrom\s+)?['"](?:(?:node:)?(?:fs|fs\/promises|child_process)|\.\.\/spawn\.ts)['"]/;
 
   /**
    * Canonical ops contributed by one ops module: import it, walk every
@@ -554,6 +559,8 @@ describe('ops-module system-access containment — top-level fs/child_process im
     expect(SYSTEM_IMPORT_RE.test(`import {\n  readFileSync,\n  writeFileSync,\n} from 'fs/promises';`)).toBe(true);
     expect(SYSTEM_IMPORT_RE.test(`import 'node:fs';`)).toBe(true);
     expect(SYSTEM_IMPORT_RE.test(`export { execSync } from 'node:child_process';`)).toBe(true);
+    expect(SYSTEM_IMPORT_RE.test(`import { execFileSync } from '../spawn.ts';`)).toBe(true);
+    expect(SYSTEM_IMPORT_RE.test(`import { buildSpawnInvocation } from '../minions/spawn-helpers.ts';`)).toBe(false);
     expect(SYSTEM_IMPORT_RE.test(`const nodeFs = await import('node:fs');`)).toBe(false);
     expect(SYSTEM_IMPORT_RE.test(`import { resolve } from 'node:path';`)).toBe(false);
     expect(SYSTEM_IMPORT_RE.test(`code();\n// import { x } from 'node:fs'`)).toBe(false);

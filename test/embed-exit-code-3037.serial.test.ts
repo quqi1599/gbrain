@@ -10,7 +10,7 @@
  * provider pointed at a local mock llama-server (OpenAI-compatible, no auth)
  * that can be flipped between failing and healthy. Single test, single
  * brain: every spawn pays a cold transpile cost (see
- * apply-migrations-pglite-spawn.serial.test.ts for the rationale).
+ * apply-migrations-pglite-spawn.test.ts for the rationale).
  *
  * Serial: spawns subprocesses + binds a local port + writes tmpdirs.
  */
@@ -18,8 +18,9 @@ import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'node:url';
 
-const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
 const DIMS = 16;
 
 async function runCli(

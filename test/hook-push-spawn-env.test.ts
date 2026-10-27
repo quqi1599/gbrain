@@ -10,7 +10,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-// test-reads-source-ok: the property under test is a source SHAPE — every detached/exec spawn in hook.ts must pass `env: process.env` so the cwd-.env quarantine reaches the child; a runtime probe cannot enumerate spawn sites, only grepping the source can.
+// test-reads-source-ok[trust-boundary]: the property under test is a source SHAPE — every detached/exec spawn in hook.ts must pass `env: process.env` so the cwd-.env quarantine reaches the child; a runtime probe cannot enumerate spawn sites, only grepping the source can.
 const SRC = readFileSync(join(import.meta.dir, '../src/commands/hook.ts'), 'utf8');
 
 function spawnDetachedPushBody(): string {
@@ -36,10 +36,13 @@ describe('spawnDetachedPush env handoff', () => {
 });
 
 describe('tryExecAsync env handoff', () => {
-  test('the git exec wrapper passes the (quarantined) process.env explicitly', () => {
+  test('the git exec wrapper passes the (quarantined) process.env explicitly, through gitChildEnv() (#4992)', () => {
     const start = SRC.indexOf('function tryExecAsync(');
     expect(start).toBeGreaterThan(-1);
     const body = SRC.slice(start, SRC.indexOf('\n}\n', start));
-    expect(body).toMatch(/execFile\([\s\S]*?\{[^}]*env:\s*process\.env[^}]*\}/);
+    // gitChildEnv() copies process.env at call time (after the quarantine deletions) minus Git's
+    // repository-locating variables, so the child sees the deletions and `git -C` works on the workspace.
+    expect(body).toMatch(/execFile\([\s\S]*?\{[^}]*env:\s*gitChildEnv\(\)[^}]*\}/);
+    expect(SRC).toMatch(/import \{[^}]*\bgitChildEnv\b[^}]*\} from '\.\.\/core\/git-env\.ts'/);
   });
 });

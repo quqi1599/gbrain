@@ -30,11 +30,13 @@
  */
 
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import type { WindowTurn } from './entity-salience.ts';
+import type { CorpusFileStat, CorpusProgress } from './corpus-windows.ts';
 import { toCorpusText, type ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { mapOpenclawLine } from '../transcripts/openclaw.ts';
+import { stripPastedContent, stripPastedContentFromCorpus } from '../transcripts/pasted-content.ts';
 
 /** Length of the hex content-hash slice in segment filenames. */
 /**
@@ -68,18 +70,95 @@ export function segmentHash(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, SEGMENT_HASH_LEN);
 }
 
-export function segmentFileName(sessionId: string, hash: string): string {
-  return `${safeIdComponent(sessionId)}.seg-${hash.replace(/[^0-9a-f]/g, '')}.txt`;
+/**
+ * #6268 (R14): the spool subdirectory every source-stamped corpus file lives
+ * in. A pre-stamp sweeper reads only the corpus dir's top level and files any
+ * non-writeback `.txt` there under its own pass source, so a stamped file it
+ * could see would be misfiled; inside this subdirectory it sees nothing.
+ * Top-level files are the legacy (unstamped) corpus. No leading dot: dream
+ * synthesis walks into it exactly as it walked the top level.
+ */
+export const CORPUS_SPOOL_SUBDIR = 'sourced';
+
+/**
+ * The stamp of a file whose writer could not resolve the session's source.
+ * Underscores are never valid in a source id (`SOURCE_ID_RE`), so no real
+ * source can be named this.
+ */
+export const CORPUS_UNRESOLVED_STAMP = '_unresolved';
+
+const SOURCE_STAMP_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
+
+/** A valid corpus source stamp: a source id or the unresolved marker. */
+export function isCorpusSourceStamp(stamp: unknown): stamp is string {
+  return typeof stamp === 'string' && (stamp === CORPUS_UNRESOLVED_STAMP || SOURCE_STAMP_RE.test(stamp));
+}
+
+export function corpusSpoolDir(corpusDir: string): string {
+  return join(corpusDir, CORPUS_SPOOL_SUBDIR);
+}
+
+/** The spool dir, created 0700. Throws on fs failure. */
+export function ensureCorpusSpoolDir(corpusDir: string): string {
+  const dir = corpusSpoolDir(corpusDir);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+function stampPart(stamp: string | null | undefined): string {
+  if (stamp === undefined || stamp === null) return '';
+  if (!isCorpusSourceStamp(stamp)) throw new Error(`invalid corpus source stamp ${JSON.stringify(stamp)}`);
+  return `.src-${stamp}`;
+}
+
+/** `<sessionId>.seg-<hash>[.src-<stamp>].txt`; spool writers always pass the stamp. */
+export function segmentFileName(sessionId: string, hash: string, stamp?: string | null): string {
+  return `${safeIdComponent(sessionId)}.seg-${hash.replace(/[^0-9a-f]/g, '')}${stampPart(stamp)}.txt`;
+}
+
+/** The session-end corpus file: `<sessionId>[.src-<stamp>].txt`. */
+export function sessionCorpusFileName(sessionId: string, stamp?: string | null): string {
+  return `${safeIdComponent(sessionId)}${stampPart(stamp)}.txt`;
 }
 
 export function ledgerFileName(sessionId: string): string {
   return `${safeIdComponent(sessionId)}.ledger.json`;
 }
 
+/** #4618 per-session seat sidecar (context/seat.ts owns its content). One
+ * per SESSION, not per corpus file: the session-end `.txt`, its checkpoint
+ * segments and its writeback turns all share it. */
+export const SEAT_SIDECAR_SUFFIX = '.seat.json';
+
+export function seatFileName(sessionId: string): string {
+  return `${safeIdComponent(sessionId)}${SEAT_SIDECAR_SUFFIX}`;
+}
+
+/** #6268: the per-session source record in the spool (context/corpus-source.ts owns its content and lock). */
+export const SESSION_SOURCE_SUFFIX = '.source.json';
+export const SESSION_SOURCE_LOCK_SUFFIX = '.source.lock';
+
+export function sessionSourceFileName(sessionId: string): string {
+  return `${safeIdComponent(sessionId)}${SESSION_SOURCE_SUFFIX}`;
+}
+
+/** A seat sidecar written ahead of its corpus file is never reaped inside
+ * this window (the writer renames the corpus file within seconds). */
+const SEAT_ORPHAN_GRACE_MS = 10 * 60 * 1000;
+
 /** Receipt sidecar suffix (harvest link candidates persisted before manifest
  * publish). Lives HERE so the engine-free hook lane can GC orphaned receipts
  * without importing the engine-typed harvest module. */
 export const HARVEST_RECEIPT_SUFFIX = '.receipt.json';
+/** #6091: capture-time consent record (capture-consent.ts); reaped with its corpus file after a grace period.
+ * `<file>.capture-off.json` is the pre-wave-12 single record; W4.2 records are `<file>.capture-off.<brain>.json`. */
+export const CAPTURE_OFF_SUFFIX = '.capture-off.json';
+export const CAPTURE_OFF_INFIX = '.capture-off.';
+/** #5887 window-progress sidecar (context/corpus-windows.ts) and its CAS
+ * lock. Engine-free home so the hook's GC reaps both with the `.txt`; the
+ * hook's resume rewrite never deletes them. */
+export const CORPUS_PROGRESS_SUFFIX = '.progress';
+export const CORPUS_PROGRESS_LOCK_SUFFIX = '.progress.lock';
 
 /**
  * Inverse of `segmentFileName`: `{sessionId, hash}` when `name` is a corpus
@@ -89,9 +168,26 @@ export const HARVEST_RECEIPT_SUFFIX = '.receipt.json';
  */
 export function parseSegmentFileName(
   name: string,
-): { sessionId: string; hash: string } | null {
-  const m = /^(.+)\.seg-([0-9a-f]{12,64})\.txt$/.exec(name);
-  return m ? { sessionId: m[1], hash: m[2] } : null;
+): { sessionId: string; hash: string; stamp?: string } | null {
+  const m = /^(.+)\.seg-([0-9a-f]{12,64})(?:\.src-([a-z0-9_-]{1,40}))?\.txt$/.exec(name);
+  if (!m) return null;
+  return { sessionId: m[1], hash: m[2], ...(m[3] && isCorpusSourceStamp(m[3]) ? { stamp: m[3] } : {}) };
+}
+
+/** `{sessionId, stamp}` of a stamped session-end file; null for any other name. */
+export function parseSessionCorpusFileName(name: string): { sessionId: string; stamp: string } | null {
+  if (parseSegmentFileName(name) || parseWbFileName(name)) return null;
+  const m = /^(.+)\.src-([a-z0-9_-]{1,40})\.txt$/.exec(name);
+  return m && isCorpusSourceStamp(m[2]) ? { sessionId: m[1], stamp: m[2] } : null;
+}
+
+/**
+ * The source stamp a corpus file NAME carries (any kind), or null. A spool
+ * file without one is malformed; at the top level only the legacy
+ * writeback grammar ever carried a stamp.
+ */
+export function corpusFileStamp(name: string): string | null {
+  return parseSegmentFileName(name)?.stamp ?? parseWbFileName(name)?.sourceId ?? parseSessionCorpusFileName(name)?.stamp ?? null;
 }
 
 /**
@@ -189,9 +285,10 @@ export function writeSegment(
   dir: string,
   sessionId: string,
   text: string,
+  stamp?: string | null,
 ): { file: string; hash: string; existed: boolean } {
   const hash = segmentHash(text);
-  const file = join(dir, segmentFileName(sessionId, hash));
+  const file = join(dir, segmentFileName(sessionId, hash, stamp));
   if (existsSync(file)) return { file, hash, existed: true };
   const tmp = `${file}.tmp-${process.pid}`;
   writeFileSync(tmp, text, { mode: 0o600 });
@@ -239,7 +336,7 @@ export async function coverageComplete(
 export function readOpenclawBoundaryTail(
   path: string,
   opts: { maxBytes?: number } = {},
-): { turns: WindowTurn[]; boundaryTurnIndexes: number[]; toolCalls: ToolCallRecord[]; toolCallTurnIndexes: number[] } | null {
+): OpenclawBoundaryTail | null {
   const maxBytes = Math.max(1, Math.floor(opts.maxBytes ?? 2 * 1024 * 1024));
   let raw: string;
   try {
@@ -259,6 +356,47 @@ export function readOpenclawBoundaryTail(
   } catch {
     return null;
   }
+  const entries: unknown[] = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      entries.push(JSON.parse(t));
+    } catch {
+      continue; // includes a tail read's partial first line
+    }
+  }
+  return mapOpenclawEntries(entries);
+}
+
+export type OpenclawBoundaryTail = { turns: WindowTurn[]; boundaryTurnIndexes: number[]; toolCalls: ToolCallRecord[]; toolCallTurnIndexes: number[] };
+
+/**
+ * #6316: OpenClaw 2026.9.x keeps transcripts in its SQLite store and passes
+ * compact() a `sessionTarget` instead of a `sessionFile`. The host's
+ * `session-transcript-runtime` returns the same event objects the JSONL file
+ * holds, so this keeps the newest events up to `maxBytes` of serialized JSON
+ * (the file reader's tail bound) and maps them with the same mapper.
+ */
+export function readOpenclawEventsTail(events: unknown[], opts: { maxBytes?: number } = {}): OpenclawBoundaryTail | null {
+  const maxBytes = Math.max(1, Math.floor(opts.maxBytes ?? 2 * 1024 * 1024));
+  let bytes = 0;
+  let start = events.length;
+  while (start > 0) {
+    let size: number;
+    try {
+      size = Buffer.byteLength(JSON.stringify(events[start - 1]) ?? '', 'utf8') + 1;
+    } catch {
+      break;
+    }
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    start--;
+  }
+  return mapOpenclawEntries(events.slice(start));
+}
+
+function mapOpenclawEntries(entries: unknown[]): OpenclawBoundaryTail | null {
   const turns: WindowTurn[] = [];
   const boundaryTurnIndexes: number[] = [];
   // Memorable integration: tool calls stamped with the turn slot they sit at
@@ -269,15 +407,7 @@ export function readOpenclawBoundaryTail(
   const toolCalls: ToolCallRecord[] = [];
   const toolCallTurnIndexes: number[] = [];
   let mappedAnything = false;
-  for (const line of raw.split('\n')) {
-    const t = line.trim();
-    if (!t) continue;
-    let entry: unknown;
-    try {
-      entry = JSON.parse(t);
-    } catch {
-      continue; // includes a tail read's partial first line
-    }
+  for (const entry of entries) {
     const mapped = mapOpenclawLine(entry);
     if (mapped.kind === 'message' || mapped.kind === 'skip') {
       for (const c of mapped.toolCalls ?? []) {
@@ -300,21 +430,21 @@ export function readOpenclawBoundaryTail(
 
 /**
  * Ambient-writeback turn files (WP4) — the Stop-hook backstop's siblings of
- * checkpoint segments. `<sessionId>.wb-<hash24>[.src-<sourceId>].txt` where
+ * checkpoint segments. `<sessionId>.wb-<hash24>[.src-<stamp>].txt` where
  * the hash is the GATE's normalized-turn hash (turn identity, computed in
  * writeback-gate.ts) — a re-fired Stop hook for the same turn re-derives the
  * same name and short-circuits (requirement 9's deterministic idempotency,
- * embedding-free). The optional `.src-` segment banks the session's
- * GBRAIN_SOURCE so the SWEEP fallback files the turn into the same source
- * the prompt-time IPC lane would have (source-isolation invariant —
- * adversarial review, this wave); omitted for the default source, keeping
- * default-flow names byte-identical. They end `.txt` ON PURPOSE: the sweep's
+ * embedding-free). The `.src-` segment banks the session's source so the
+ * SWEEP fallback files the turn into the same source the prompt-time IPC
+ * lane would have (source-isolation invariant). #6268: spool writers stamp
+ * every file, `default` included; a top-level name without one is a legacy
+ * file written before stamps (old writers omitted `default` and an unset
+ * GBRAIN_SOURCE alike, so it proves nothing). They end `.txt` ON PURPOSE: the sweep's
  * corpus pass is the free backstop when serve/IPC is down (the sweep applies
  * the writeback gate before extracting them — OV2-11).
  */
-export function wbFileName(sessionId: string, hash24: string, sourceId?: string | null): string {
-  const src = sourceId && sourceId !== 'default' ? `.src-${safeIdComponent(sourceId)}` : '';
-  return `${safeIdComponent(sessionId)}.wb-${hash24.replace(/[^0-9a-f]/g, '')}${src}.txt`;
+export function wbFileName(sessionId: string, hash24: string, stamp?: string | null): string {
+  return `${safeIdComponent(sessionId)}.wb-${hash24.replace(/[^0-9a-f]/g, '')}${stampPart(stamp)}.txt`;
 }
 
 /** `{sessionId, hash, sourceId?}` when `name` is a writeback turn file, else
@@ -325,12 +455,39 @@ export function parseWbFileName(name: string): { sessionId: string; hash: string
   return m ? { sessionId: m[1], hash: m[2], ...(m[3] ? { sourceId: m[3] } : {}) } : null;
 }
 
+/**
+ * The harness session a `.txt` corpus file belongs to: the session-end
+ * `<sessionId>.txt`, a checkpoint segment or a writeback turn file. Used to
+ * classify gbrain's own claude-cli sessions (#5413) across every form.
+ */
+export function corpusFileSessionId(name: string): string {
+  return parseSegmentFileName(name)?.sessionId ?? parseWbFileName(name)?.sessionId
+    ?? parseSessionCorpusFileName(name)?.sessionId ?? name.replace(/\.txt$/, '');
+}
+
+/**
+ * #5812 — the text a fact extractor may see from a session-corpus file: paste
+ * blocks removed (someone else's words), the file itself unchanged. A
+ * writeback turn file is one user turn; every other corpus file is
+ * `toCorpusText` blocks, stripped per `[user]` block.
+ */
+export function corpusTextForExtraction(path: string, text: string): string {
+  return parseWbFileName(basename(path)) ? stripPastedContent(text).text : stripPastedContentFromCorpus(text);
+}
+
 /** The TERMINAL writeback_off `.ingested` sidecar payload — the wb state
  * machine's one terminal skip, written identically by the serve harvest and
  * the sweep backstop (shape drift between the two writers would be invisible
  * until a consumer disagrees). */
 export function writebackOffSidecarJson(): string {
   return JSON.stringify({ ingested_at: new Date().toISOString(), skipped: 'writeback_off' }) + '\n';
+}
+
+/** The TERMINAL self_capture `.ingested` sidecar payload (#5413/#5820) —
+ * written identically by the serve harvest and the sweep, so neither retries
+ * a corpus file captured from gbrain's own claude-cli session. */
+export function selfCaptureSidecarJson(): string {
+  return JSON.stringify({ ingested_at: new Date().toISOString(), skipped: 'self_capture' }) + '\n';
 }
 
 /**
@@ -345,10 +502,10 @@ export async function bankWritebackTurn(
   sessionId: string,
   normalizedTurn: string,
   hash24: string,
-  sourceId?: string | null,
+  stamp?: string | null,
 ): Promise<{ status: 'wb_banked' | 'wb_dup' | 'wb_scan_unavailable' | 'wb_empty' | `wb_${string}`; flushCorpusFile?: string }> {
   try {
-    const name = wbFileName(sessionId, hash24, sourceId);
+    const name = wbFileName(sessionId, hash24, stamp);
     const file = join(dir, name);
     if (existsSync(file) || existsSync(file + '.ingested')) return { status: 'wb_dup', flushCorpusFile: name };
     let redacted: string;
@@ -383,7 +540,13 @@ export async function bankCompactSegment(
   sessionId: string,
   allTurns: WindowTurn[],
   boundaryTurnIndexes: number[],
-  opts: { remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number },
+  opts: {
+    remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number;
+    /** #6091: runs before the segment is renamed into place (capture-time consent record); a throw banks nothing. */
+    beforeWrite?: (file: string, text: string) => void;
+    /** #6268: the session's source stamp (spool writers always pass one). */
+    stamp?: string | null;
+  },
 ): Promise<{ segment: string; flushCorpusFile?: string; hash?: string; ordinal?: number }> {
   try {
     const windowTurns = sliceBoundaryWindow(allTurns, boundaryTurnIndexes, {
@@ -395,11 +558,12 @@ export async function bankCompactSegment(
     if (!rendered) return { segment: 'scan_unavailable' };
     if (!rendered.text.trim()) return { segment: 'empty_window' };
     if (opts.remainingMs() < opts.minWriteMs) return { segment: 'deadline_write' };
-    const w = writeSegment(dir, sessionId, rendered.text);
+    opts.beforeWrite?.(join(dir, segmentFileName(sessionId, segmentHash(rendered.text), opts.stamp)), rendered.text);
+    const w = writeSegment(dir, sessionId, rendered.text, opts.stamp);
     const ordinal = appendSegmentLedger(dir, sessionId, w.hash);
     return {
       segment: w.existed ? 'segment_dup' : 'segment_banked',
-      flushCorpusFile: segmentFileName(sessionId, w.hash),
+      flushCorpusFile: segmentFileName(sessionId, w.hash, opts.stamp),
       hash: w.hash,
       ordinal,
     };
@@ -442,21 +606,270 @@ export async function decideCorpusMode(
 }
 
 /**
+ * E-N1: a corpus `.txt` with no `.ingested` sidecar holds turns nothing has
+ * extracted yet (an HTTP serve with no sweep, a refused harvest). Retention
+ * removes it only at this multiple of the configured retention, and doctor
+ * `memory_writeback` warns while it waits.
+ */
+export const CORPUS_UNINGESTED_RETENTION_FACTOR = 3;
+/** Completion sidecar suffix (sweep.ts CORPUS_INGESTED_SUFFIX; duplicated to stay engine-free). */
+const INGESTED_SUFFIX = '.ingested';
+
+/**
+ * #6786: `.ingested` skip reasons that record a state of the extracting
+ * process (no servable extraction model), not anything about the file. A
+ * sidecar carrying one is not a completion: selection, the HTTP drain, the
+ * doctor backlog and retention GC all treat the file as pending, and the
+ * sweep extracts it once a model serves (pre-#6786 builds wrote these).
+ */
+export const CORPUS_NON_TERMINAL_SKIPS: readonly string[] = ['chat_unavailable'];
+
+/**
+ * #6786: what `<full>.ingested` says. `absent` (no sidecar), `unavailable`
+ * (a non-terminal skip), or `final` (a completion; an unreadable or
+ * non-JSON sidecar counts as one, as every build before #6786 did). Never throws.
+ */
+export function corpusSidecarState(full: string): 'absent' | 'unavailable' | 'final' {
+  let text: string;
+  try {
+    text = readFileSync(full + INGESTED_SUFFIX, 'utf8');
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'final';
+  }
+  try {
+    const skipped = (JSON.parse(text) as { skipped?: unknown } | null)?.skipped;
+    return typeof skipped === 'string' && CORPUS_NON_TERMINAL_SKIPS.includes(skipped) ? 'unavailable' : 'final';
+  } catch {
+    return 'final';
+  }
+}
+
+function isFileStat(v: unknown): v is CorpusFileStat {
+  const s = v as CorpusFileStat;
+  return !!s && typeof s === 'object' && Number.isFinite(s.size) && Number.isFinite(s.mtime_ms) && Number.isFinite(s.ino);
+}
+
+/** #5887 `.progress` parse (context/corpus-windows.ts); null when unparseable (replayed safely). */
+export function parseCorpusProgress(text: string): CorpusProgress | null {
+  let p: CorpusProgress;
+  try { p = JSON.parse(text) as CorpusProgress; } catch { return null; }
+  if (!p || typeof p !== 'object' || p.version !== 1 || !Number.isSafeInteger(p.generation)) return null;
+  if (!Array.isArray(p.turns) || !p.turns.every((t) => t && typeof t.sha256 === 'string')) return null;
+  if (p.continuation !== null && !(p.continuation && typeof p.continuation.turn_sha256 === 'string'
+    && Number.isSafeInteger(p.continuation.stripped_offset))) return null;
+  if (p.finished !== null && !isFileStat(p.finished)) return null;
+  if (!p.totals || !Array.isArray(p.entity_slugs)) return null;
+  if (p.source != null && !(typeof p.source.id === 'string' && typeof p.source.incarnation === 'string')) return null;
+  return p;
+}
+
+/**
+ * How a corpus file stands (#6786: the one classifier for sweep selection,
+ * the under-claim re-check and retention GC):
+ *   'pending'        — no `.ingested` sidecar;
+ *   'unavailable'    — the sidecar records a non-terminal skip: pending;
+ *   'done'           — its `.progress` finished this exact file (stat match);
+ *   'changed'        — rewritten since; re-enter (turn hashes decide resume);
+ *   'legacy'         — finished before `.progress` existed and not rewritten
+ *                      since (the sidecar is newer than the file): adopt;
+ *   'legacy_changed' — finished before `.progress` existed, rewritten after.
+ * Writeback turn files are immutable single turns: a final sidecar is 'done'.
+ * Only 'done' and 'legacy' are finished. Stat and progress read errors throw.
+ */
+export type CorpusFileCompletion = 'pending' | 'unavailable' | 'done' | 'changed' | 'legacy' | 'legacy_changed';
+
+export function corpusFileCompletion(full: string, name: string): CorpusFileCompletion {
+  const sidecar = corpusSidecarState(full);
+  if (sidecar !== 'final') return sidecar === 'absent' ? 'pending' : 'unavailable';
+  if (parseWbFileName(name)) return 'done';
+  const st = statSync(full);
+  let progress: CorpusProgress | null = null;
+  try {
+    progress = parseCorpusProgress(readFileSync(full + CORPUS_PROGRESS_SUFFIX, 'utf8'));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    return statSync(full + INGESTED_SUFFIX).mtimeMs >= st.mtimeMs ? 'legacy' : 'legacy_changed';
+  }
+  if (!progress) return statSync(full + INGESTED_SUFFIX).mtimeMs >= st.mtimeMs ? 'legacy' : 'legacy_changed';
+  const f = progress.finished;
+  return f && f.size === st.size && f.mtime_ms === st.mtimeMs && f.ino === st.ino ? 'done' : 'changed';
+}
+
+export function corpusFileFinished(state: CorpusFileCompletion): boolean {
+  return state === 'done' || state === 'legacy';
+}
+
+/** Whether a corpus file still waits for extraction, by `corpusFileCompletion`; a file that is gone does not. */
+export function corpusFileAwaitsExtraction(full: string, name: string): boolean {
+  try {
+    return !corpusFileFinished(corpusFileCompletion(full, name));
+  } catch {
+    return existsSync(full);
+  }
+}
+
+/**
+ * #6785: per-file record of the one corpus window (or writeback turn) whose
+ * extraction keeps failing after the model call. Written under the file's
+ * `.in-progress` claim by context/corpus-windows.ts; removed when that
+ * window commits, or by `gbrain sweep --retry-failed --apply`.
+ */
+export const CORPUS_FAILURE_SUFFIX = '.failures.json';
+/** Failed attempts after which a window is not retried until an operator retry or one extraction-config change. */
+export const CORPUS_WINDOW_FAILURE_CAP = 5;
+
+export interface CorpusFailureRecord {
+  version: 1;
+  /** The failing window's start (`<turn sha256>@<offset>`), or `turn` for a writeback turn file. */
+  key: string;
+  source_incarnation: string | null;
+  count: number;
+  first_at: number;
+  last_at: number;
+  /** Error code or class of the last failure; never its message. */
+  last_code: string;
+  /** extraction-config fingerprint (model, provider, key presence) at the last failure. */
+  fingerprint: string | null;
+  /** True once a fingerprint change re-armed a capped window; a second change does not. */
+  rearmed: boolean;
+}
+
+/** The failure record, or null when absent or unparseable. Never throws. */
+export function readCorpusFailure(full: string): CorpusFailureRecord | null {
+  try {
+    const r = JSON.parse(readFileSync(full + CORPUS_FAILURE_SUFFIX, 'utf8')) as CorpusFailureRecord;
+    if (!r || r.version !== 1 || typeof r.key !== 'string' || !Number.isSafeInteger(r.count) || r.count < 1
+      || !Number.isFinite(r.last_at) || !Number.isFinite(r.first_at) || typeof r.last_code !== 'string'
+      || !(r.source_incarnation === null || typeof r.source_incarnation === 'string')
+      || !(r.fingerprint === null || typeof r.fingerprint === 'string') || typeof r.rearmed !== 'boolean') return null;
+    return r;
+  } catch {
+    return null;
+  }
+}
+
+/** Every corpus `.txt` in `dir` with a failure record. Missing dir = empty; never throws. */
+export function listCorpusFailures(dir: string): Array<{ name: string; full: string; record: CorpusFailureRecord }> {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const present = new Set(names);
+  const out: Array<{ name: string; full: string; record: CorpusFailureRecord }> = [];
+  for (const name of names.filter((n) => n.endsWith('.txt') && present.has(n + CORPUS_FAILURE_SUFFIX)).sort()) {
+    const record = readCorpusFailure(join(dir, name));
+    if (record) out.push({ name, full: join(dir, name), record });
+  }
+  return out;
+}
+
+export interface CorpusBacklog {
+  /** `.txt` files not finished by `corpusFileCompletion` (no final sidecar, or windows left). */
+  pending: number;
+  /** mtime of the oldest pending file, or null with none pending. */
+  oldestPendingMtimeMs: number | null;
+  /** Pending files older than retention: kept only by the un-ingested rule, deleted at the ceiling. */
+  pastRetention: number;
+}
+
+/** Count corpus turn files still waiting for extraction. Missing dir = empty backlog; never throws. */
+export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()): CorpusBacklog {
+  const backlog: CorpusBacklog = { pending: 0, oldestPendingMtimeMs: null, pastRetention: 0 };
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return backlog;
+  }
+  const present = new Set(names);
+  for (const name of names) {
+    if (!name.endsWith('.txt')) continue;
+    if (present.has(name + INGESTED_SUFFIX) && !corpusFileAwaitsExtraction(join(dir, name), name)) continue;
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(join(dir, name)).mtimeMs;
+    } catch {
+      continue;
+    }
+    backlog.pending++;
+    if (backlog.oldestPendingMtimeMs === null || mtimeMs < backlog.oldestPendingMtimeMs) backlog.oldestPendingMtimeMs = mtimeMs;
+    if (mtimeMs < now - retentionMs) backlog.pastRetention++;
+  }
+  return backlog;
+}
+
+/**
+ * Retention GC for corpus turn files: a finished file (corpusFileCompletion
+ * 'done' or 'legacy') goes at `retentionMs`; one nothing has finished
+ * extracting (no sidecar, a non-terminal skip such as `chat_unavailable`
+ * #6786, windows still pending, or rewritten since) stays until
+ * `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1).
+ * Best-effort per file; never throws.
+ */
+export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.now()): void {
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.txt')) continue;
+      const p = join(dir, name);
+      try {
+        const age = now - statSync(p).mtimeMs;
+        if (age <= retentionMs) continue;
+        const ageLimit = corpusFileFinished(corpusFileCompletion(p, name)) ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
+        if (age > ageLimit) rmSync(p, { force: true });
+      } catch {
+        /* per-file best effort */
+      }
+    }
+  } catch {
+    /* GC never breaks the caller */
+  }
+}
+
+/**
  * GC companion for the corpus dir (extends the hook's `.txt`-only GC): remove
- * ledgers past the retention window, and remove ORPHANED sidecars whose base
- * `.txt` is gone (previously they lived forever). Best-effort per file; never
- * throws.
+ * ledgers past the retention window, ORPHANED sidecars whose base `.txt` is
+ * gone (previously they lived forever), and a session's seat sidecar once no
+ * `.txt` of that session remains (after a grace window, so a sidecar written
+ * just ahead of its corpus file survives). Best-effort per file; never throws.
+ * #6611: a session is live while a `.txt` of it exists in ANY of
+ * `liveSessionDirs` (the hook passes the spool and the legacy top level: the
+ * source record is always frozen into the spool, a legacy session's `.txt`
+ * lives in the top level).
  */
 export function gcCorpusArtifacts(
   dir: string,
   maxAgeMs: number,
   sidecarSuffixes: string[],
+  liveSessionDirs: string[] = [dir],
 ): void {
   try {
     const cutoff = Date.now() - maxAgeMs;
-    for (const name of readdirSync(dir)) {
+    const names = readdirSync(dir);
+    const liveSessions = new Set(liveSessionDirs.flatMap((d) => {
+      try { return d === dir ? names : readdirSync(d); } catch { return []; }
+    }).filter((n) => n.endsWith('.txt')).map(corpusFileSessionId));
+    for (const name of names) {
       const p = join(dir, name);
       try {
+        const perSession = [SEAT_SIDECAR_SUFFIX, SESSION_SOURCE_SUFFIX].find((suffix) => name.endsWith(suffix));
+        if (perSession) {
+          if (!liveSessions.has(name.slice(0, -perSession.length)) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) {
+            rmSync(p, { force: true });
+          }
+          continue;
+        }
+        if (name.endsWith(SESSION_SOURCE_LOCK_SUFFIX)) {
+          if (statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) rmSync(p, { force: true });
+          continue;
+        }
+        const offAt = name.endsWith('.json') ? name.lastIndexOf(CAPTURE_OFF_INFIX) : -1;
+        if (offAt > 0) {
+          // Written BEFORE its corpus file lands: only an orphan past the grace period is reaped (every brain's record alike).
+          if (!existsSync(join(dir, name.slice(0, offAt))) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) rmSync(p, { force: true });
+          continue;
+        }
         if (name.endsWith('.ledger.json')) {
           if (statSync(p).mtimeMs < cutoff) rmSync(p, { force: true });
           continue;

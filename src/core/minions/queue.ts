@@ -8,15 +8,22 @@
  *   await queue.prune({ olderThan: new Date(Date.now() - 30 * 86400000) });
  */
 
-import { APPLICATION_AUTHORITY, assertSameAuthority, assertNoUnreviewedJobs, authorizeJobExecution, currentSubmissionAuthority, parseSubmissionAuthority, type SubmissionAuthority } from './submission-authority.ts';
+import { APPLICATION_AUTHORITY, LEGACY_AUTHORITY_COLUMN, assertNoUnreviewedJobs, authorizeJobExecution, currentSubmissionAuthority, parseSubmissionAuthority, type SubmissionAuthority } from './submission-authority.ts';
 import type { BrainEngine } from '../engine.ts';
 import type {
   MinionJob, MinionJobInput, MinionJobStatus, InboxMessage, TokenUpdate,
   MinionQueueOpts, ChildDoneMessage, ChildOutcome, Attachment, AttachmentInput,
 } from './types.ts';
 import { rowToMinionJob, rowToInboxMessage, rowToAttachment } from './types.ts';
+import { WATCHDOG_SUSPECT_MARK, releaseWatchdogClaim, requeueCoRunnerStalls, unmarkedJobSql } from './watchdog-attribution.ts';
+export { WATCHDOG_SUSPECT_MARK } from './watchdog-attribution.ts';
+import { coalesceOnIdempotencyKey, decideCoalesce, insertOrCoalesce } from './idempotency-coalesce.ts';
+import { withSubmitterLabel } from './job-insight.ts';
+import { adoptSpendAuthorization, legacyDefaultClaimSetSql, legacyDefaultClaimParams, type SpendAuthorization } from './spend-authorization.ts';
 import { validateAttachment } from './attachments.ts';
-import { isProtectedJobName } from './protected-names.ts';
+import type { QueueFamilyStats } from './queue-families.ts';
+import { isProtectedJobName, LEASE_BEACON_QUEUE } from './protected-names.ts';
+import { jsonbSafeJson } from '../text-safe.ts';
 import { assertEmbedBackfillQueueAdmission } from './embed-backfill-admission.ts';
 import { lockDelegatedSubmission, checkDelegatedCapacity, prepareDelegatedReplay, admitDelegatedRetry } from './delegated-admission.ts';
 import {
@@ -29,7 +36,7 @@ import {
 } from './admission.ts';
 import {
   defaultTimeoutMsFor, HANDLER_DEFAULT_TIMEOUT_MS,
-  defaultLockDurationMsFor, HANDLER_DEFAULT_LOCK_DURATION_MS, clampLockDurationMs,
+  defaultLockDurationMsFor, HANDLER_DEFAULT_LOCK_DURATION_MS, clampLockDurationMs, WALL_CLOCK_THRESHOLD_MS_SQL,
 } from './handler-timeouts.ts';
 import {
   withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay,
@@ -48,6 +55,8 @@ export interface TrustedSubmitOpts {
   allowPgliteInlineWorker?: boolean;
   /** Authenticated submit_agent identity, never read from agent job parameters. */
   delegatedClientId?: string;
+  /** Consent-gated CLI producers only: the user's spend authorization (spend-authorization.ts). */
+  spendAuthorization?: SpendAuthorization;
 }
 
 const MIGRATION_VERSION = 7;
@@ -162,18 +171,20 @@ type CoalesceAuditEvent = {
  *  audit append is filesystem I/O, and doing it while holding the advisory
  *  lock + a pool connection would let a hung audit volume serialize every
  *  submission for the scope (adversarial-review finding). */
-function coalesceReturn(
+async function coalesceReturn(
+  tx: BrainEngine,
   row: Record<string, unknown>,
   audit: Omit<CoalesceAuditEvent, 'returned_job_id'>,
   sink: (ev: CoalesceAuditEvent) => void,
   authority: SubmissionAuthority,
-): MinionJob {
-  assertSameAuthority(row.submission_authority, authority);
+): Promise<MinionJob> {
+  if (await decideCoalesce(tx, row, authority) !== 'coalesce') throw new Error(`job ${String(row.id)} is ${String(row.status)} and cannot be a coalesce target`);
   const coalesced = rowToMinionJob(row);
   coalesced.coalesced = true;
   sink({ ...audit, returned_job_id: coalesced.id });
   return coalesced;
 }
+
 
 export class MinionQueue {
   readonly maxSpawnDepth: number;
@@ -217,6 +228,8 @@ export class MinionQueue {
     // canonical form. Without the trim-before-check, `queue.add(' shell ', ...)`
     // would evade the guard and insert a job literally named 'shell'.
     if (currentSubmissionAuthority() && currentSubmissionAuthority()!.kind !== 'application') throw new Error('Remote jobs cannot submit descendant jobs');
+    // #7240: Postgres refuses a lone UTF-16 surrogate or U+0000 anywhere in a JSONB value, which failed the whole insert.
+    if (data !== undefined) data = jsonbSafeJson(data);
     const authority = parseSubmissionAuthority(trusted?.submissionAuthority ?? APPLICATION_AUTHORITY);
     if (!authority) throw new Error('Unsupported submission authority');
     const delegatedClientId = authority.kind === 'remote_agent' ? authority.principal.id : trusted?.delegatedClientId;
@@ -342,26 +355,11 @@ export class MinionQueue {
       //
       //    Dead/cancelled jobs represent permanently-failed work whose
       //    idempotency slot must be freed so a fresh attempt can be inserted.
-      //    We NULL the key (preserving the row for audit) and fall through
-      //    to the INSERT path below.
+      //    We NULL the key (preserving the row, with the released key in its
+      //    data for the dream breaker) and fall through to the INSERT below.
       if (opts?.idempotency_key) {
-        const existing = await tx.executeRaw<Record<string, unknown>>(
-          `SELECT * FROM minion_jobs WHERE idempotency_key = $1`,
-          [opts.idempotency_key]
-        );
-        if (existing.length > 0) {
-          const existingJob = rowToMinionJob(existing[0]);
-          assertSameAuthority(existingJob.submission_authority, authority);
-          if (existingJob.status === 'dead' || existingJob.status === 'cancelled') {
-            await tx.executeRaw(
-              `UPDATE minion_jobs SET idempotency_key = NULL WHERE id = $1`,
-              [existingJob.id]
-            );
-          } else {
-            existingJob.coalesced = true;
-            return existingJob;
-          }
-        }
+        const existing = await coalesceOnIdempotencyKey(tx, opts.idempotency_key, authority);
+        if (existing) return existing;
       }
 
       // 1a. Param-coalescing (admission): an identical parentless submit —
@@ -390,7 +388,7 @@ export class MinionQueue {
         const matchParams: unknown[] = [jobName, admissionQueue, paramHash];
         if (ttlHours != null) matchParams.push(ttlHours / 2);
         const match = await tx.executeRaw<Record<string, unknown>>(
-          `SELECT * FROM minion_jobs
+          `SELECT *, ${LEGACY_AUTHORITY_COLUMN} FROM minion_jobs
             WHERE name = $1 AND queue = $2 AND status = 'waiting'
               AND parent_job_id IS NULL
               AND data->>'__param_hash' = $3
@@ -400,7 +398,7 @@ export class MinionQueue {
           matchParams
         );
         if (match.length > 0) {
-          return coalesceReturn(match[0], {
+          return coalesceReturn(tx, match[0], {
             queue: admissionQueue,
             name: jobName,
             param_hash: paramHash,
@@ -501,7 +499,7 @@ export class MinionQueue {
           const pendingCount = parseInt(pendingCountRows[0]?.count ?? '0', 10);
           if (pendingCount >= maxPending) {
             const existingPending = await tx.executeRaw<Record<string, unknown>>(
-              `SELECT * FROM minion_jobs
+              `SELECT *, ${LEGACY_AUTHORITY_COLUMN} FROM minion_jobs
                WHERE name = $1 AND queue = $2 AND ${pendingCond}
                  AND ${scopeExact}
                ORDER BY CASE WHEN status = 'waiting' THEN 0 ELSE 1 END, created_at DESC, id DESC
@@ -509,7 +507,7 @@ export class MinionQueue {
               [jobName, backpressureQueue, bpSourceId]
             );
             if (existingPending.length > 0) {
-              return coalesceReturn(existingPending[0], {
+              return coalesceReturn(tx, existingPending[0], {
                 queue: backpressureQueue,
                 name: jobName,
                 pending_count: pendingCount,
@@ -531,7 +529,7 @@ export class MinionQueue {
           const waitingCount = parseInt(waitingCountRows[0]?.count ?? '0', 10);
           if (waitingCount >= maxWaiting) {
             const existingWaiting = await tx.executeRaw<Record<string, unknown>>(
-              `SELECT * FROM minion_jobs
+              `SELECT *, ${LEGACY_AUTHORITY_COLUMN} FROM minion_jobs
                WHERE name = $1 AND queue = $2 AND status = 'waiting'
                  AND ${scopeWildcard}
                ORDER BY created_at DESC, id DESC
@@ -539,7 +537,7 @@ export class MinionQueue {
               [jobName, backpressureQueue, bpSourceId]
             );
             if (existingWaiting.length > 0) {
-              return coalesceReturn(existingWaiting[0], {
+              return coalesceReturn(tx, existingWaiting[0], {
                 queue: backpressureQueue,
                 name: jobName,
                 waiting_count: waitingCount,
@@ -606,11 +604,11 @@ export class MinionQueue {
       const baseCols = `name, queue, status, priority, data, max_attempts, backoff_type,
             backoff_delay, backoff_jitter, delay_until, parent_job_id, on_child_fail,
             depth, max_children, timeout_ms, lock_duration_ms, remove_on_complete, remove_on_fail, idempotency_key,
-            quiet_hours, stagger_key, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until, submission_authority`;
+            quiet_hours, stagger_key, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until, submission_authority, spend_authorization`;
       const baseVals = `$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21`;
-      const baseValsWithOwner = `${baseVals}, $22, $23, $24, $25::jsonb`;
+      const baseValsWithOwner = `${baseVals}, $22, $23, $24, $25::jsonb, $26::text::jsonb`;
       const cols = hasMaxStalled ? `${baseCols}, max_stalled` : baseCols;
-      const vals = hasMaxStalled ? `${baseValsWithOwner}, $26` : baseValsWithOwner;
+      const vals = hasMaxStalled ? `${baseValsWithOwner}, $27` : baseValsWithOwner;
 
       const insertSql = opts?.idempotency_key
         ? `INSERT INTO minion_jobs (${cols})
@@ -626,7 +624,7 @@ export class MinionQueue {
         opts?.queue ?? 'default',
         childStatus,
         opts?.priority ?? 0,
-        data ?? {},
+        withSubmitterLabel(data, authority.kind === 'application'),
         opts?.max_attempts ?? 3,
         opts?.backoff_type ?? 'exponential',
         opts?.backoff_delay ?? 1000,
@@ -657,28 +655,16 @@ export class MinionQueue {
         opts?.private_queue_owner_token ?? null,
         privateQueueLeaseUntil,
         authority,
+        trusted?.spendAuthorization ? JSON.stringify(trusted.spendAuthorization) : null,
       ];
       if (hasMaxStalled) params.push(clampedMaxStalled);
 
-      const inserted = await tx.executeRaw<Record<string, unknown>>(insertSql, params);
+      // ON CONFLICT DO NOTHING returns 0 rows: a concurrent submit won the
+      // race, and its row goes through the same coalesce rule (third path).
+      const outcome = await insertOrCoalesce(tx, insertSql, params, opts?.idempotency_key, authority);
+      if ('coalesced' in outcome) return outcome.coalesced;
 
-      // ON CONFLICT DO NOTHING returns 0 rows — fall back to SELECT to fetch the
-      // existing row that won the race.
-      if (inserted.length === 0 && opts?.idempotency_key) {
-        const existing = await tx.executeRaw<Record<string, unknown>>(
-          `SELECT * FROM minion_jobs WHERE idempotency_key = $1`,
-          [opts.idempotency_key]
-        );
-        if (existing.length === 0) {
-          throw new Error(`idempotency_key ${opts.idempotency_key} insert returned no row and no existing row found`);
-        }
-        const raced = rowToMinionJob(existing[0]);
-        assertSameAuthority(raced.submission_authority, authority);
-        raced.coalesced = true; // third coalesce path: lost the insert race
-        return raced;
-      }
-
-      const child = rowToMinionJob(inserted[0]);
+      const child = rowToMinionJob(outcome.inserted);
 
       // 4. Flip parent to waiting-children if this is a fresh child insert.
       //    Only transition from non-terminal, non-already-waiting-children states.
@@ -703,7 +689,7 @@ export class MinionQueue {
       } catch { /* audit failures never block submission */ }
     }
 
-    return result;
+    return trusted?.spendAuthorization && result.coalesced ? adoptSpendAuthorization(this.engine, result, trusted.spendAuthorization) : result;
   }
 
   /** Get a job by ID. Returns null if not found. */
@@ -1266,11 +1252,20 @@ export class MinionQueue {
       return parseInt(rows[0]?.count ?? '0', 10);
     }
 
+    // A completed dream synthesis child is the record that its transcript was
+    // synthesized. Archive the key before the row goes, or the next cycle
+    // pays to synthesize the transcript again.
     const rows = await this.engine.executeRaw<{ count: string }>(
       `WITH pruned AS (
          DELETE FROM minion_jobs
          WHERE status = ANY($1) AND updated_at < $2
-         RETURNING id
+         RETURNING name, status, data, idempotency_key, finished_at
+       ), archived AS (
+         INSERT INTO dream_synthesis_completions (source_id, idempotency_key, completed_at)
+         SELECT COALESCE(NULLIF(data->>'source_id', ''), 'default'), idempotency_key, COALESCE(finished_at, now())
+           FROM pruned
+          WHERE name = 'subagent' AND status = 'completed' AND idempotency_key LIKE 'dream:synth%'
+         ON CONFLICT DO NOTHING
        )
        SELECT count(*)::text as count FROM pruned`,
       [statuses, olderThan.toISOString()]
@@ -1295,6 +1290,7 @@ export class MinionQueue {
       drained_completed: number; drained_failed: number; drained_dead: number; drained_cancelled: number;
       waiting_now: number; oldest_waiting_minutes: number | null }>;
     queue_health: { waiting: number; active: number; stalled: number };
+    by_queue: QueueFamilyStats[];
     /**
      * issue #1801 — QUEUE-SCOPED wedge signature for the `jobs stats` WEDGED
      * line. by_status/by_type/queue_health above stay GLOBAL (dashboard
@@ -1422,6 +1418,7 @@ export class MinionQueue {
         active: by_status['active'] ?? 0,
         stalled,
       },
+      by_queue: await (await import('./queue-families.ts')).queueFamilyStats(this.engine, since),
       wedge: {
         queue: wedgeQueue,
         active_healthy: parseInt(wr.active_healthy ?? '0', 10),
@@ -1452,7 +1449,9 @@ export class MinionQueue {
    * The map binds as a RAW object (never JSON.stringify into ::jsonb — the
    * postgres.js double-encode trap; PGLite hides it, real PG does not).
    */
-  async claim(lockToken: string, lockDurationMs: number, queue: string, registeredNames: string[]): Promise<MinionJob | null> {
+  /** `excludeWatchdogSuspects`: a worker with jobs in flight never claims a job marked by a shared watchdog drain (watchdog-attribution.ts).
+   *  `excludeNames`: skip these job names (the worker's long-job lane reservation, lanes.ts). */
+  async claim(lockToken: string, lockDurationMs: number, queue: string, registeredNames: string[], opts: { excludeWatchdogSuspects?: boolean; excludeNames?: string[] } = {}): Promise<MinionJob | null> {
     if (registeredNames.length === 0) return null;
     await assertNoUnreviewedJobs(this.engine);
 
@@ -1471,10 +1470,12 @@ export class MinionQueue {
     // submit surfaces clamp already, but a bypass-written row (direct SQL
     // repair, foreign tooling) must not grant a ~24-day lease to a worker
     // that crashes before its first renewal (or a 1ms one that thrashes).
+    const excludeNames = opts.excludeNames?.length ? opts.excludeNames : null;
     const rows = await this.engine.executeRawDirect<Record<string, unknown>>(
       `UPDATE minion_jobs SET
         status = 'active',
         claim_generation = claim_generation + 1,
+        ${legacyDefaultClaimSetSql('$7', '$8')},
         lock_token = $1,
         lock_until = now() + ((CASE WHEN COALESCE(lock_duration_ms, ($6::jsonb ->> name)::int) IS NULL THEN $2
                                     ELSE LEAST(GREATEST(COALESCE(lock_duration_ms, ($6::jsonb ->> name)::int), 5000), 3600000) END)::double precision * interval '1 millisecond'),
@@ -1489,16 +1490,20 @@ export class MinionQueue {
         updated_at = now()
        WHERE id = (
          SELECT id FROM minion_jobs
-         WHERE queue = $3 AND status = 'waiting' AND submission_authority IS NOT NULL AND name = ANY($4)
+         WHERE queue = $3 AND status = 'waiting' AND submission_authority IS NOT NULL AND name = ANY($4)${opts.excludeWatchdogSuspects ? ` AND ${unmarkedJobSql('$9')}` : ''}${excludeNames ? ` AND NOT (name = ANY($${opts.excludeWatchdogSuspects ? 10 : 9}))` : ''}
          ORDER BY priority ASC, created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT 1
        )
        RETURNING *`,
-      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS]
+      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS, ...legacyDefaultClaimParams(),
+        ...(opts.excludeWatchdogSuspects ? [WATCHDOG_SUSPECT_MARK] : []), ...(excludeNames ? [excludeNames] : [])]
     );
     return rows.length > 0 ? rowToMinionJob(rows[0]) : null;
   }
+
+  /** A co-runner of a watchdog drain back to waiting, marked, no attempt burned (token-fenced). */
+  releaseWatchdogClaim(id: number, lockToken: string, errorText: string): Promise<boolean> { return releaseWatchdogClaim(this.engine, id, lockToken, errorText); }
 
   /**
    * Dead-letter active jobs whose timeout_at has passed.
@@ -1527,7 +1532,7 @@ export class MinionQueue {
       // SKIP LOCKED subselect — see killJobs() for the shared tail.
       const candidates = await tx.executeRaw<{ id: number; parent_job_id: number | null }>(
         `SELECT id, parent_job_id FROM minion_jobs
-          WHERE status = 'active'
+          WHERE status = 'active' AND queue <> '${LEASE_BEACON_QUEUE}'
             AND timeout_at IS NOT NULL
             AND timeout_at < now()
             AND lock_until > now()`
@@ -1659,13 +1664,9 @@ export class MinionQueue {
       // handleTimeouts; shared tail in killJobs().
       const candidates = await tx.executeRaw<{ id: number; parent_job_id: number | null }>(
         `SELECT id, parent_job_id FROM minion_jobs
-          WHERE status = 'active'
+          WHERE status = 'active' AND queue <> '${LEASE_BEACON_QUEUE}'
             AND started_at IS NOT NULL
-            AND EXTRACT(EPOCH FROM (now() - started_at)) * 1000 >
-              CASE
-                WHEN timeout_ms IS NOT NULL THEN timeout_ms * 2
-                ELSE COALESCE(lock_duration_ms, $1)::double precision * 2 * GREATEST(max_stalled, 1)
-              END`,
+            AND EXTRACT(EPOCH FROM (now() - started_at)) * 1000 > ${WALL_CLOCK_THRESHOLD_MS_SQL}`,
         [lockDurationMs]
       );
       if (candidates.length === 0) return [];
@@ -1810,7 +1811,7 @@ export class MinionQueue {
 
   /**
    * Fail a job (token-fenced). All side effects atomic in one transaction:
-   *   1. UPDATE child to 'delayed' (retry) | 'failed' | 'dead'
+   *   1. UPDATE child to 'delayed' (retry) | 'failed' | 'dead'; `result` (a handler result that reported a failure, #7188) is kept
    *   2. If terminal AND parent_job_id, run on_child_fail policy:
    *      - 'fail_parent' → mark parent 'failed' (via failParent SQL)
    *      - 'remove_dep'  → null out parent_job_id (via removeChildDependency SQL)
@@ -1827,7 +1828,8 @@ export class MinionQueue {
     lockToken: string,
     errorText: string,
     newStatus: 'delayed' | 'failed' | 'dead',
-    backoffMs?: number
+    backoffMs?: number,
+    result?: Record<string, unknown>,
   ): Promise<MinionJob | null> {
     return this.engine.transaction(async (tx) => {
       // Lock the parent row first so concurrent sibling completions/failures
@@ -1851,10 +1853,11 @@ export class MinionQueue {
           delay_until = CASE WHEN $1 = 'delayed' THEN now() + ($4::double precision * interval '1 millisecond') ELSE NULL END,
           finished_at = CASE WHEN $1 IN ('failed', 'dead') THEN now() ELSE NULL END,
           started_at = CASE WHEN $1 = 'delayed' THEN NULL ELSE started_at END,
+          result = COALESCE($7::jsonb, result),
           lock_token = NULL, lock_until = NULL, updated_at = now()
          WHERE id = $5 AND status = 'active' AND lock_token = $6
          RETURNING *`,
-        [newStatus, errorText, errorText, backoffMs ?? 0, id, lockToken]
+        [newStatus, errorText, errorText, backoffMs ?? 0, id, lockToken, result ?? null]
       );
       if (rows.length === 0) return null;
 
@@ -1989,6 +1992,57 @@ export class MinionQueue {
     return rowToMinionJob(rows[0]);
   }
 
+  /**
+   * Return a claimed job to `delayed` without counting an attempt or growing
+   * its stacktrace (a deferral is a state, not a failure; a job that waits for
+   * a key for weeks must not accumulate one stack entry per retry).
+   */
+  async deferJob(id: number, lockToken: string, note: string, delayMs: number): Promise<MinionJob | null> {
+    const rows = await this.engine.executeRaw<Record<string, unknown>>(
+      `UPDATE minion_jobs SET
+        status = 'delayed', error_text = $1,
+        delay_until = now() + ($2::double precision * interval '1 millisecond'),
+        started_at = NULL, timeout_at = NULL,
+        lock_token = NULL, lock_until = NULL, updated_at = now()
+       WHERE id = $3 AND status = 'active' AND lock_token = $4
+       RETURNING *`,
+      [note, Math.max(0, delayMs), id, lockToken],
+    );
+    return rows.length === 0 ? null : rowToMinionJob(rows[0]);
+  }
+
+  async releaseConfigurationJob(
+    id: number,
+    lockToken: string,
+    signal: AbortSignal,
+  ): Promise<'released' | 'no_op' | 'unconfirmed'> {
+    if (signal.aborted) return 'unconfirmed';
+    let onAbort: () => void = () => {};
+    try {
+      const cancelled = new Promise<'unconfirmed'>(resolve => {
+        onAbort = () => resolve('unconfirmed');
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      const release = this.engine.executeRaw<{ id: number }>(
+        `UPDATE minion_jobs SET
+          status = 'delayed',
+          error_text = 'worker_configuration_blocked',
+          delay_until = now() + interval '30 seconds',
+          started_at = NULL, timeout_at = NULL,
+          lock_token = NULL, lock_until = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'active' AND lock_token = $2
+         RETURNING id`,
+        [id, lockToken],
+        { signal },
+      ).then(rows => signal.aborted ? 'unconfirmed' as const : rows.length > 0 ? 'released' as const : 'no_op' as const);
+      return await Promise.race([release, cancelled]);
+    } catch {
+      return 'unconfirmed';
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
   /** Update job progress (token-fenced). */
   async updateProgress(id: number, lockToken: string, progress: unknown): Promise<boolean> {
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
@@ -2096,19 +2150,24 @@ export class MinionQueue {
     // override; the worker sweep resolves from env/default.
     const graceMs = graceMsOverride ?? resolveStallReclaimGraceMs();
     return this.engine.transaction(async (tx) => {
+      // GBRA-133: a drain-lease holder record whose lease lock is gone or expired outlived a killed holder; nothing else removes it.
+      await tx.executeRaw(`DELETE FROM minion_jobs b WHERE b.queue = '${LEASE_BEACON_QUEUE}' AND b.status = 'active' AND b.lock_until < now()
+        AND NOT EXISTS (SELECT 1 FROM gbrain_cycle_locks l WHERE l.acquisition_token::text = b.lock_token AND l.ttl_expires_at > now())`);
       const candidates = await tx.executeRaw<{ id: number; parent_job_id: number | null; stalled_counter: number; max_stalled: number }>(
         `SELECT id, parent_job_id, stalled_counter, max_stalled
            FROM minion_jobs
-          WHERE status = 'active'
+          WHERE status = 'active' AND queue <> '${LEASE_BEACON_QUEUE}'
             AND lock_until < now() - ($1::double precision * interval '1 millisecond')`,
         [graceMs]
       );
       if (candidates.length === 0) return { requeued: [], dead: [] };
-      const ids = candidates.map(c => c.id);
+      // GBRA-130 A-30: the claims of a worker that held several (a kernel OOM kill) requeue marked, no stall counted.
+      const coRunners = await requeueCoRunnerStalls(tx, candidates, graceMs);
+      const ids = coRunners.rest.map(c => c.id);
       // Only the dead-letter branch touches parents; lock just those, sorted.
       await this.lockParentsOrdered(
         tx,
-        candidates.filter(c => Number(c.stalled_counter) + 1 >= Number(c.max_stalled)),
+        coRunners.rest.filter(c => Number(c.stalled_counter) + 1 >= Number(c.max_stalled)),
       );
 
       const requeuedRows = await tx.executeRaw<Record<string, unknown>>(
@@ -2148,7 +2207,7 @@ export class MinionQueue {
       // other terminal kill. Outcome 'dead' (not 'timeout') so consumers can
       // distinguish "died via max-stall" from "timed out during run".
       await this.killJobs(tx, deadRows, 'dead', 'max stalled count exceeded');
-      return { requeued: requeuedRows.map(rowToMinionJob), dead: deadRows.map(rowToMinionJob) };
+      return { requeued: [...coRunners.requeued, ...requeuedRows].map(rowToMinionJob), dead: deadRows.map(rowToMinionJob) };
     }).then(async (result) => {
       // W0 ship-review (data-migration): the per-kill unblock above is
       // forward-only — parents stranded in 'waiting-children' by PRE-upgrade
@@ -2460,13 +2519,19 @@ export class MinionQueue {
  * zero live-lock active rows, waiting > 0, and the last completion is older
  * than the threshold (or absent). Threshold matches the doctor wedged_queue
  * check: GBRAIN_WEDGED_QUEUE_WARN_MINUTES (server-side env), default 15.
+ *
+ * Queue honesty (agent-first operator wave E5): when the caller knows no
+ * worker is running for the queue (`workerAlive: false` — always on PGLite
+ * unless a `gbrain jobs work` drain is live), waiting work is `no_worker`, not
+ * wedged: nothing is stuck, nothing is running it. Omitted liveness keeps the
+ * pre-E5 derivation (doctor's wedged_queue check).
  */
 export function deriveWedgeSignal(wedge: {
   queue?: string;
   active_healthy: number;
   waiting: number;
   minutes_since_completion: number | null;
-}): { wedged: boolean; wedge_threshold_minutes: number; private_queue: boolean } {
+}, liveness: { workerAlive?: boolean } = {}): { wedged: boolean; no_worker: boolean; wedge_threshold_minutes: number; private_queue: boolean } {
   const raw = parseInt(process.env.GBRAIN_WEDGED_QUEUE_WARN_MINUTES ?? '', 10);
   const wedge_threshold_minutes = Number.isFinite(raw) && raw > 0 ? raw : 15;
   // A dream-inline private queue is parent-owned: no shared worker will ever
@@ -2475,7 +2540,8 @@ export function deriveWedgeSignal(wedge: {
   // (jobs stats, get_job_stats op, doctor) points at reconciliation.
   const private_queue = wedge.queue !== undefined && isDreamInlinePrivateQueue(wedge.queue);
   const mins = wedge.minutes_since_completion;
-  const wedged = !private_queue && wedge.active_healthy === 0 && wedge.waiting > 0
+  const no_worker = !private_queue && liveness.workerAlive === false && wedge.waiting > 0;
+  const wedged = !private_queue && !no_worker && wedge.active_healthy === 0 && wedge.waiting > 0
     && (mins === null || mins > wedge_threshold_minutes);
-  return { wedged, wedge_threshold_minutes, private_queue };
+  return { wedged, no_worker, wedge_threshold_minutes, private_queue };
 }

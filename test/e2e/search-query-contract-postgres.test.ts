@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { hasDatabase, setupLegacyEmbeddingDB, teardownDB } from './helpers.ts';
-import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
-import { seedSearchQueryContract, verifyKeywordTieOrder, verifyMixedCjkCase, verifySearchDateBounds } from '../helpers/search-query-contract.ts';
+import type { BrainEngine } from '../../src/core/engine.ts';
+import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { seedSearchQueryContract, vector, verifyKeywordTieOrder, verifyMixedCjkCase, verifySearchDateBounds } from '../helpers/search-query-contract.ts';
 import { withEnv } from '../helpers/with-env.ts';
 
 (hasDatabase() ? describe : describe.skip)('search query contract on Postgres', () => {
@@ -24,6 +25,20 @@ import { withEnv } from '../helpers/with-env.ts';
     }
     expect(await engine.searchKeyword('ordertoken impossibleterm', { sourceId: 'query-dates', orFallback: true })).toEqual([]);
     expect(await engine.executeRaw(`SHOW enable_seqscan`)).toEqual(before);
+  });
+
+  test("search reads inside a caller's transaction restore every setting they change (#6721)", async () => {
+    // Each read sets its settings in one statement; nested, it reads the caller's values first and restores them.
+    // A nested keyword, title or count read used to leave its own statement_timeout on the caller's transaction.
+    const after = await engine.transaction(async tx => {
+      await tx.executeRaw(`SELECT set_config('jit', 'on', true), set_config('statement_timeout', '45s', true), set_config('enable_seqscan', 'on', true)`);
+      expect((await tx.searchKeyword('ordertoken impossibleterm', { sourceId: 'query-order', orFallback: true })).length).toBeGreaterThan(0);
+      await tx.searchTitles('ordertoken impossibleterm', { sourceId: 'query-order' });
+      await tx.countKeywordPages('ordertoken', { sourceId: 'query-order' });
+      await tx.searchVector(vector, { sourceId: 'query-order', limit: 3 });
+      return tx.executeRaw(`SELECT current_setting('jit') AS jit, current_setting('statement_timeout') AS timeout, current_setting('enable_seqscan') AS seqscan`);
+    });
+    expect(after).toEqual([{ jit: 'on', timeout: '45s', seqscan: 'on' }]);
   });
 
   test('restricted runtime roles retain RLS and local settings through relaxed retries', async () => {
@@ -60,5 +75,57 @@ import { withEnv } from '../helpers/with-env.ts';
       await engine.executeRaw('DROP OWNED BY query_contract_reader');
       await engine.executeRaw('DROP ROLE query_contract_reader');
     }
+  });
+
+  /** Runs `check` as a reader that sees pages only from a statement where `predicate` holds. */
+  async function asSettingProbeReader(predicate: string, check: (reader: PostgresEngine) => Promise<void>) {
+    await engine.executeRaw('CREATE ROLE query_contract_probe NOLOGIN');
+    const tables = ['pages', 'content_chunks', 'page_body_manifest', 'sources', 'timeline_entries', 'config'];
+    const original = await engine.executeRaw<{ relname: string; relrowsecurity: boolean }>(`SELECT relname, relrowsecurity FROM pg_class WHERE relname = ANY($1::text[])`, [tables]);
+    const reader = new PostgresEngine();
+    try {
+      await engine.executeRaw('GRANT USAGE ON SCHEMA public TO query_contract_probe');
+      await engine.executeRaw(`GRANT SELECT ON ${tables.join(', ')} TO query_contract_probe`);
+      for (const table of tables) {
+        await engine.executeRaw(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+        await engine.executeRaw(`CREATE POLICY query_contract_probe_allow ON ${table} FOR SELECT TO query_contract_probe USING (true)`);
+      }
+      await engine.executeRaw(`CREATE POLICY query_contract_probe_setting ON pages AS RESTRICTIVE FOR SELECT TO query_contract_probe USING (${predicate})`);
+      // One pooled connection, so the session role and settings reach every search transaction.
+      await reader.connect({ database_url: process.env.DATABASE_URL!, poolSize: 1 });
+      await reader.executeRaw('SET ROLE query_contract_probe');
+      await check(reader);
+    } finally {
+      await reader.disconnect();
+      await engine.executeRaw('DROP POLICY IF EXISTS query_contract_probe_setting ON pages');
+      for (const table of tables) {
+        await engine.executeRaw(`DROP POLICY IF EXISTS query_contract_probe_allow ON ${table}`);
+        if (!original.find(row => row.relname === table)?.relrowsecurity) await engine.executeRaw(`ALTER TABLE ${table} DISABLE ROW LEVEL SECURITY`);
+      }
+      await engine.executeRaw('DROP OWNED BY query_contract_probe');
+      await engine.executeRaw('DROP ROLE query_contract_probe');
+    }
+  }
+
+  test('every search arm runs with JIT off and restores the caller setting (#6039)', async () => {
+    // An arm that leaves JIT on sees no pages.
+    await asSettingProbeReader(`current_setting('jit') = 'off'`, async reader => {
+      await reader.executeRaw('SET jit = on');
+      const opts = { limit: 10, sourceId: 'query-dates' };
+      const arms = (e: BrainEngine) => ({
+        keyword: () => e.searchKeyword('precisiontoken', opts),
+        keywordChunks: () => e.searchKeywordChunks('precisiontoken', opts),
+        cjk: () => e.searchKeyword('東京', opts),
+        titles: () => e.searchTitles('precisiontoken', opts),
+        vector: () => e.searchVector(vector, opts),
+      });
+      for (const [arm, run] of Object.entries(arms(reader))) expect({ arm, hits: (await run()).length }).toEqual({ arm, hits: 7 });
+      await reader.transaction(async tx => {
+        for (const [arm, run] of Object.entries(arms(tx))) {
+          expect({ arm, hits: (await run()).length }).toEqual({ arm, hits: 7 });
+          expect(await tx.executeRaw(`SELECT $1::text AS arm, current_setting('jit') AS jit`, [arm])).toEqual([{ arm, jit: 'on' }]);
+        }
+      });
+    });
   });
 });

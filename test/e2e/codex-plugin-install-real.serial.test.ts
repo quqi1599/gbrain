@@ -10,7 +10,7 @@
  *      config.toml, snapshot carries the curated skills + non-root mcp.json +
  *      an EXECUTABLE launcher, dual-marketplace resolution yields exactly one
  *      gbrain plugin, add-twice idempotency, the deterministic tools/list
- *      surface oracle (== the starter surface, via the snapshot launcher),
+ *      surface oracle (== the registration surface, via the snapshot launcher),
  *      the cold-home fast-fail ("No brain configured. Run: gbrain init"),
  *      the --source-guard write gate (blocked without GBRAIN_SOURCE on a
  *      multi-source brain, allowed with it), the `codex mcp add` coexistence
@@ -30,6 +30,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { REGISTRATION_SURFACE } from '../../src/core/mcp-registration.ts';
 
 import {
   resolveCodexBinary,
@@ -42,7 +43,7 @@ import {
   ensureCompiledGbrain,
 } from '../helpers/agent-harness.ts';
 import { operations } from '../../src/core/operations.ts';
-import { filterOpsForSurface } from '../../src/mcp/surface.ts';
+import { isCallable, publishGatesFromDisabled } from '../../src/core/ops/callable.ts';
 import { codexPluginProvidesName } from '../../src/core/bootstrap/harness.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
@@ -187,7 +188,7 @@ describe.skipIf(!PLUGIN_CAPABLE)('codex plugin door — INSTALL (no auth needed)
       expect(statSync(launcher).mode & 0o111, 'launcher lost its exec bit in the snapshot copy').toBeGreaterThan(0);
       const mcpJson = JSON.parse(readFileSync(join(snap!, '.codex-plugin', 'mcp.json'), 'utf8'));
       const serverArgs: string[] = mcpJson.mcpServers.gbrain.args;
-      expect(serverArgs).toEqual(['serve', '--surface', 'starter', '--source-guard']);
+      expect(serverArgs).toEqual(['serve', '--surface', REGISTRATION_SURFACE, '--source-guard']);
 
       // (d) idempotency: add twice each — state stays sane (exactly one
       // gbrain@gbrain row; outcome recorded in the evidence, not softened).
@@ -217,7 +218,8 @@ describe.skipIf(!PLUGIN_CAPABLE)('codex plugin door — INSTALL (no auth needed)
         env: probeEnv,
         timeoutMs: 120_000,
       });
-      const expected = filterOpsForSurface(operations, 'starter').map((o) => o.name).sort();
+      const publishGates = publishGatesFromDisabled(operations, new Set());
+      const expected = operations.filter((o) => isCallable(o, { transport: 'stdio', surface: REGISTRATION_SURFACE, scopes: [], publishGates })).map((o) => o.name).sort();
       expect(tools.sort()).toEqual(expected);
 
       // (f) cold-home fast-fail: fresh empty GBRAIN_HOME → actionable exit,
@@ -229,9 +231,17 @@ describe.skipIf(!PLUGIN_CAPABLE)('codex plugin door — INSTALL (no auth needed)
         env: hermeticChildEnv({ HOME: coldHome, GBRAIN_BIN: gbrainBin, GBRAIN_HOME: coldHome }) as Record<string, string>,
         timeout: 60_000,
       });
-      expect(cold.status).not.toBe(0);
-      expect(cold.stderr).toContain('No brain configured');
-      expect(cold.stderr).toContain('gbrain init');
+      expect(cold.status).toBe(0);
+      expect(cold.stderr).toContain('STATUS-ONLY');
+      const coldFast = spawnSync(launcher, [...serverArgs, '--fail-fast'], {
+        cwd: snap!,
+        encoding: 'utf8',
+        env: hermeticChildEnv({ HOME: coldHome, GBRAIN_BIN: gbrainBin, GBRAIN_HOME: coldHome }) as Record<string, string>,
+        timeout: 60_000,
+      });
+      expect(coldFast.status).not.toBe(0);
+      expect(coldFast.stderr).toContain('No brain configured');
+      expect(coldFast.stderr).toContain('gbrain init');
 
       // (g) --source-guard: a GENUINELY AMBIGUOUS brain (default + TWO
       // non-default sources, so resolution can't land on the unambiguous

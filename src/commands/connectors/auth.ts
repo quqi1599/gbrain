@@ -5,16 +5,21 @@
  * from stdin so the secret never lands in argv/`ps`. `--try-oauth` (chatgpt)
  * attempts the best-effort OAuth PKCE loopback first, then probes and falls back
  * to cookie guidance. Every path ends with a probe + a one-line verdict; nothing
- * is saved on a failed probe unless `--force`.
+ * is saved on a failed probe unless `--force`. A ChatGPT cookie first mints a
+ * token through the same client; a failed mint is the verdict and no probe
+ * follows it (#7515).
  */
 
 import type { BrainEngine } from '../../core/engine.ts';
 import { setCliExitVerdict } from '../../core/cli-force-exit.ts';
-import { ConnectorClient } from '../../core/connectors/client.ts';
-import type { ConnectorFetch } from '../../core/connectors/client.ts';
+import { shellQuote } from '../../core/agent-output.ts';
+import { agentBlock } from '../../core/agent-markers.ts';
+import { isInteractive } from '../../core/interaction.ts';
+import { readStdinPayload } from '../../core/stdin-read.ts';
+import { ConnectorClient, probeFailure } from '../../core/connectors/client.ts';
 import { deleteCredential, saveCredential } from '../../core/connectors/credentials.ts';
 import { getConnectorProvider, isConnectorProviderName } from '../../core/connectors/registry.ts';
-import type { ChatHistoryProvider, ConnectorCredential } from '../../core/connectors/types.ts';
+import type { ChatHistoryProvider, ConnectorCredential, ProbeResult } from '../../core/connectors/types.ts';
 
 interface AuthFlags {
   cookie?: string;
@@ -39,25 +44,62 @@ function parseFlags(args: string[]): { provider: string; flags: AuthFlags } {
   return { provider, flags };
 }
 
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks).toString('utf8').trim();
+/** A person pasting a cookie at the terminal gets 5 minutes for the first byte. */
+const PASTE_WAIT_MS = 300_000;
+
+/** Bounded credential read (C5): an open-but-silent stdin times out with a message instead of hanging. */
+async function readStdin(firstByteMs?: number): Promise<string | null> {
+  const read = await readStdinPayload("printf '%s' \"$COOKIE\" | gbrain connectors auth <provider> --cookie -",
+    firstByteMs !== undefined ? { firstByteMs } : {});
+  if (read.ok) return read.text.trim();
+  console.error(read.message);
+  return null;
+}
+
+/**
+ * The headless lane (C7, mirrors Google connect): the `[AGENT]` block with
+ * the provider's cookie checklist fenced as `[SHOW USER]`, and the command
+ * that takes the cookie on stdin once the user has it. The cookie is a
+ * credential: the user copies it; the agent never guesses or reuses one.
+ */
+export function headlessCredentialBlock(provider: string, prov: Pick<ChatHistoryProvider, 'sessionInstructions'>): string {
+  const argv = ['gbrain', 'connectors', 'auth', provider, '--cookie', '-'];
+  return agentBlock({
+    ask: `Ask the user to copy their ${provider} session cookie from a logged-in browser (steps below), then pass it on stdin.`,
+    why: `Syncing ${provider} history needs the user's own browser session; there is no headless sign-in, and only the user can copy it.`,
+    risk: `The cookie grants access to the user's ${provider} account; gbrain stores it only on this machine (0600) and sends it only to ${provider}.`,
+    consent: 'credentials',
+    actor: 'user',
+    next: 'tell_user_to_run',
+    if_yes: `printf '%s' "<cookie>" | ${shellQuote(argv)}`,
+    if_no: 'Nothing was saved. The official export works without a cookie: gbrain transcripts ingest <export-file>.',
+    verify: `gbrain connectors status ${provider}`,
+  }, { showUser: prov.sessionInstructions() });
 }
 
 function makeProbeClient(provider: ChatHistoryProvider, cred: ConnectorCredential): ConnectorClient {
   return new ConnectorClient({
     baseUrl: provider.baseUrl,
     headers: () => provider.authHeaders(cred),
-    refresh: provider.refreshAccessToken
-      ? () => provider.refreshAccessToken!(cred, fetch as unknown as ConnectorFetch)
-      : undefined,
+    refresh: provider.refreshAccessToken ? (client) => provider.refreshAccessToken!(cred, client) : undefined,
   });
+}
+
+/** chatgpt: mint an accessToken from the cookie up front, so the first sync doesn't start with a 401→refresh round-trip. */
+async function mintToken(provider: ChatHistoryProvider, cred: ConnectorCredential, client: ConnectorClient): Promise<ProbeResult> {
+  if (!cred.cookie || !provider.refreshAccessToken) return { ok: true };
+  try {
+    if (await provider.refreshAccessToken(cred, client)) return { ok: true };
+    return { ok: false, kind: 'unauthorized', detail: 'the session endpoint returned no access token' };
+  } catch (e) {
+    return probeFailure(e);
+  }
 }
 
 async function probeAndReport(provider: ChatHistoryProvider, cred: ConnectorCredential): Promise<boolean> {
   const client = makeProbeClient(provider, cred);
-  const r = await provider.probe(client);
+  const minted = await mintToken(provider, cred, client);
+  const r = minted.ok ? await provider.probe(client) : minted;
   if (r.ok) {
     console.log(`✓ ${provider.name}: credential verified — conversation history is reachable.`);
     return true;
@@ -102,8 +144,14 @@ export async function runConnectorAuth(_engine: BrainEngine, args: string[]): Pr
   }
   const prov = getConnectorProvider(provider)!;
 
-  // --try-oauth (chatgpt only, best-effort/forward-compat).
-  if (flags.tryOauth && prov.oauth) {
+  const interactive = isInteractive();
+  // --try-oauth (chatgpt only, best-effort/forward-compat). The loopback flow
+  // needs a person at a browser on this machine and blocks up to 10 minutes
+  // waiting for the redirect, so a headless run never starts it (C7): it
+  // hands the agent the cookie lane instead.
+  if (flags.tryOauth && prov.oauth && !interactive) {
+    console.error('OAuth sign-in needs a person at a browser on this machine (it waits for a local redirect), so it was not started.');
+  } else if (flags.tryOauth && prov.oauth) {
     const ok = await tryOauth(prov, flags);
     if (ok) {
       printFirstRun(provider);
@@ -117,11 +165,24 @@ export async function runConnectorAuth(_engine: BrainEngine, args: string[]): Pr
   // Cookie / token lane (primary).
   let cookie = flags.cookie;
   let token = flags.token;
-  if (cookie === '-') cookie = await readStdin();
+  if (cookie === '-') {
+    const read = await readStdin();
+    if (read === null) { setCliExitVerdict(1); return; }
+    cookie = read;
+  }
+  if (!cookie && !token && !interactive) {
+    // Headless (an agent or a pipeline): there is no one to paste a cookie.
+    // Only the user can copy it from their browser, so relay the checklist
+    // and stop; nothing was saved.
+    process.stdout.write(headlessCredentialBlock(provider, prov));
+    setCliExitVerdict(1);
+    return;
+  }
   if (!cookie && !token) {
     console.error(prov.sessionInstructions());
     console.error('\nPaste the credential now (Cookie header, or `token:<accessToken>`), then Ctrl-D:');
-    const pasted = await readStdin();
+    const pasted = await readStdin(PASTE_WAIT_MS);
+    if (pasted === null) { setCliExitVerdict(1); return; }
     if (pasted.startsWith('token:')) token = pasted.slice('token:'.length).trim();
     else cookie = pasted;
   }
@@ -138,12 +199,6 @@ export async function runConnectorAuth(_engine: BrainEngine, args: string[]): Pr
     accessToken: token || undefined,
     savedAt: new Date().toISOString(),
   };
-  // chatgpt: mint an accessToken from the cookie up front so the first sync
-  // doesn't start with a guaranteed 401→refresh round-trip.
-  if (cred.cookie && prov.refreshAccessToken) {
-    await prov.refreshAccessToken(cred, fetch as unknown as ConnectorFetch);
-  }
-
   const ok = await probeAndReport(prov, cred);
   if (!ok && !flags.force) {
     console.error('Credential NOT saved (probe failed). Re-run with --force to save anyway.');

@@ -30,12 +30,14 @@
  *   - --json: structured response for agents.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { readStdinPayload } from '../core/stdin-read.ts';
+import { resolve } from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult, RemoteMcpError } from '../core/mcp-client.ts';
 import { computeContentHash } from '../core/ingestion/types.ts';
-import { operations, OperationError } from '../core/operations.ts';
+import { operations, opError } from '../core/operations.ts';
 import type { OperationContext } from '../core/operations.ts';
 import { resolveSourceWithTier } from '../core/source-resolver.ts';
 // Pure content helpers moved to core (shared with the capture MCP op — the
@@ -53,9 +55,11 @@ import {
 import { randomUUID } from 'node:crypto';
 import { parseMutationPrecondition } from '../core/persistence/preconditions.ts';
 import { isWriteReceipt, type WriteReceipt } from '../core/persistence/types.ts';
+import { currentCliWriteWait } from '../core/persistence/write-wait.ts';
 import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
+import { PAGE_MAX_BYTES } from '../core/page-size-policy.ts';
 
 export { detectBinaryNullByte, normalizeForHash, mergeCaptureFrontmatter } from '../core/capture-content.ts';
 
@@ -92,7 +96,9 @@ function parseArgs(args: string[]): RunOpts | { help: true; positional: string |
     const mutationFlag = /^--(request-id|expected-revision)(?:=(.*))?$/.exec(a);
     if (mutationFlag) {
       const value = mutationFlag[2] ?? args[++i];
-      if (!value || value.startsWith('--')) throw new OperationError('invalid_params', `${mutationFlag[1]} requires a UUID.`);
+      if (!value || value.startsWith('--')) throw opError('invalid_params', `${mutationFlag[1]} requires a UUID.`, mutationFlag[1] === 'request-id'
+        ? 'Give --request-id the UUID an earlier attempt of this capture printed (it replays that request), or omit it and gbrain generates one.'
+        : 'Give --expected-revision the revision gbrain get --json returned for the page, or omit it to capture without a revision check.');
       if (mutationFlag[1] === 'request-id') opts.request_id = value;
       else opts.expected_revision = value;
       continue;
@@ -123,7 +129,9 @@ function parseArgs(args: string[]): RunOpts | { help: true; positional: string |
     if (a === '--where') { const v = args[++i]; if (v) opts.where = v; continue; }
     if (a === '--kind') { const v = args[++i]; if (v) opts.kind = v; continue; }
     if (a === '--depth') { const v = args[++i]; if (v) opts.depth = v; continue; }
-    if (a.startsWith('--')) throw new OperationError('invalid_params', `Unsupported capture option '${a}'.`);
+    if (a.startsWith('--')) throw opError('invalid_params', `Unsupported capture option '${a.split('=')[0]}'.`,
+      `Remove ${a.split('=')[0]}; gbrain capture accepts --file, --stdin, --slug, --type, --source, --who, --what, --where, --kind, --depth, --request-id, --expected-revision, --force, --json and --quiet.`,
+      { fix: { argv: ['gbrain', 'capture', '--help'], consent: [], actor: 'agent', why: 'Prints the capture forms and flags.', requires_exclusive: false } });
     positional.push(a);
   }
   if (positional.length > 0) {
@@ -176,15 +184,6 @@ Examples:
   gbrain capture --file ./notes/today.md --slug daily/2026-05-20
   JOB=$(gbrain capture "..." --quiet)
 `;
-
-
-async function readStdinBuffer(): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : (chunk as Buffer));
-  }
-  return Buffer.concat(chunks);
-}
 
 
 /**
@@ -258,6 +257,36 @@ function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): voi
   if (result.write_request) console.log(`  request_id:    ${result.write_request.request_id}`);
 }
 
+/**
+ * The `capture` operation parameters one CLI invocation submits, on every
+ * transport (direct handler, resident-owner IPC, thin-client HTTP). The
+ * provenance trio (`source_kind`, `source_uri`, `ingested_via`) is trusted
+ * local CLI provenance: the owner stores it for a local caller and replaces it
+ * with `mcp:capture` for a remote one (page-mutations.ts), so a thin client
+ * sends none of it. #6524: every key here is declared on the op, which the
+ * dispatch unknown-parameter check requires of a write
+ * (test/capture-cli-params-contract-6524.test.ts).
+ */
+function captureParams(parsed: RunOpts, content: string, precondition: Record<string, unknown>, thinClient: boolean): Record<string, unknown> {
+  return {
+    content,
+    ...precondition,
+    ...(parsed.slug ? { slug: parsed.slug } : {}),
+    ...(parsed.type ? { type: parsed.type } : {}),
+    ...(parsed.who ? { who: parsed.who } : {}),
+    ...(parsed.what ? { what: parsed.what } : {}),
+    ...(parsed.where ? { where: parsed.where } : {}),
+    ...(parsed.kind ? { kind: parsed.kind } : {}),
+    ...(parsed.depth ? { depth: parsed.depth } : {}),
+    ...(thinClient ? {} : {
+      source_kind: 'capture-cli',
+      // #5622: the owner maps a local file to its source-relative origin (or 'cli-file'); no file URI or home path is stored.
+      ...(parsed.filePath ? { local_file: resolve(parsed.filePath) } : { source_uri: parsed.stdin ? 'stdin' : 'cli-positional' }),
+      ingested_via: 'capture-cli',
+    }),
+  };
+}
+
 export async function runCapture(engine: BrainEngine | null, args: string[], options: { getEngine?: () => Promise<BrainEngine> } = {}): Promise<void> {
   const parsed = parseArgs(args);
   if ('help' in parsed) {
@@ -285,10 +314,29 @@ export async function runCapture(engine: BrainEngine | null, args: string[], opt
   let rawBuffer: Buffer | null = null;
   let inputLabel = ''; // for error messages
   if (parsed.stdin) {
-    rawBuffer = await readStdinBuffer();
+    // Bounded read (C5): an open-but-silent pipe times out instead of hanging,
+    // and partial input is never captured. Raw bytes reach the binary guards.
+    const read = await readStdinPayload('echo "a thought" | gbrain capture --stdin');
+    if (!read.ok) {
+      console.error(`gbrain capture: ${read.message}`);
+      process.exit(1);
+    }
+    rawBuffer = read.raw;
     inputLabel = 'stdin';
   } else if (parsed.filePath) {
     inputLabel = parsed.filePath;
+    // Wave B: a trusted local file over the page ceiling streams (src/cli/commands/append.ts streamLocalCapture).
+    if (!isThinClient(cfg) && (statSync(parsed.filePath, { throwIfNoEntry: false })?.size ?? 0) > PAGE_MAX_BYTES) {
+      try {
+        const streamed = await (await import('../cli/commands/append.ts')).streamLocalCapture(parsed.filePath, parsed, async () => engine ??= await options.getEngine!());
+        if (streamed) return printReceipt({ ...streamed, written: false, source_kind: 'capture-cli', captured_at: new Date().toISOString() }, parsed.quiet ?? false, parsed.json ?? false);
+      } catch (error) {
+        if (await reportPersistenceCliError(error, parsed.json ?? false)) return;
+        console.error(`gbrain capture: ${error instanceof Error ? error.message : String(error)}`);
+        const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+        return setCliExitVerdict(1);
+      }
+    }
     try {
       // No encoding => returns Buffer; binary guard sees raw bytes.
       rawBuffer = readFileSync(parsed.filePath);
@@ -364,24 +412,14 @@ export async function runCapture(engine: BrainEngine | null, args: string[], opt
   try {
     const precondition = parseMutationPrecondition(parsed as unknown as Record<string, unknown>);
     requestId = precondition.request_id ?? randomUUID();
-    const params: Record<string, unknown> = {
-      content: rawBody,
-      ...precondition,
-      request_id: requestId,
-      ...(parsed.slug ? { slug: parsed.slug } : {}),
-      ...(parsed.type ? { type: parsed.type } : {}),
-      ...(parsed.who ? { who: parsed.who } : {}),
-      ...(parsed.what ? { what: parsed.what } : {}),
-      ...(parsed.where ? { where: parsed.where } : {}),
-      ...(parsed.kind ? { kind: parsed.kind } : {}),
-      ...(parsed.depth ? { depth: parsed.depth } : {}),
-      source_kind: 'capture-cli',
-      source_uri: parsed.filePath ? `file://${parsed.filePath}` : parsed.stdin ? 'stdin' : 'cli-positional',
-      ingested_via: 'capture-cli',
-    };
+    const params = captureParams(parsed, rawBody, { ...precondition, request_id: requestId }, isThinClient(cfg));
     let result: Record<string, unknown>;
-    if (isThinClient(cfg)) {
-      const raw = await callRemoteTool(cfg!, 'capture', params, { timeoutMs: getCliOptions().timeoutMs ?? 30_000 });
+    // Wave B: a file larger than one request goes through an upload session (src/cli/commands/append.ts).
+    const upload = parsed.filePath ? await import('../cli/commands/append.ts') : null;
+    if (upload?.captureNeedsUpload(params, isThinClient(cfg))) {
+      result = await upload.uploadCapture(rawBody, parsed, requestId, async () => engine ??= await options.getEngine!());
+    } else if (isThinClient(cfg)) {
+      const raw = await callRemoteTool(cfg!, 'capture', params, { timeoutMs: getCliOptions().timeoutMs ?? 30_000, writeWaitMs: currentCliWriteWait().waitMs });
       result = unpackToolResult<Record<string, unknown>>(raw);
     } else {
       const cli = getCliOptions();
@@ -391,14 +429,18 @@ export async function runCapture(engine: BrainEngine | null, args: string[], opt
       if (delegated.handled) result = delegated.result as Record<string, unknown>;
       else {
         if (!engine && options.getEngine) engine = await options.getEngine();
-        if (!engine) throw new OperationError('owner_unavailable', 'Capture requires a connected engine or a local persistence owner.');
+        if (!engine) throw opError('owner_unavailable', 'Capture requires a connected engine or a local persistence owner.',
+          'Run gbrain capture from the CLI on the brain host, where it opens the brain itself or hands the capture to a running gbrain serve.',
+          { fix: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', why: 'Shows whether this machine resolves a brain and whether a serve owns it, read-only.', requires_exclusive: false } });
         const resolved = await resolveSourceWithTier(engine, parsed.source ?? null);
         resolvedSourceId = resolved.source_id;
         const captureOp = operations.find(operation => operation.name === 'capture');
-        if (!captureOp) throw new OperationError('unavailable', 'The capture operation is missing; upgrade this installation.');
+        if (!captureOp) throw opError('unavailable', 'The capture operation is missing; upgrade this installation.',
+          'This gbrain build has no capture operation. Check for an update and, with the user\'s go-ahead, run gbrain upgrade, then capture again.',
+          { fix: { argv: ['gbrain', 'check-update', '--json'], consent: [], actor: 'agent', why: 'Reports whether a newer gbrain is available, read-only.', requires_exclusive: false } });
         const ctx: OperationContext = {
           engine, config: cfg ?? { engine: 'pglite' }, sourceId: resolvedSourceId,
-          remote: false, dryRun: false,
+          remote: false, dryRun: false, writeWaitMs: currentCliWriteWait().waitMs,
           logger: {
             info: (message: string) => process.stderr.write(`[capture] ${message}\n`),
             warn: (message: string) => process.stderr.write(`[capture] WARN: ${message}\n`),
@@ -451,6 +493,7 @@ export const __testing = {
   deriveTitle,
   explicitCaptureType,
   parseArgs,
+  captureParams,
   detectBinaryNullByte,
   detectBinarySignature,
   normalizeForHash,

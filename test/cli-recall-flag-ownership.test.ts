@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildFlagRegistry } from '../scripts/generate-flag-registry.ts';
-import { validateCommandFlags } from '../src/cli.ts';
+import { validateCommandFlags } from '../src/cli/main.ts';
 import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
 import { runCli } from './helpers/cli-spawn.ts';
 
@@ -39,7 +39,7 @@ describe('recall and degraded serve flag ownership', () => {
     const home = mkdtempSync(join(tmpdir(), 'gbrain-recall-flags-'));
     try {
       const result = await runCli(['recall', '--query', 'example', flag, '--json'], { home, cwd: home });
-      expect(result.exitCode).toBe(1);
+      expect(result.exitCode).toBe(2);
       expect(result.stderr).toContain(`unknown flag ${flag} for 'gbrain recall'`);
       expect(JSON.parse(result.stdout)).toMatchObject({ status: 'error', reason: 'invalid_flag' });
       expect(result.stderr).not.toContain('database_url is missing');

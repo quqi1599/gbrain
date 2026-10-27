@@ -8,8 +8,8 @@
  *  1. The RENDERED AGENTS.md carries Gate 3 ("Entity lookup (brain first)") in
  *     full — search-the-brain-before-answering with the actual brain tools —
  *     so a Codex agent with no hooks still pulls context every turn.
- *  2. `registerCodexMcp` argv pins `serve --surface full` (bootstrap needs the
- *     whole op surface, not a narrowed `verbs`) and binds GBRAIN_SOURCE so a
+ *  2. `registerCodexMcp` argv pins `serve --surface full` (REGISTRATION_SURFACE:
+ *     bootstrap's page, timeline and verb tools, not a narrowed `verbs`) and binds GBRAIN_SOURCE so a
  *     GUI-spawned serve (which inherits no shell env) writes to the workspace
  *     source [G1, CX-P1.4].
  */
@@ -84,7 +84,7 @@ describe('Codex door — rendered AGENTS.md pull protocol (Gate 3)', () => {
 describe('Codex door — registerCodexMcp argv (--surface full + GBRAIN_SOURCE)', () => {
   const BIN = '/opt/gbrain/bin/gbrain';
 
-  test('user-global stdio registration binds the source and pins the full op surface', () => {
+  test('user-global stdio registration binds the source and pins the full surface', () => {
     const argvs = registerCodexMcp({ gbrainBin: BIN, sourceId: 'workspace' });
     expect(argvs.length).toBe(1);
     const argv = argvs[0]!;

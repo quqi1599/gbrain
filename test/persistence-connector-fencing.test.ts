@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { withGoogleAccount } from './helpers/connector-fixture.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { performSync } from '../src/commands/sync.ts';
@@ -69,7 +70,7 @@ for (const connector of ['github', 'google'] as const) {
       const run = () => connector === 'github'
         ? runGitHubSync(engine, f.id, parseGitHubSourceConfig(config, f.dir), { ...options, skipLock: true,
           githubItem: { repo: 'acme-example/app', number: 1, kind: 'issue' } }, fetcher)
-        : runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), { ...options, skipLock: true }, fetcher);
+        : runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), { ...options, skipLock: true }, withGoogleAccount(fetcher));
       const first = run();
       first.catch(() => {});
       await entered.promise;
@@ -93,7 +94,7 @@ for (const connector of ['github', 'google'] as const) {
       globalThis.fetch = (async (url: string | URL | Request) => {
         again.resolve();
         await delayed.promise;
-        return fetcher(String(url));
+        return withGoogleAccount(fetcher)(String(url));
       }) as typeof fetch;
       const command = performSync(engine, { ...options, sourceId: f.id, full: true, skipLock: true, lockId: 'caller-cannot-bypass-source-lease' });
       command.catch(() => {});
@@ -127,7 +128,7 @@ for (const connector of ['github', 'google'] as const) {
         return connector === 'github'
           ? runGitHubSync(engine, f.id, parseGitHubSourceConfig(config, f.dir), { ...options,
             githubItem: { repo: 'acme-example/app', number: 1, kind: 'issue' } }, fetcher)
-          : runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), options, fetcher);
+          : runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), options, withGoogleAccount(fetcher));
       };
       const old = run(true);
       old.catch(() => {});
@@ -136,7 +137,7 @@ for (const connector of ['github', 'google'] as const) {
         await engine.executeRaw('DELETE FROM gbrain_cycle_locks WHERE id=$1', [syncLockId(f.id)]);
         await run(false);
         const checkpoint = await sourceCheckpoint(engine, f.id);
-        const receipts = await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1', [f.id]);
+        const receipts = await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1 ORDER BY id', [f.id]);
         released.resolve();
         const [result] = await Promise.allSettled([old]);
         const slug = connector === 'github' ? 'gh/acme-example/app/1' : 'people/first-example';
@@ -144,7 +145,7 @@ for (const connector of ['github', 'google'] as const) {
         if (bound) expect(readFileSync(join(f.dir, `${slug}.md`), 'utf8')).toContain('Newest response');
         expect(result).toMatchObject({ status: 'rejected', reason: { name: 'LockStolenError' } });
         expect(await sourceCheckpoint(engine, f.id)).toEqual(checkpoint);
-        expect(await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1', [f.id])).toEqual(receipts);
+        expect(await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1 ORDER BY id', [f.id])).toEqual(receipts);
         await disposePersistenceConsumer(engine);
         expect((await run(false)).status).not.toBe('partial');
       } finally { released.resolve(); await old.catch(() => {}); }

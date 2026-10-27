@@ -116,6 +116,49 @@ describe('queue_health — healthy queue stays quiet', () => {
   });
 });
 
+describe('queue_health — unreadable worker registry', () => {
+  it('reports liveness unknown instead of erroring or advising a worker start', async () => {
+    await seed('default', 'embed-backfill', 'waiting', { createdAtSql: "now() - interval '3 hours'" });
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => { throw new Error('EACCES: permission denied'); },
+    });
+    expect(check.status).toBe('warn');
+    expect(check.details?.worker_alive).toBeNull();
+    expect(check.message).toContain('worker liveness is unknown');
+    expect(check.message).not.toContain('no live worker is registered');
+    expect(check.fix).toBeUndefined();
+  });
+
+  it('carries the registry errno and path in details and the message', async () => {
+    await seed('default', 'embed-backfill', 'waiting', { createdAtSql: "now() - interval '3 hours'" });
+    const { WorkerRegistryUnreadableError } = await import('../src/core/minions/worker-registry.ts');
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => { throw new WorkerRegistryUnreadableError('/home/alice-example/.gbrain/workers', 'EACCES', null); },
+    });
+    expect(check.details).toMatchObject({
+      worker_alive: null,
+      worker_registry_unreadable: true,
+      worker_registry_errno: 'EACCES',
+      worker_registry_path: '/home/alice-example/.gbrain/workers',
+    });
+    expect(check.message).toContain('unreadable (EACCES at /home/alice-example/.gbrain/workers)');
+  });
+
+  it('withholds the registry path from a remote caller; the local caller keeps it', async () => {
+    await seed('default', 'embed-backfill', 'waiting', { createdAtSql: "now() - interval '3 hours'" });
+    const { WorkerRegistryUnreadableError } = await import('../src/core/minions/worker-registry.ts');
+    const readWorkers = () => { throw new WorkerRegistryUnreadableError('/home/alice-example/.gbrain/workers', 'EACCES', null); };
+    const remote = await computeQueueHealthCheck(pgLike, { readWorkers, remote: true });
+    expect(JSON.stringify(remote)).not.toContain('/home/alice-example');
+    expect(remote.details).toMatchObject({ worker_alive: null, worker_registry_unreadable: true, worker_registry_errno: 'EACCES', worker_registry_path_redacted: true });
+    expect(remote.details).not.toHaveProperty('worker_registry_path');
+    expect(remote.message).toContain('unreadable (EACCES; path withheld from remote callers');
+    const local = await computeQueueHealthCheck(pgLike, { readWorkers, remote: false });
+    expect(local.details?.worker_registry_path).toBe('/home/alice-example/.gbrain/workers');
+    expect(local.message).toContain('unreadable (EACCES at /home/alice-example/.gbrain/workers)');
+  });
+});
+
 describe('malformed_path_pages discovery check (buildChecks seam)', () => {
   it('warns naming the count + slug when a page is backed by a bracketed filename', async () => {
     await base.executeRaw(
@@ -137,5 +180,35 @@ describe('malformed_path_pages discovery check (buildChecks seam)', () => {
     );
     const checks = await buildChecks(base, [], null);
     expect(checks.find((c) => c.name === 'malformed_path_pages')).toBeUndefined();
+  });
+});
+
+describe('queue_health — prompt_too_long deaths are attributed per dream phase (#6303)', () => {
+  async function seedDead(key: string | null): Promise<void> {
+    await base.executeRaw(
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, error_text, idempotency_key, created_at, updated_at, finished_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'default', 'dead', 'prompt_too_long: 300000 tokens', $1, now(), now(), now())`,
+      [key],
+    );
+  }
+
+  it('patterns deaths get patterns advice, never the synthesize budget knob', async () => {
+    await seedDead('dream:patterns:abc');
+    await seedDead('dream:patterns:def');
+    const check = await computeQueueHealthCheck(pgLike);
+    expect(check.message).toContain('2 dream patterns subagent job(s)');
+    expect(check.message).toContain('models.dream.patterns');
+    expect(check.message).toContain('dream.patterns.lookback_days');
+    expect(check.message).not.toContain('dream.synthesize.max_prompt_tokens');
+  });
+
+  it('synthesize and other deaths keep their own lines', async () => {
+    await seedDead('dream:synth-v2:default:filename:a.md:0123456789abcdef');
+    await seedDead(null);
+    const check = await computeQueueHealthCheck(pgLike);
+    expect(check.message).toContain('1 dream synthesize subagent job(s)');
+    expect(check.message).toContain('dream.synthesize.max_prompt_tokens');
+    expect(check.message).toContain('1 subagent job(s) dead-lettered with prompt_too_long');
+    expect(check.message).not.toContain('models.dream.patterns');
   });
 });

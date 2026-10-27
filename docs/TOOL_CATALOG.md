@@ -4,16 +4,19 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **Starter** marks membership in the ~38-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 162 tools across 25 areas. **Starter** marks membership in the ~40-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
+| `get_brain_health` | Brain health as bands for agents without admin scope: write capacity (ok, low or critical, with a days band) and counts of write failures, ghost pages and unsearchable chunks as bands, for the sources you can read. | read |  |  |
 | `get_health` | Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. | admin |  |  |
 | `get_stats` | Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant. | admin |  |  |
 | `get_status_snapshot` | Snapshot for `gbrain status` thin-client mode: sync freshness + last cycle + queue depths + worker liveness. | admin |  |  |
 | `get_usage` | Aggregate chat usage + cost from the chat_usage_log ledger (per-model and per-phase token counts, cache reads/writes, USD estimates) with explicit coverage fields. | admin |  |  |
+| `get_write_attribution` | Admin read: who created and who last changed a page, or one of its facts, takes or timeline entries. | admin |  |  |
+| `mute_notice` | Mute a coaching or info notice (or first_run_decisions) for this client. | write | yes |  |
 | `quarantine_list` | List quarantined (hidden) and optionally content-flagged pages by scanning page frontmatter, newest-updated first. | admin |  |  |
 | `run_doctor` | Run brain health checks and return a structured DoctorReport (thin-client doctor surface). | admin |  |  |
 | `run_onboard` | Probe brain health + optionally submit onboard remediations. | admin |  |  |
@@ -50,7 +53,7 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `request_tools` | Discover this brain's tool catalog and optionally unlock a wider tool surface for your client. | read | yes |  |
+| `request_tools` | More tools and params: no arguments lists your catalog; {tools: [names]} returns full schemas, every optional param included; {surface} widens it (per client or stdio session). | read | yes |  |
 
 ## entities
 
@@ -60,61 +63,70 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 | `extract_entities` | Extract entity names (people, companies) from text and create/update their brain stub pages. | write |  |  |
 | `extraction_pending` | List unverified auto-extracted entity stubs awaiting owner review (the quarantine lane from extract_entities). | read |  |  |
 
+## facts
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `purge_fact` | Owner-only, trusted local CLI on the brain host (`gbrain forget <id> --purge`). | admin |  |  |
+
 ## identity
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `get_brain_identity` | Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. | read |  |  |
-| `whoami` | Introspect the calling identity. | read | yes |  |
+| `whoami` | Your identity: transport, scopes and, over OAuth, client, source_id and federated_read. | read | yes |  |
 
 ## ingest
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `get_ingest_log` | Get recent ingestion log entries | read | yes |  |
-| `log_ingest` | Log an ingestion event | write |  |  |
+| `get_ingest_log` | Recent ingestion log entries: what was already imported, and when. | read | yes |  |
+| `log_ingest` | Record one ingestion event (source type, reference, pages updated, summary) in the brain's ingest log. | write |  |  |
 
 ## insights
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `find_anomalies` | Returns statistical anomalies in recent page activity, grouped by cohort (tag or type). | read | yes |  |
-| `find_contradictions` | Stored contradiction reports are temporarily available only to trusted local callers without a source filter. | read |  |  |
+| `find_anomalies` | Anomalies in recent page activity, grouped by cohort (tag or type) against a baseline. | read | yes |  |
+| `find_contradictions` | Return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. | read |  |  |
 | `find_experts` | Answers 'who in my brain knows about <topic>'. | read |  |  |
-| `find_trajectory` | v0.35.4 — return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). | read |  |  |
+| `find_trajectory` | Return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). | read |  |  |
 | `get_calibration_profile` | Read the active calibration profile for a holder. | read |  |  |
-| `get_recent_salience` | Returns readable pages recently touched and ranked by activity salience and recency. | read | yes |  |
+| `get_recent_salience` | Recently touched pages ranked by salience. | read | yes |  |
 | `volunteer_context` | Push-based context: volunteer brain pages relevant to a rolling conversation window WITHOUT being asked. | read |  |  |
 
 ## jobs
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `cancel_job` | Cancel a waiting, active, or delayed job. | admin | yes |  |
-| `get_agent_job` | Poll an agent job submitted via submit_agent. | agent | yes |  |
+| `cancel_job` | Cancel a waiting, active or delayed job you may manage. | admin | yes |  |
+| `get_agent_job` | Poll a submit_agent job: status, result, queue_position. | agent | yes |  |
 | `get_job` | Get job status and details by ID. | admin |  |  |
 | `get_job_progress` | Get structured progress for a running job. | admin |  |  |
 | `get_job_stats` | Job queue statistics. | admin |  |  |
-| `list_jobs` | List jobs with optional filters. | admin |  |  |
-| `pause_job` | Pause a waiting, active, or delayed job | admin |  |  |
+| `list_jobs` | List background jobs with optional status/queue/name filters; pass fields to project each job to the columns you need. | admin |  |  |
+| `pause_job` | Pause a waiting, active or delayed background job. | admin |  |  |
 | `replay_job` | Replay a completed/failed/dead job, optionally with modified data | admin |  |  |
-| `resume_job` | Resume a paused job back to waiting | admin |  |  |
-| `retry_job` | Re-queue a failed or dead job for retry | admin |  |  |
-| `send_job_message` | Send a sidechannel message to a running job's inbox | admin |  |  |
-| `submit_agent` | Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. | agent | yes |  |
+| `resume_job` | Resume a paused background job (back to waiting). | admin |  |  |
+| `retry_job` | Re-queue a failed or dead background job. | admin |  |  |
+| `send_job_message` | Send a sidechannel message to a running job's inbox (for jobs that read steering messages). | admin |  |  |
+| `submit_agent` | Submit an agent job (agent scope; tools and budget bound to your client). | agent | yes |  |
 | `submit_job` | Submit a background job. | admin |  |  |
+| `wait_job` | Wait until a job is completed, failed, dead or cancelled (at most 55 s per call), then return it like get_job plus terminal. | admin |  |  |
 
 ## links
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `add_link` | Create link between pages | write |  |  |
+| `add_link` | Create a typed link (edge) from one page to another in the same source. | write |  |  |
 | `find_orphans` | Find disconnected pages. | read |  |  |
-| `get_backlinks` | List incoming links to a page | read | yes |  |
-| `get_links` | List outgoing links from a page | read |  |  |
-| `list_link_sources` | List distinct link_source provenances in the brain with edge counts (e.g. | read | yes |  |
-| `remove_link` | Remove link between pages | write |  |  |
-| `traverse_graph` | Traverse link graph from a page. | read | yes |  |
+| `get_backlinks` | Links to a page, ≤500/call; group:"page" by referrer, newest first. | read | yes |  |
+| `get_links` | List a page's outgoing links (typed edges to other pages). | read |  |  |
+| `list_link_sources` | Link provenances (e.g. | read | yes |  |
+| `rank_entities` | Rank pages by graph connections: the most-linked people, companies or other entities. | read |  |  |
+| `remove_link` | Remove a link between two pages (optionally only one link_type or link_source). | write |  |  |
+| `traverse_graph` | Walk the link graph from a page. | read | yes |  |
+| `wanted_pages` | Link targets that have no page yet, most-referenced first: each was written as a link but its page does not exist, so no edge exists. | read |  |  |
 
 ## loops
 
@@ -129,20 +141,21 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `extract_facts` | v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. | write |  |  |
+| `confirm_memory` | Owner only: mark a fact, take or page as confirmed by the user (trust tier user_confirmed). | write |  |  |
+| `extract_facts` | Extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. | write |  |  |
 | `forget_fact` | Forget a fact by recording a durable withdrawal in its source and visibility. | write |  |  |
 
 ## memory-verbs
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `context_pack` | MEMORY VERB (v1): budget-packed session-boundary bundle for a set of standing entities — entity cards + open threads + hot facts, zero-LLM, sub-second. | read | yes |  |
-| `delta` | MEMORY VERB (v1): "what changed since T" for heartbeats — pages updated after `since` + hot facts newer than `since` + open-thread events after `since`, zero-LLM. | read | yes |  |
-| `entity` | MEMORY VERB (v1): inspect ONE known person/company/project card — zero LLM calls, sub-100ms. | read | yes |  |
-| `forget` | MEMORY VERB (v1): expire a remembered fact by id — the protocol delete verb. | write | yes |  |
-| `recall` | MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. | read | yes |  |
-| `remember` | MEMORY VERB (v1): save one fact to durable agent memory — the protocol write verb. | write | yes |  |
-| `synthesize` | [EXPENSIVE / SLOW — makes LLM calls, seconds-to-minutes latency, costs money] MEMORY VERB (v1): answer a broad question using cross-page LLM reasoning with citations and gap analysis. | read | yes |  |
+| `context_pack` | Core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. | read | yes |  |
+| `delta` | Pages, facts, thread events changed since a cursor, zero LLM. | read | yes |  |
+| `entity` | Person/company/account card, zero LLM. | read | yes |  |
+| `forget` | Expire a remembered fact by its fact_id (never a page slug). | write | yes |  |
+| `recall` | Read facts by entity, since or session_id; `query` also searches pages. | read | yes |  |
+| `remember` | Save facts with provenance; set `entity` (the subject) or recall misses it. | write | yes |  |
+| `synthesize` | [EXPENSIVE / SLOW: LLM calls] Cited answer to a broad question across pages. | read | yes |  |
 
 ## ontology
 
@@ -157,45 +170,70 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `cancel_write_request` | Cancel your accepted write before publication starts. | write | yes |  |
-| `capture` | Capture a quick note into the brain — the "just remember this" write. | write | yes |  |
+| `abort_page_upload` | Discard an uncommitted upload session: its staged parts are deleted and its quota is freed. | write |  |  |
+| `append_page` | Add text to the end of a page, in time proportional to the text: use it for logs and conversations instead of re-putting a large page. | write |  |  |
+| `begin_page_upload` | Start writing a page too large for one request: then upload_page_part from part 0 and commit_page_upload. | write |  |  |
+| `cancel_write_request` | Cancel your accepted write before it publishes; returns the receipt. | write | yes |  |
+| `capture` | Quick note ("just remember this"): slugged under inbox/ by date + content hash, so recapturing is idempotent. | write | yes |  |
+| `commit_page_upload` | Write an upload's page once every part is sent; returns put_page's receipt. | write |  |  |
 | `delete_page` | Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). | write |  |  |
+| `edit_page` | Change part of a page: prefer this over put_page for small changes. | write | yes |  |
 | `fetch` | Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). | read |  |  |
-| `get_chunks` | Get content chunks for a page | read |  |  |
-| `get_page` | Read a page by slug (supports optional fuzzy matching). | read | yes |  |
+| `get_chunks` | Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. | read |  |  |
+| `get_page` | Read a page; `section` or `grep` reads one part. | read | yes |  |
+| `get_page_upload` | An upload's state and next_part, to resume after a lost reply. | write |  |  |
 | `get_raw_data` | Retrieve raw data for a page. | read |  |  |
-| `get_versions` | Page version history | read |  |  |
-| `get_write_request` | Read your durable write receipt by request_id. | write | yes |  |
-| `list_pages` | List pages with optional filters. | read | yes |  |
-| `list_write_requests` | List your currently authorized write receipts in one source, newest first. | write | yes |  |
-| `put_page` | Replace a complete canonical Markdown page. | write | yes |  |
-| `put_raw_data` | Store raw API response data for a page | write |  |  |
-| `resolve_slugs` | Fuzzy-resolve a partial slug to matching page slugs | read | yes |  |
-| `restore_page` | v0.26.5 — restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). | write |  |  |
-| `revert_version` | Revert page to a previous version | write |  |  |
+| `get_versions` | Page version history, newest snapshot first: metadata only (id, snapshot_at, title, type, tags, frontmatter) for the newest 20 versions by default. | read |  |  |
+| `get_write_request` | Your write's receipt by request_id (after write_pending or a lost reply). | write | yes |  |
+| `list_page_purges` | Owner-only (`gbrain pages purges list`). | admin |  |  |
+| `list_pages` | List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. | read | yes |  |
+| `list_write_conflicts` | Pages whose writes keep ending in a source_changed conflict, grouped by slug. | read |  |  |
+| `list_write_requests` | Your write receipts in one source, newest first (for a lost request_id). | write | yes |  |
+| `put_page` | Complete content REPLACES the whole page: read get_page include_content:true; its revision is expected_revision. | write | yes |  |
+| `put_pages` | Write up to 50 complete Markdown pages (8 MB total) in one call; use instead of put_page for more than 3 pages. | write |  |  |
+| `put_raw_data` | Store a raw provider payload (API response JSON) alongside a page, keyed by source. | write |  |  |
+| `resolve_slugs` | Fuzzy-match a partial slug or title to page slugs. | read | yes |  |
+| `restore_page` | Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). | write |  |  |
+| `revert_version` | Restore a page to an earlier version from its history (a new revision; history is kept). | write |  |  |
+| `unpurge_page` | Owner-only (`gbrain pages unpurge <slug>`). | admin |  |  |
+| `upload_page_part` | Send the next part of an upload: part equals next_part, the whole call within part_max_frame_bytes, cut between code points. | write |  |  |
+| `whois` | Exact identity lookup: entity pages whose email, title or declared alias equals an email address or name, ignoring case, accents and quotes. | read |  |  |
+
+## questions
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `questions_list` | List pinned questions with freshness, blocked reason and next action, plus fresh/stale/pending counts. | read |  |  |
+| `questions_pin` | Pin a question: gbrain keeps a cited answer current from your notes and flags sentences whose evidence changed. | write |  |  |
+| `questions_refresh` | Refresh a pinned answer now (a paid model call): re-retrieves current evidence and edits the answer, or recomputes with full or after deletions. | write |  |  |
+| `questions_status` | One pinned question: the answer with per-sentence stale flags, evidence watermark, last refresh, blocked reason, next action and verify step. | read |  |  |
+| `questions_unpin` | Unpin a question: refreshes stop and its page is archived (your notes on it are kept). | write |  |  |
 
 ## schema
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `get_active_schema_pack` | v0.40.6.0: cheap identity packet for the active schema pack. | read |  |  |
-| `list_schema_packs` | v0.40.6.0: list installed schema packs (bundled + user-installed). | read |  |  |
-| `reload_schema_pack` | v0.40.6.0: flush the in-process schema pack cache so the next loadActivePack re-reads from disk. | admin |  |  |
-| `schema_apply_mutations` | v0.40.7.0: batched schema pack mutation. | admin |  |  |
-| `schema_explain_type` | v0.40.6.0: resolved settings for a single page_type in the active pack. | read |  |  |
-| `schema_graph` | v0.40.6.0: schema pack graph as JSON edges. | read |  |  |
-| `schema_lint` | v0.40.6.0: lint the active (or named) schema pack. | read |  |  |
-| `schema_review_orphans` | v0.40.6.0: list pages with no active-pack type match. | read |  |  |
-| `schema_stats` | v0.40.6.0: per-type page counts + typed-coverage from the DB. | read |  |  |
+| `get_active_schema_pack` | Cheap identity packet for the active schema pack. | read |  |  |
+| `list_schema_packs` | List installed schema packs (bundled + user-installed). | read |  |  |
+| `reload_schema_pack` | Flush the in-process schema pack cache so the next loadActivePack re-reads from disk. | admin |  |  |
+| `schema_apply_mutations` | Batched schema pack mutation. | admin |  |  |
+| `schema_explain_type` | Resolved settings for a single page_type in the active pack. | read |  |  |
+| `schema_graph` | Schema pack graph as JSON edges. | read |  |  |
+| `schema_lint` | Lint the active (or named) schema pack. | read |  |  |
+| `schema_review_orphans` | List pages with no active-pack type match. | read |  |  |
+| `schema_stats` | Per-type page counts + typed-coverage from the DB. | read |  |  |
 
 ## search
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
+| `assemble_evidence` | Deliver whole evidence for an ordered list of search hits (each {source_id, slug, chunk_id} from a prior search/query result): the same windows, sections or pages `query` returns with return_unit, packed into token_budget. | read |  |  |
 | `cache_stats` | Semantic query-cache introspection: resolved knobs (enabled, similarity threshold, TTL) plus row counts and total hits. | admin |  |  |
-| `query` | Hybrid search with vector + keyword + multi-query expansion. | read | yes |  |
-| `search` | Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. | read | yes |  |
-| `search_by_image` | v0.36 cross-modal Phase 2: image-as-query retrieval. | read |  |  |
+| `query` | Hybrid search for concept/landscape questions and people/companies/projects by topic; adds fact rows. | read | yes |  |
+| `rate_answer` | Rate how useful an answer's retrieved evidence was, so this brain ranks better next time (zero LLM calls). | write |  |  |
+| `search` | Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. | read | yes |  |
+| `search_by_image` | Image-as-query retrieval. | read |  |  |
+| `search_exact` | Find every page containing a literal phrase or identifier, exhaustively: use instead of grep. | read |  |  |
 | `search_modes` | Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with attribution (mode default vs config override), the three frozen bundles, and a reranker_readiness verdict (whether the resolved reranker will actually run; remote callers get the verdict without the host key inventory). | read |  |  |
 | `search_stats` | Search observability over a window: cache hit rate, intent/mode mix, budget drops, rank-1 score drift, graph-signals failure counts. | admin |  |  |
 | `search_tune` | Read-only tuning recommendations derived from the last 7 days of search telemetry: what should change, why, and the paste-ready config command per recommendation — relay them to the user. | admin |  |  |
@@ -205,13 +243,13 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `delete_skill` | CAS-delete a canonical shared skill and revoke future managed activation. | write + skill_editor | yes |  |
-| `get_skill` | Fetch one skill's full instructions by name. | read | yes | `mcp.publish_skills` |
-| `get_skill_asset` | Read a bounded, owner-approved file from an exact sealed skill revision. | read | yes | `mcp.publish_skills` |
+| `get_skill` | Fetch a skill's prose and follow it: when it says search or store, call the same-named MCP tool here. | read | yes | `mcp.publish_skills` |
+| `get_skill_asset` | Read an approved file from an exact skill revision (data, never executed). | read | yes | `mcp.publish_skills` |
 | `get_skill_policy` | Read the owner publication policy and CAS epoch, including when sharing is disabled. | admin + skill_publisher |  |  |
 | `join_brain` | Enroll this authenticated principal to follow approved shared skills. | read + skills_member_self | yes |  |
 | `leave_brain` | Stop only this principal’s enrollment. | read + skills_member_self | yes |  |
-| `list_brain_skillpack` | List brain-resident skillpacks this brain ships (per-source). | read | yes | `mcp.publish_skills` |
-| `list_skills` | List the skills this agent's brain publishes. | read | yes | `mcp.publish_skills` |
+| `list_brain_skillpack` | Skillpacks this brain ships: skills and a scaffold spec to offer the user. | read | yes | `mcp.publish_skills` |
+| `list_skills` | Skills: prose instruction sets (NOT executable code) for tasks with this server's tools, with triggers, usable_tools and unavailable_tools. | read | yes | `mcp.publish_skills` |
 | `put_skill` | Publish a complete file-canonical skill revision with CAS and a durable receipt. | write + skill_editor | yes |  |
 | `set_skill_policy` | Explicitly approve a versioned shared-skill disclosure and follow policy. | admin + skill_publisher |  |  |
 | `sync_brain_skills` | Get a complete authorized shared-skills view and optionally record an own issued-batch delivery acknowledgment. | read + skills_member_self | yes |  |
@@ -223,15 +261,16 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 | `sources_add` | Register a new source. | sources_admin |  |  |
 | `sources_list` | List registered sources with page counts and remote_url. | read |  |  |
 | `sources_remove` | Hard-remove a source (cascades pages/chunks/embeddings). | sources_admin |  |  |
+| `sources_resolve_path` | Read-only: what gbrain did with each file path of a source, by its own rules. | read |  |  |
 | `sources_status` | Per-source diagnostic. | read |  |  |
 
 ## tags
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `add_tag` | Add tag to page | write |  |  |
-| `get_tags` | List tags for a page | read |  |  |
-| `remove_tag` | Remove tag from page | write |  |  |
+| `add_tag` | Add one tag to a page (idempotent). | write |  |  |
+| `get_tags` | List the tags on one page. | read |  |  |
+| `remove_tag` | Remove one tag from a page. | write |  |  |
 
 ## takes
 
@@ -251,6 +290,6 @@ Every non-localOnly operation on the MCP surface: 133 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `add_timeline_entry` | Append an entry to the canonical Markdown timeline and structured timeline store in one committed write. | write | yes |  |
-| `get_timeline` | Get timeline entries for a page, optionally filtered by date window | read |  |  |
+| `add_timeline_entry` | Append a dated entry to a page timeline. | write | yes |  |
+| `get_timeline` | Get timeline entries for a page, optionally filtered by date window. | read |  |  |
 

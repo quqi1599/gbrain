@@ -24,11 +24,12 @@ import {
   createBenchmarkBrain,
   resetTables,
 } from '../src/eval/longmemeval/harness.ts';
-import { haystackToPages, type LongMemEvalQuestion } from '../src/eval/longmemeval/adapter.ts';
+import { haystackToPages, opaqueSessionId, sessionSlug, type LongMemEvalQuestion } from '../src/eval/longmemeval/adapter.ts';
 import { loadResumeSet } from '../src/commands/eval-longmemeval.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { DEFAULT_SOURCE_BOOSTS } from '../src/core/search/source-boost.ts';
 import type { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { cpuMsAsync } from './helpers/cpu-time.ts';
 
 // ---------------------------------------------------------------------------
 // Shared engine for the harness/reset/speed cases
@@ -129,22 +130,24 @@ describe('warm-create speed gate', () => {
   // GitHub Actions Ubuntu runners are slower yet (CI run #77585655194 hit
   // 17364ms total / ~1736ms/trial). Detect "loaded execution" via `$SHARD`
   // (set by scripts/run-unit-parallel.sh) OR `$CI` (set by every major CI).
-  // Loaded ceiling 4000ms still catches >50x algorithmic regressions.
+  // Loaded ceiling 4000ms still catches >50x algorithmic regressions. Each
+  // trial is timed in thread CPU time (PGLite runs on this thread), which
+  // measures the work rather than how long the scheduler made it wait.
   const LOADED = !!process.env.SHARD || !!process.env.CI;
   const P50_CEILING_MS = LOADED ? 4000 : 1500;
   test(`p50 < ${P50_CEILING_MS}ms under parallel test load (catches order-of-magnitude regressions)`, async () => {
     const trials = 10;
     const samples: number[] = [];
     for (let i = 0; i < trials; i++) {
-      const t0 = performance.now();
-      await resetTables(sharedEngine);
-      for (let j = 0; j < 5; j++) {
-        const slug = `chat/speed-${i}-${j}`;
-        const content = `---\ntype: note\n---\n\n**user:** speed sample ${i}-${j} keyword apple\n`;
-        await importFromContent(sharedEngine, slug, content, { noEmbed: true });
-      }
-      await sharedEngine.searchKeyword('apple', { limit: 5 });
-      samples.push(performance.now() - t0);
+      samples.push(await cpuMsAsync(async () => {
+        await resetTables(sharedEngine);
+        for (let j = 0; j < 5; j++) {
+          const slug = `chat/speed-${i}-${j}`;
+          const content = `---\ntype: note\n---\n\n**user:** speed sample ${i}-${j} keyword apple\n`;
+          await importFromContent(sharedEngine, slug, content, { noEmbed: true });
+        }
+        await sharedEngine.searchKeyword('apple', { limit: 5 });
+      }));
     }
     samples.sort((a, b) => a - b);
     const p50 = samples[Math.floor(samples.length * 0.5)];
@@ -180,12 +183,13 @@ describe('adapter haystackToPages', () => {
     };
     const pages = haystackToPages(q);
     expect(pages.length).toBe(3);
-    expect(pages[0].slug).toBe('chat/sess-1');
-    expect(pages[1].slug).toBe('chat/sess-2');
-    expect(pages[2].slug).toBe('chat/sess-3');
+    expect(pages[0].slug).toBe(sessionSlug('q-shape-1', 'sess-1'));
+    expect(pages[1].slug).toBe(sessionSlug('q-shape-1', 'sess-2'));
+    expect(pages[2].slug).toBe(sessionSlug('q-shape-1', 'sess-3'));
+    expect(new Set(pages.map(p => p.slug)).size).toBe(3);
     expect(pages[0].content).toContain('type: note');
     expect(pages[0].content).toContain('date: 2025-01-15');
-    expect(pages[0].content).toContain('session_id: sess-1');
+    expect(pages[0].content).toContain(`session_id: ${opaqueSessionId('q-shape-1', 'sess-1')}`);
     expect(pages[0].content).toContain('**user:** hi');
     expect(pages[0].content).toContain('**assistant:** hello');
   });
@@ -202,7 +206,7 @@ describe('adapter haystackToPages', () => {
       ],
     };
     const pages = haystackToPages(q);
-    expect(pages[0].content).toContain('session_id: sess-x');
+    expect(pages[0].content).toContain(`session_id: ${opaqueSessionId('q-shape-2', 'sess-x')}`);
     expect(pages[0].content).not.toContain('date:');
   });
 
@@ -228,12 +232,12 @@ describe('adapter haystackToPages', () => {
     };
     const pages = haystackToPages(q);
     expect(pages.length).toBe(2);
-    // Slugs got lowercased + underscores became hyphens (validator-safe).
-    expect(pages[0].slug).toBe('chat/sharegpt-abc-0');
-    expect(pages[1].slug).toBe('chat/sess-def-1');
-    // Frontmatter keeps the ORIGINAL session_id (no sanitization). The
-    // _s ids preserve through the round-trip; only the slug got rewritten.
-    expect(pages[0].content).toContain('session_id: sharegpt_AbC_0');
+    // Slugs are opaque per-question ids (validator-safe, no gold label).
+    expect(pages[0].slug).toBe(sessionSlug('q-s-1', 'sharegpt_AbC_0'));
+    expect(pages[1].slug).toBe(sessionSlug('q-s-1', 'sess_DEF_1'));
+    // Frontmatter carries the same opaque id; the raw id never reaches the page.
+    expect(pages[0].content).toContain(`session_id: ${opaqueSessionId('q-s-1', 'sharegpt_AbC_0')}`);
+    expect(pages[0].content).not.toContain('sharegpt_AbC_0');
     expect(pages[0].content).toContain('date: 2025-01-01');
     expect(pages[0].content).toContain('**user:** hi');
     expect(pages[1].content).toContain('**user:** bye');
@@ -254,7 +258,7 @@ describe('adapter haystackToPages', () => {
     };
     const pages = haystackToPages(q);
     expect(pages.length).toBe(1);
-    expect(pages[0].slug).toBe('chat/lme-q-s-2-0');
+    expect(pages[0].slug).toBe(sessionSlug('q-s-2', 'lme_q-s-2_0'));
   });
 });
 

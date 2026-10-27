@@ -6,49 +6,11 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
-import { loadConfig, type GBrainConfig } from '../../../core/config.ts';
 // Leaf module (no flag surface of its own) — see that file for why this
 // isn't imported from extract-conversation-facts.ts directly (#4135).
-import { ALLOWED_TYPES } from '../../../core/facts/conversation-types.ts';
-
-function hasNonEmptyChatFallbackChain(value: unknown): boolean {
-  if (Array.isArray(value)) {
-    return value.some((entry) => typeof entry === 'string' && entry.trim().length > 0);
-  }
-  if (typeof value !== 'string' || value.trim().length === 0) return false;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (Array.isArray(parsed)) {
-      return parsed.some((entry) => typeof entry === 'string' && entry.trim().length > 0);
-    }
-  } catch {
-    // `config set` stores raw strings; any non-empty non-JSON value is set.
-  }
-  return true;
-}
-
-/**
- * `chat_fallback_chain` is accepted by config and reaches the gateway config,
- * but no production chat path consumes it. Keep the warning in doctor rather
- * than config loading so ordinary commands stay quiet. Returning null for an
- * empty value keeps clean doctor reports silent instead of adding an OK line.
- */
-export async function checkChatFallbackChainInert(
-  engine: BrainEngine,
-  effectiveConfig: Pick<GBrainConfig, 'chat_fallback_chain'> | null = loadConfig(),
-): Promise<Check | null> {
-  const fileOrEnvSet = hasNonEmptyChatFallbackChain(effectiveConfig?.chat_fallback_chain);
-  const dbValue = await engine.getConfig('chat_fallback_chain').catch(() => null);
-  if (!fileOrEnvSet && !hasNonEmptyChatFallbackChain(dbValue)) return null;
-  return {
-    name: 'chat_fallback_chain_inert',
-    status: 'warn',
-    message:
-      '`chat_fallback_chain` is set but currently has no effect: no production chat path consumes it. ' +
-      'If you set it expecting fallback behavior, clear it from every plane that still holds a value: ' +
-      'the DB (`gbrain config unset chat_fallback_chain`), `~/.gbrain/config.json`, and `GBRAIN_CHAT_FALLBACK_CHAIN`.',
-  };
-}
+import { ALLOWED_TYPES, conversationFactsEligibleSql, pageTypesForAllowed, isConversationFactsEligiblePage, requireParseableConversationFlag } from '../../../core/facts/conversation-types.ts';
+import { checkError } from '../check-fix.ts';
+import { PASS_FLOOR_THRESHOLD, PASS_MEAN_THRESHOLD } from '../../../core/cross-modal-eval/aggregate.ts';
 
 /**
  * v0.32.3 [CDX-20]: surface mode + per-key override drift.
@@ -66,7 +28,7 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
     const overrides = await engine.listConfigKeys('search.');
     // Exclude search.mode itself + the upgrade-notice state key from the
     // override roster — they aren't knobs.
-    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown');
+    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown' && k !== 'search.mode_source');
 
     const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
     const loaded = await loadSearchModeConfig(engine);
@@ -81,10 +43,11 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
       return { name: 'search_mode', status: 'ok', message: context };
     }
 
-    // v0.48.2: installs from v0.46.3–v0.47.10 carry an explicit
-    // `search.reranker.model voyage:rerank-2.5` row init wrote before the
-    // bundle default caught up. It is now redundant, but `--reset` would also
-    // wipe every OTHER tuned search.* knob — name the exact key instead.
+    // An explicit `search.reranker.model` equal to the bundle default is
+    // redundant, but `--reset` would also wipe every OTHER tuned search.*
+    // knob — name the exact key instead. (Installs from v0.46.3–v0.47.10
+    // carry an init-written `voyage:rerank-2.5` row; since the default moved
+    // to rerank-3-lite that row is a real pin and keeps them on rerank-2.5.)
     const redundant: string[] = [];
     if (resetReranker !== undefined) {
       const explicitModel = await engine.getConfig('search.reranker.model');
@@ -237,7 +200,7 @@ export async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Ch
  * is mid-transition and retrieval may be degraded until it drains. Warn with
  * the exact resume + status commands.
  */
-export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise<Check> {
+export async function checkEmbeddingMigrationState(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     const { readMigrationState, migrationSignature, renderResumeCommand } = await import('../../../core/embedding-migration.ts');
     const marker = await readMigrationState(engine);
@@ -254,10 +217,14 @@ export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise
     const s = marker.state;
     let staleNote = '';
     try {
-      const stale = await engine.countStaleChunks({
-        signature: migrationSignature(s.to_model, s.to_dims),
-        includeNullSignature: true,
-      });
+      const signature = migrationSignature(s.to_model, s.to_dims);
+      // A remote caller's grant counts only its own sources' chunks.
+      let stale = 0;
+      if (opts.sourceIds) {
+        for (const sourceId of opts.sourceIds) stale += await engine.countStaleChunks({ sourceId, signature, includeNullSignature: true });
+      } else {
+        stale = await engine.countStaleChunks({ signature, includeNullSignature: true });
+      }
       staleNote = `; ${stale} chunk(s) not yet in the target space`;
     } catch { /* count is best-effort */ }
     return {
@@ -291,7 +258,11 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
           status: 'warn',
           message:
             `${source} is "${resolved}" but that provider/model lacks native tool calling. ` +
-            `The subagent loop cannot run on this model — runtime will fall back to claude-sonnet-4-6. ` +
+            `The subagent loop cannot run on this model — ` +
+            // #5432: an explicit models.subagent is not swapped; dispatch refuses it.
+            (source === 'models.subagent'
+              ? `jobs are refused at dispatch. `
+              : `runtime will fall back to claude-sonnet-4-6. `) +
             `Fix: \`gbrain config set ${source} <provider>:<model-with-tools>\` (e.g. anthropic:claude-sonnet-4-6 or openai:gpt-5.2).`,
         };
       }
@@ -388,11 +359,7 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
         : `Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability`,
     };
   } catch (e) {
-    return {
-      name: 'subagent_capability',
-      status: 'warn',
-      message: `Could not check subagent capability: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('subagent_capability', 'check subagent capability', e);
   }
 }
 
@@ -434,7 +401,7 @@ export function computeConversationParserProbeHealthCheck(
     return {
       name,
       status: 'ok',
-      message: 'enabled but no probe events in the last 7 days (next run by autopilot; fixtures require a source-checkout install).',
+      message: 'enabled but no probe events in the last 7 days (next run by autopilot).',
     };
   }
   const bad = events.filter(e => e.outcome !== 'pass');
@@ -455,9 +422,120 @@ export function computeConversationParserProbeHealthCheck(
   };
 }
 
+/** Panel fields of a probe audit row, read as untrusted JSON (absent on rows written before #5506). */
+interface ProbeJudgePanelFields {
+  judge_models?: unknown;
+  judge_scored_questions?: unknown;
+  distinct_judge_models?: unknown;
+  distinct_judge_providers?: unknown;
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * The latest run's judge panel, appended to the OK and the WARN message.
+ * A slot (A, B, C in slot order) that scored no question is named; among
+ * the slots that scored, a model holding two or more gets the remedy
+ * (three different models in the slot keys), and fewer than three
+ * providers get the not-cross-modal information. Empty for an event with
+ * missing or malformed panel fields, so its message stays as before; a row
+ * without valid per-slot scored counts treats every slot as having scored.
+ */
+function judgePanelNote(event: ProbeJudgePanelFields): string {
+  const models = event.judge_models;
+  const distinctModels = event.distinct_judge_models;
+  const distinctProviders = event.distinct_judge_providers;
+  if (!Array.isArray(models) || models.length === 0) return '';
+  if (!models.every((m: unknown): m is string => typeof m === 'string')) return '';
+  if (!isCount(distinctModels) || !isCount(distinctProviders)) return '';
+  const counts = event.judge_scored_questions;
+  const scored: number[] | null =
+    Array.isArray(counts) && counts.length === models.length && counts.every(isCount) ? counts : null;
+  const judged = (i: number): boolean => scored === null || scored[i]! > 0;
+  const silent = models
+    .map((m, i) => (judged(i) ? '' : ` Slot ${String.fromCharCode(65 + i)} (${m}) scored no question, so it did not judge.`))
+    .join('');
+  const panel =
+    ` Latest judge panel (slot order): ${models.join(', ')}; ` +
+    `${plural(distinctModels, 'distinct model')} from ${plural(distinctProviders, 'provider')}.${silent}`;
+  const judgedModels = models.filter((_, i) => judged(i));
+  const shared = judgedModels.filter((m: string, i: number) => judgedModels.indexOf(m) !== i);
+  if (shared.length > 0) {
+    return (
+      panel +
+      ` ${[...new Set(shared)].join(' and ')} holds more than one slot, so its votes count more than once. ` +
+      `Next step: set models.eval.cross_modal.slot_a, slot_b and slot_c to three different models ` +
+      `(gbrain config set models.eval.cross_modal.slot_a <model>; one provider is enough, ` +
+      `for example three claude-cli models).`
+    );
+  }
+  if (distinctProviders < 3) {
+    return panel + ` Fewer than 3 providers judged, so the panel is not cross-modal (information only).`;
+  }
+  return panel;
+}
+
+interface ProbeFailureFields {
+  failures?: ReadonlyArray<{ question_id?: string; dimensions?: ReadonlyArray<{ dimension: string; mean?: number; scores?: ReadonlyArray<number | null>; fail_reason: string }> }>;
+  reader_model?: string;
+  receipt_dir?: string;
+}
+
+/**
+ * #7145: which judge dimension the non-PASS runs failed on, against the bar (every dimension's mean across judges
+ * >= PASS_MEAN_THRESHOLD and every judge >= PASS_FLOOR_THRESHOLD, on the 1-10 scale), what the dimension asks
+ * (`rubric`: the probe's own dimension texts, PROBE_QA_DIMENSIONS), and where to look. A dimension failing while
+ * correctness never does means the answers were right and judged on style: the reader or the rubric, not retrieval.
+ * Empty when no run recorded a failing dimension.
+ */
+function probeFailureExplanation(bad: ReadonlyArray<ProbeFailureFields>, rubric: readonly string[]): { text: string; details?: Record<string, unknown> } {
+  const tally = new Map<string, { runs: number; questions: number; means: number[]; reasons: Set<string> }>();
+  for (const event of bad) {
+    const seen = new Set<string>();
+    for (const failure of event.failures ?? []) {
+      for (const d of failure.dimensions ?? []) {
+        const key = d.dimension.trim().toLowerCase();
+        const t = tally.get(key) ?? { runs: 0, questions: 0, means: [], reasons: new Set<string>() };
+        if (!seen.has(key)) { t.runs++; seen.add(key); }
+        t.questions++;
+        if (typeof d.mean === 'number' && Number.isFinite(d.mean)) t.means.push(d.mean);
+        t.reasons.add(d.fail_reason);
+        tally.set(key, t);
+      }
+    }
+  }
+  if (tally.size === 0) return { text: '' };
+  const dims = [...tally].sort((a, b) => b[1].questions - a[1].questions).map(([dimension, t]) => ({ dimension, runs: t.runs, questions: t.questions,
+    mean_min: t.means.length ? Math.min(...t.means) : null, mean_max: t.means.length ? Math.max(...t.means) : null, fail_reasons: [...t.reasons].sort() }));
+  const asks = (dimension: string) => rubric.find(r => r.split('—')[0]!.trim().toLowerCase() === dimension)?.split('—')[1]?.trim();
+  const range = (d: typeof dims[number]) => d.mean_min === null ? '' : `, judge mean ${d.mean_min}${d.mean_max !== d.mean_min ? `-${d.mean_max}` : ''}`;
+  const parts = dims.map(d => `${d.dimension} in ${plural(d.runs, 'run')} (${plural(d.questions, 'question')}${range(d)}; ${d.fail_reasons.join(', ')})`);
+  const top = dims[0]!;
+  const question = asks(top.dimension);
+  const styleOnly = !tally.has('correctness');
+  const latest = bad[bad.length - 1]!;
+  const receipt = [...bad].reverse().find(e => typeof e.receipt_dir === 'string')?.receipt_dir;
+  const text = ` Failing judge dimension(s): ${parts.join('; ')}. The bar is a mean of at least ${PASS_MEAN_THRESHOLD} across judges and no judge below ${PASS_FLOOR_THRESHOLD}, on a 1-10 scale.`
+    + (question ? ` ${top.dimension} asks: ${question}` : '')
+    + (styleOnly ? ` Correctness never failed, so the answers matched the expected facts and were judged on ${top.dimension} alone: this points at the reader's answer style`
+      + `${latest.reader_model ? ` (reader ${latest.reader_model})` : ''} or the judges' rubric, not at retrieval or your brain.` : '')
+    + ` Next: read the answers and per-judge scores the run kept ${receipt ? `in ${receipt} (lme-output.jsonl, summary.json)` : "under the audit dir's nightly-probe/ receipts"}; `
+    + 'an answer carrying notes or reasoning means the reader ran without --reader-mode direct (an autopilot daemon started before an upgrade keeps running the old probe: restart it); '
+    + "a terse correct answer scored low means the judges' rubric needs recalibrating (models.eval.cross_modal.slot_a, slot_b and slot_c choose the judges, models.eval.longmemeval the reader).";
+  return { text, details: { failing_dimensions: dims, bar: { mean_at_least: PASS_MEAN_THRESHOLD, every_judge_at_least: PASS_FLOOR_THRESHOLD, scale: '1-10' }, correctness_failed: !styleOnly,
+    ...(latest.reader_model ? { reader_model: latest.reader_model } : {}), ...(receipt ? { receipt_dir: receipt } : {}) } };
+}
+
 export function computeNightlyQualityProbeHealthCheck(
   probeEnabled: boolean,
-  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string }>,
+  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string } & ProbeJudgePanelFields & ProbeFailureFields>,
+  rubric: readonly string[] = [],
 ): Check {
   const name = 'nightly_quality_probe_health';
   if (!probeEnabled && events.length === 0) {
@@ -482,6 +560,7 @@ export function computeNightlyQualityProbeHealthCheck(
   const bad = events.filter(e => e.outcome !== 'pass');
   const latest = events[events.length - 1]!;
   if (bad.length > 0) {
+    const skipped = events.filter(e => e.outcome === 'skipped').length;
     const counts =
       `pass=${events.filter(e => e.outcome === 'pass').length} ` +
       `fail=${events.filter(e => e.outcome === 'fail').length} ` +
@@ -489,17 +568,20 @@ export function computeNightlyQualityProbeHealthCheck(
       `inconclusive=${events.filter(e => e.outcome === 'inconclusive').length} ` +
       `budget=${events.filter(e => e.outcome === 'budget_exceeded').length} ` +
       `no_embed_key=${events.filter(e => e.outcome === 'no_embedding_key').length} ` +
-      `rate_limited=${events.filter(e => e.outcome === 'rate_limited').length}`;
+      `rate_limited=${events.filter(e => e.outcome === 'rate_limited').length}` +
+      (skipped > 0 ? ` skipped=${skipped}` : '');
+    const explained = probeFailureExplanation(bad, rubric);
     return {
       name,
       status: 'warn',
-      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.`,
+      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.${judgePanelNote(latest)}${explained.text}`,
+      ...(explained.details ? { details: explained.details } : {}),
     };
   }
   return {
     name,
     status: 'ok',
-    message: `${events.length} PASS run${events.length === 1 ? '' : 's'} in last 7d. Latest: ${latest.ts}.`,
+    message: `${events.length} PASS run${events.length === 1 ? '' : 's'} in last 7d. Latest: ${latest.ts}.${judgePanelNote(latest)}`,
   };
 }
 
@@ -560,6 +642,9 @@ export async function computeConversationFactsBacklogCheck(
       }
     }
 
+    // #5330: the extractor's eligibility rule (aliases + conversation_parseable), not type alone.
+    const concreteTypes = pageTypesForAllowed(types as Parameters<typeof pageTypesForAllowed>[0]);
+    const strict = await requireParseableConversationFlag(engine);
     const rows = await engine.executeRaw<{
       backlog: string | number;
       completed: string | number;
@@ -583,7 +668,7 @@ export async function computeConversationFactsBacklogCheck(
           AND f.source_session = f.source || ':' || p.slug || ':page-' ||
             p.content_hash || '-' ||
             COALESCE(TO_CHAR(p.effective_date AT TIME ZONE 'UTC', 'YYYY-MM-DD'), 'none')
-         WHERE p.type = ANY($1::text[])
+         WHERE ${conversationFactsEligibleSql('p', '$1', strict)}
            AND p.deleted_at IS NULL
            AND COALESCE(BTRIM(p.frontmatter->>'raw_transcript'), '') = ''
            AND p.content_hash IS NOT NULL
@@ -594,7 +679,7 @@ export async function computeConversationFactsBacklogCheck(
          COALESCE(SUM(completed), 0) AS completed,
          COALESCE(SUM(CASE WHEN completed = 0 THEN non_extractable ELSE 0 END), 0) AS non_extractable
        FROM outcomes`,
-      [types],
+      [concreteTypes],
     );
 
     let backlog = Number(rows[0]?.backlog ?? 0);
@@ -610,17 +695,17 @@ export async function computeConversationFactsBacklogCheck(
     const verifierSources = await engine.executeRaw<{ source_id: string }>(
       `SELECT DISTINCT source_id
          FROM pages
-        WHERE type = ANY($1::text[])
+        WHERE ${conversationFactsEligibleSql('pages', '$1', strict)}
           AND deleted_at IS NULL
           AND (
             COALESCE(BTRIM(frontmatter->>'raw_transcript'), '') <> ''
             OR content_hash IS NULL
           )
         ORDER BY source_id`,
-      [types],
+      [concreteTypes],
     );
     for (const { source_id: sourceId } of verifierSources) {
-      for (const type of types) {
+      for (const type of concreteTypes) {
         let offset = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -632,6 +717,7 @@ export async function computeConversationFactsBacklogCheck(
           });
           if (batch.length === 0) break;
           const verifyInProcess = batch.filter((page) => {
+            if (!isConversationFactsEligiblePage(page, concreteTypes, strict)) return false;
             const raw = page.frontmatter?.raw_transcript;
             return (typeof raw === 'string' && raw.trim().length > 0) ||
               page.content_hash == null;

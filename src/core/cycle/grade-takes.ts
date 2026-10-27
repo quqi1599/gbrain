@@ -37,6 +37,7 @@
 import { createHash } from 'node:crypto';
 import { BaseCyclePhase, effectivePhaseDeadlineMs, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { hybridSearch } from '../search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import type { SearchResult } from '../types.ts';
 import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
@@ -45,15 +46,20 @@ import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, Take, TakeResolution } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { parseTakesFence } from '../takes-fence.ts';
+import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { utcDate } from './cycle-date.ts';
 
 /**
  * Bump when the judge prompt or the JSON output shape changes. Old verdicts
  * stay valid (composite cache key includes prompt_version); new runs re-spend
  * LLM tokens.
  */
-export const GRADE_TAKES_PROMPT_VERSION = 'hybrid-evidence-v1';
+export const GRADE_TAKES_PROMPT_VERSION = 'hybrid-evidence-v2';
 
-export const GRADE_TAKE_PROMPT = `[hybrid-evidence-v1] You are grading a single forecasting take. The author
+export const GRADE_TAKE_PROMPT = `[hybrid-evidence-v2] You are grading a single forecasting take. The author
 made this claim on the given date. Based on the evidence provided, did the
 claim turn out to be:
 - correct        (the world plays out as predicted)
@@ -68,6 +74,11 @@ Output ONLY one JSON object with these fields:
 
 If the evidence is sparse or ambiguous, return verdict='unresolvable' with
 confidence reflecting the lack of evidence (NOT certainty of unresolvable).
+
+Only evidence about the subject the claim names counts. A different company,
+person or product whose name merely resembles it (for example "Acme Health"
+for a claim about "Acme") is not evidence about the claim; when only such
+evidence speaks to the outcome, return 'unresolvable'.
 
 TAKE:
   Claim:    {CLAIM}
@@ -283,22 +294,52 @@ export function evidenceSignature(evidence: string, judgeModelId: string): strin
 }
 
 /**
- * Parse the judge model's JSON output. Tolerant of fence wrapping and
- * leading prose; returns null on unrecoverable parse failure.
+ * Parse the judge model's JSON output. Tolerant of fence wrapping and of
+ * prose before or after the object; returns null on unrecoverable parse
+ * failure or on two answers that disagree.
  */
 export function parseJudgeOutput(raw: string): JudgeVerdict | null {
   if (!raw || raw.trim().length === 0) return null;
   let text = raw.trim();
   const fenced = text.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
   if (fenced) text = (fenced[1] ?? '').trim();
-  const firstObj = text.indexOf('{');
-  if (firstObj === -1) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text.slice(firstObj));
-  } catch {
-    return null;
+  const verdicts = topLevelObjects(text).map(toVerdict).filter((v): v is JudgeVerdict => v !== null);
+  if (verdicts.length === 0) return null;
+  // W6: a judge sometimes answers twice ("Correction: ..."), and prose after
+  // the object used to fail the whole parse. Two answers that disagree are no
+  // verdict (retried next cycle, as #3910 does for any unparseable answer);
+  // answers that agree keep the lowest confidence, so a repeat can never raise
+  // what auto-resolve sees.
+  if (verdicts.some(v => v.verdict !== verdicts[0]!.verdict)) return null;
+  const last = verdicts[verdicts.length - 1]!;
+  return { ...last, confidence: Math.min(...verdicts.map(v => v.confidence)) };
+}
+
+/** Every top-level `{...}` in the text that parses as JSON, in order. */
+function topLevelObjects(text: string): unknown[] {
+  const out: unknown[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"' && depth > 0) inString = true;
+    else if (ch === '{') { if (depth++ === 0) start = i; }
+    else if (ch === '}' && depth > 0 && --depth === 0) {
+      try { out.push(JSON.parse(text.slice(start, i + 1))); } catch { /* not JSON: skip */ }
+    }
   }
+  return out;
+}
+
+function toVerdict(parsed: unknown): JudgeVerdict | null {
   if (typeof parsed !== 'object' || parsed === null) return null;
   const r = parsed as Record<string, unknown>;
   const validVerdicts = ['correct', 'incorrect', 'partial', 'unresolvable'] as const;
@@ -312,6 +353,9 @@ export function parseJudgeOutput(raw: string): JudgeVerdict | null {
 }
 
 /** #2811 — evidence retrieval knobs. */
+/** Auto-resolve applies a single-judge verdict at or above this confidence (D12). */
+export const GRADE_TAKES_AUTO_RESOLVE_THRESHOLD = 0.95;
+
 export const EVIDENCE_SEARCH_LIMIT = 8;
 export const EVIDENCE_ITEM_CLAMP_CHARS = 500;
 export const EVIDENCE_BLOCK_CAP_CHARS = 4000;
@@ -386,6 +430,7 @@ export async function defaultEvidenceRetriever(
 ): Promise<string> {
   try {
     const hits = await hybridSearch(engine, take.claim, {
+      ...INTERNAL_BREADTH_SEARCH_OPTS,
       limit: EVIDENCE_SEARCH_LIMIT,
       expansion: false,
       ...(scope.sourceIds && scope.sourceIds.length > 0
@@ -431,6 +476,7 @@ export async function defaultJudge(input: {
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens: 600,
+    allowFallback: false,
   });
   const parsed = parseJudgeOutput(result.text);
   if (!parsed) {
@@ -442,6 +488,22 @@ export async function defaultJudge(input: {
     throw new Error(`judge output parse failed: unparseable judge response (${result.text.length} chars)`);
   }
   return parsed;
+}
+
+/**
+ * The phase's work window: unresolved active takes, oldest-first. Takes too
+ * recent to grade are left out in SQL so they cannot fill the window, and
+ * takes with no verdict for this prompt and judge come first, so graded takes
+ * (which stay unresolved while auto-resolve is off) leave room for the ones
+ * behind them. takeIsOldEnough still runs on each take for dates SQL cannot read.
+ */
+function listGradeWindow(engine: BrainEngine, opts: { minAgeMonths: number; promptVersion: string; judgeModelId: string; limit: number }): Promise<Take[]> {
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - opts.minAgeMonths);
+  return engine.listTakes({
+    resolved: false, active: true, sortBy: 'since_date', oldestFirst: true, sinceOnOrBefore: utcDate(cutoff),
+    ungradedFirst: { promptVersion: opts.promptVersion, judgeModelId: opts.judgeModelId }, limit: opts.limit,
+  });
 }
 
 /**
@@ -510,7 +572,7 @@ class GradeTakesPhase extends BaseCyclePhase {
     const minAgeMonths = opts.minAgeMonths ?? 6;
     const takeLimit = opts.takeLimit ?? 50;
     const autoResolve = opts.autoResolve ?? false; // D17 default OFF
-    const autoResolveThreshold = opts.autoResolveThreshold ?? 0.95; // D12 conservative
+    const autoResolveThreshold = opts.autoResolveThreshold ?? GRADE_TAKES_AUTO_RESOLVE_THRESHOLD;
     const resolvedByLabel = opts.resolvedByLabel ?? 'gbrain:grade_takes';
     // One resolved string drives the judge call, the verdict-cache key, and
     // the stored judge_model_id — the convention propose_takes adopted in
@@ -573,18 +635,15 @@ class GradeTakesPhase extends BaseCyclePhase {
     // streak; auth/billing halt on the first hit.
     const llmHalt = createGlobalLlmHaltTracker();
 
-    // Load unresolved active takes, oldest-first.
-    const takes = await engine.listTakes({
-      resolved: false,
-      active: true,
-      sortBy: 'since_date',
-      limit: takeLimit,
-    });
+    const takes = await listGradeWindow(engine, { minAgeMonths, promptVersion, judgeModelId, limit: takeLimit });
 
     if (opts.reporter) {
       opts.reporter.start('grade_takes.takes' as never, takes.length);
     }
 
+    // #5280: a managed brain refuses the raw takes update; resolutions go
+    // through the coordinated, markdown-canonical takes_resolve mutation.
+    const managed = await managedPersistenceEnabled(engine);
     const now = new Date();
     for (const take of takes) {
       // Phase deadline check (gbrain#4168). Break, not throw: verdicts
@@ -781,7 +840,28 @@ class GradeTakesPhase extends BaseCyclePhase {
       // Apply to canonical takes if eligible.
       if (shouldApply && resolution) {
         try {
-          await engine.resolveTake(take.page_id, take.row_num, resolution);
+          if (managed) {
+            // Resolve the judged take by page identity, not the cached slug: a
+            // rename during judging must not redirect the resolution to another page.
+            const [page] = await engine.executeRaw<{ slug: string; source_id: string }>(
+              `SELECT p.slug, p.source_id FROM pages p JOIN takes t ON t.page_id=p.id
+                WHERE p.id=$1 AND p.deleted_at IS NULL AND t.row_num=$2 AND t.claim=$3`, [take.page_id, take.row_num, take.claim]);
+            if (!page) throw new Error('the judged take moved or changed during grading; it is graded again next run');
+            const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
+            // The resolution publishes against this exact revision, so the judged
+            // claim must be the row this revision's fence holds.
+            const fenced = snapshot ? parseTakesFence(snapshot.page.compiled_truth ?? '').takes.find(t => t.rowNum === take.row_num) : undefined;
+            if (!snapshot || snapshot.page.id !== take.page_id || fenced?.claim !== take.claim) {
+              throw new Error('the judged page changed during grading; it is graded again next run');
+            }
+            await submitPageMutation({ engine, config: { engine: engine.kind } as never, remote: false, sourceId: page.source_id,
+              dryRun: false, logger: { info() {}, warn() {}, error() {} } }, { operation: 'takes_resolve', params: {
+              slug: page.slug, source_id: page.source_id, expected_revision: snapshot.revision, row_num: take.row_num, quality: resolution.quality,
+              evidence: resolution.source, resolved_by: resolution.resolvedBy,
+              request_id: createHash('sha256').update(`grade_takes:${take.id}:${recordedSig}:${snapshot.revision}`).digest('hex').replace(/^(.{8})(.{4}).(.{3}).(.{3})(.{12}).*/, '$1-$2-4$3-a$4-$5') } });
+          } else {
+            await maintenanceTransaction(engine, tx => tx.resolveTake(take.page_id, take.row_num, resolution));
+          }
           result.auto_applied += 1;
 
           // T11 / E4 — gstack-learnings coupling on incorrect / partial
@@ -814,6 +894,11 @@ class GradeTakesPhase extends BaseCyclePhase {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           result.warnings.push(`auto-apply failed on take ${take.id}: ${msg}`);
+          // Managed: drop the cached verdict so the next run grades the take
+          // again instead of skipping it as already applied.
+          if (managed) await engine.executeRaw(`DELETE FROM take_grade_cache
+            WHERE take_id=$1 AND prompt_version=$2 AND judge_model_id=$3 AND evidence_signature=$4`,
+          [take.id, promptVersion, recordedJudgeModelId, recordedSig]);
         }
       }
 

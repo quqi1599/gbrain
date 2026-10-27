@@ -15,6 +15,7 @@ import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { submitRememberMutation } from '../src/core/persistence/memory-mutations.ts';
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
 import { reviewedWriterIntent } from './helpers/writer-admin-intent.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 let diskEngine: PGLiteEngine;
 beforeAll(() => { diskEngine = new PGLiteEngine(); });
@@ -37,8 +38,26 @@ describe('source lifecycle CLI', () => {
       '--access', 'env', '--token-env', 'EXAMPLE_TOKEN', '--services', 'calendar', '--dir', '.'], id);
     expect(google.params).toMatchObject({ request_id: id, options: { id: 'example', requestId: id,
       google: { tokenEnv: 'EXAMPLE_TOKEN', access: 'env', services: ['calendar'], dir: process.cwd() } } });
+    // #5442 / #5445: the per-source calendar horizon and loop exclusion labels ride the same add.
+    const tuned = parseSourceLifecycleArgs(['add', 'example', '--kind', 'google', '--account', 'account@example.invalid',
+      '--future-days', '365', '--loops-exclude-labels', 'Newsletters, Label_7', '--contacts-dir', '/contacts/', '--dir', '.'], id);
+    expect(tuned.params).toMatchObject({ options: { google: { futureDays: 365, loopsExcludeLabels: ['Newsletters', 'Label_7'], contactsDir: 'contacts' } } });
+    expect(google.params).not.toHaveProperty('options.google.contactsDir');
+    expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'google', '--account', 'account@example.invalid', '--contacts-dir', '../people'])).toThrow('contacts-dir');
+    expect(google.params).not.toHaveProperty('options.google.futureDays');
+    expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'google', '--account', 'account@example.invalid', '--future-days', '0'])).toThrow('positive integer');
+    expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'google', '--account', 'account@example.invalid', '--future-days', '4000'])).toThrow('3650');
     expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'github', '--scope', 'repos'])).toThrow('valid owner/name');
     expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'google', '--account', 'account@example.invalid', '--access', 'command'])).toThrow('access');
+  });
+
+  test('usage refusals name their own next step and offer the verb help', async () => {
+    expectFunnelSuggestions('src/commands/sources-lifecycle-args.ts', 'invalid', 20);
+    const misplaced = envelopeFor(await caught(() => parseSourceLifecycleArgs(['archive', 'example', '--force'])));
+    expect(misplaced).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'archive', '--help'], next: 'run' } });
+    expect(misplaced.suggestion).toContain('Remove --force; sources archive accepts');
+    const githubOnly = envelopeFor(await caught(() => parseSourceLifecycleArgs(['add', 'example', '--repos', 'acme-example/notes'])));
+    expect(githubOnly.suggestion).toContain('Add --kind github for --repos');
   });
 
   test('actual CLI source writes use the resident owner, replay after deletion, and share page request identity', async () => {

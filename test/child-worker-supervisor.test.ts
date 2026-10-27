@@ -32,6 +32,7 @@ import {
   type ChildSupervisorEvent,
 } from '../src/core/minions/child-worker-supervisor.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { detectTini } from '../src/core/minions/spawn-helpers.ts';
 
 /**
  * Per-test bun timeout for the spawn-driving tests. Generous because each test
@@ -807,6 +808,58 @@ describe('ChildWorkerSupervisor', () => {
         h.cleanup();
       }
     }, TEST_TIMEOUT_MS);
+
+    // #5062 (fix wave 9): the composer shutdown path (MinionSupervisor) is
+    // SIGTERM → drain window → SIGKILL by liveness → confirmed exit, and it
+    // decides "drained" from lastExit, which must be recorded while stopping.
+    async function runForStop(cliPath: string, args: string[]) {
+      let stopping = false;
+      let resolveSpawn: (pid: number) => void;
+      const firstSpawn = new Promise<number>((r) => { resolveSpawn = r; });
+      const sup = new ChildWorkerSupervisor({
+        cliPath,
+        args,
+        maxCrashes: 100,
+        _backoffFloorMs: 5,
+        isStopping: () => stopping,
+        onMaxCrashesExceeded: () => { stopping = true; },
+        onEvent: (e) => { if (e.kind === 'worker_spawned') resolveSpawn(e.pid); },
+      });
+      const runPromise = sup.run();
+      const pid = await firstSpawn;
+      return { sup, pid, runPromise, beginStop: () => { stopping = true; } };
+    }
+
+    it.skipIf(process.platform === 'win32')('stop sequence: a SIGTERM-ignoring worker needs SIGKILL and lastExit records the kill (#5062)', async () => {
+      const ctx = await runForStop('/bin/sh', ['-c', 'trap "" TERM; exec sleep 30']);
+      await sleep(200);
+      ctx.beginStop();
+      ctx.sup.killChild('SIGTERM');
+      await ctx.sup.awaitChildExit(300);
+      expect(ctx.sup.childAlive).toBe(true);
+      ctx.sup.killChild('SIGKILL');
+      await ctx.sup.awaitChildExit(5_000);
+      expect(ctx.sup.childAlive).toBe(false);
+      expect(isAlive(ctx.pid)).toBe(false);
+      expect(ctx.sup.lastExit).toEqual({ code: null, signal: 'SIGKILL' });
+      await ctx.runPromise;
+    }, TEST_TIMEOUT_MS);
+
+    it('stop sequence: a worker that drains on SIGTERM leaves lastExit code 0 (#5062)', async () => {
+      const h = makeHarness('stop-cooperative', "process.on('SIGTERM', () => process.exit(0));\nsetTimeout(() => {}, 30_000);");
+      try {
+        const ctx = await runForStop(h.cliPath, h.args);
+        await sleep(300);
+        ctx.beginStop();
+        ctx.sup.killChild('SIGTERM');
+        await ctx.sup.awaitChildExit(10_000);
+        expect(ctx.sup.childAlive).toBe(false);
+        expect(ctx.sup.lastExit).toEqual({ code: 0, signal: null });
+        await ctx.runPromise;
+      } finally {
+        h.cleanup();
+      }
+    }, TEST_TIMEOUT_MS);
   });
 
   // A worker that can NEVER launch (bad cliPath, missing binary, a target the
@@ -835,7 +888,7 @@ describe('ChildWorkerSupervisor', () => {
       };
     }
 
-    it('settles the run loop instead of hanging, and counts each failure as a crash', async () => {
+    it('settles the run loop instead of hanging, and counts each failure as a crash', async () => withEnv({ PATH: '' }, async () => {
       const h = makeUnlaunchableHarness('enoent');
       const { events, maxCrashesFired } = await runUntilTerminal(h, {
         maxCrashes: 2,
@@ -874,6 +927,17 @@ describe('ChildWorkerSupervisor', () => {
       );
       expect(backoffs.length).toBeGreaterThanOrEqual(1);
       expect(backoffs.every((b) => b.reason === 'crash')).toBe(true);
+    }), TEST_TIMEOUT_MS);
+
+    it.skipIf(!detectTini())('bounds a missing executable behind tini at the same hard ceiling', async () => {
+      const { events, maxCrashesFired } = await runUntilTerminal(makeUnlaunchableHarness('tini-enoent'), {
+        maxCrashes: 2, hardStopMaxCrashes: 3, _backoffFloorMs: 1,
+      });
+      expect(maxCrashesFired).toEqual({ count: 3, max: 3 });
+      const exits = events.filter((e): e is Extract<ChildSupervisorEvent, { kind: 'worker_exited' }> => e.kind === 'worker_exited');
+      expect(exits).toHaveLength(3);
+      expect(exits.map(e => e.crashCount)).toEqual([1, 2, 3]);
+      expect(exits.every(e => e.code === 127)).toBe(true);
     }, TEST_TIMEOUT_MS);
 
     it('honours isStopping so a shutdown mid-failure does not keep respawning', async () => {

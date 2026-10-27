@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, test, afterEach } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
@@ -197,6 +197,25 @@ describe('post-peel dispatch smoke [ENG-E5]', () => {
 });
 
 describe('scaffold --harness openclaw (workspace delegation)', () => {
+  test('default installs the brain-first core only; --all installs the full bundle', () => {
+    const { home, gbrainHome } = homes();
+    const ws = mkdtempSync(join(tmpdir(), 'gb-harness-ws-'));
+    const full = mkdtempSync(join(tmpdir(), 'gb-harness-ws-'));
+    cleanups.push(ws, full);
+    const env = { HOME: home, GBRAIN_HOME: gbrainHome };
+    const r = run(['scaffold', '--harness', 'openclaw', '--workspace', ws, '--json'], env);
+    expect(r.code, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).persona).toBe('core');
+    const skillDirs = (dir: string) => readdirSync(join(dir, 'skills'), { withFileTypes: true })
+      .filter(e => e.isDirectory() && existsSync(join(dir, 'skills', e.name, 'SKILL.md'))).map(e => e.name).sort();
+    expect(skillDirs(ws)).toEqual(['brain-ops', 'capture', 'data-loss-gate', 'query', 'resolve-before-asking']);
+    expect(existsSync(join(ws, 'skills', 'conventions', 'brain-first.md'))).toBe(true);
+    const all = run(['scaffold', '--harness', 'openclaw', '--workspace', full, '--all', '--json'], env);
+    expect(all.code, all.stderr).toBe(0);
+    expect(JSON.parse(all.stdout).persona).toBe('all');
+    expect(skillDirs(full).length).toBeGreaterThan(50);
+  }, 120_000);
+
   test('--skill picks filter the workspace scaffold; plugin-lane additions are reported skipped, not thrown', () => {
     const { home, gbrainHome } = homes();
     const ws = mkdtempSync(join(tmpdir(), 'gb-harness-ws-'));
@@ -432,4 +451,46 @@ describe('review-driven CLI hardening', () => {
     expect(r.code, r.stderr).toBe(0);
     expect(readFileSync(join(dest, 'query', 'SKILL.md'), 'utf-8')).toContain('gbrain-skill-stub');
   }, 180_000);
+});
+
+// #5912: the shared-dependency ledger key `_shared` is not a skill, and the
+// scaffold's "Update lens" hint must run verbatim with the targeting flags the
+// user passed.
+describe('reference --harness after a scaffold (#5912)', () => {
+  test('no slug: the lens covers the installed skills, never the reserved shared-dep key', () => {
+    const { home, gbrainHome } = homes();
+    const env = { HOME: home, GBRAIN_HOME: gbrainHome, CLAUDE_CONFIG_DIR: '' };
+    const dest = join(home, 'dest');
+    expect(run(['scaffold', '--harness', 'claude-code', '--skill', 'query', '--dest', dest], env).code).toBe(0);
+    const all = run(['reference', '--harness', 'claude-code', '--dest', dest, '--json'], env);
+    expect(all.code, all.stderr).toBe(0);
+    const one = run(['reference', '--harness', 'claude-code', 'query', '--dest', dest, '--json'], env);
+    expect(one.code, one.stderr).toBe(0);
+    expect(JSON.parse(all.stdout).summary).toEqual(JSON.parse(one.stdout).summary);
+    expect(all.stdout).not.toContain('_shared');
+  });
+
+  test('no slug after a full remove falls back to the default selection instead of failing', () => {
+    const { home, gbrainHome } = homes();
+    const env = { HOME: home, GBRAIN_HOME: gbrainHome, CLAUDE_CONFIG_DIR: '' };
+    const dest = join(home, 'dest');
+    expect(run(['scaffold', '--harness', 'claude-code', '--skill', 'query', '--dest', dest], env).code).toBe(0);
+    expect(run(['remove', '--harness', 'claude-code', '--dest', dest, '--skill', 'query'], env).code).toBe(0);
+    const r = run(['reference', '--harness', 'claude-code', '--dest', dest, '--json'], env);
+    expect(r.code, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).summary.missing).toBeGreaterThan(0);
+  });
+
+  test('the printed Update lens command runs verbatim with the scaffold\'s --dest', () => {
+    const { home, gbrainHome } = homes();
+    const env = { HOME: home, GBRAIN_HOME: gbrainHome, CLAUDE_CONFIG_DIR: '' };
+    const dest = join(home, 'codex-skills');
+    const s = run(['scaffold', '--harness', 'codex', '--skill', 'query', '--dest', dest], env);
+    expect(s.code, s.stderr).toBe(0);
+    const hint = /Update lens: gbrain skillpack (.+?) \| remove: gbrain skillpack (.+)$/m.exec(s.stdout);
+    expect(hint).not.toBeNull();
+    for (const cmd of [hint![1], hint![2]]) expect(cmd).toContain(`--dest ${dest}`);
+    const lens = run(hint![1].split(' '), env);
+    expect(lens.code, lens.stderr).toBe(0);
+  });
 });

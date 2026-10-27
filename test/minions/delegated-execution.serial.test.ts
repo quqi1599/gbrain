@@ -174,7 +174,10 @@ describe('remote-owned production tool visibility', () => {
     }
     await expect(invoke('put_page', { slug: 'wiki/agents/HIDDEN', content: 'Replacement' })).rejects.toThrow();
     await expect(invoke('add_timeline_entry', { slug: 'wiki/agents/hidden', date: '2026-08-01', summary: 'Unwanted entry' })).rejects.toThrow('outside your write visibility');
-    await expect(invoke('put_page', { slug: 'wiki/agents/alias', content: '---\nid: private-fixture-id\n---\nReplacement' })).rejects.toMatchObject({ code: 'permission_denied' });
+    // Echoing the private page's frontmatter.id with different content is not a
+    // duplicate: it writes only the requested visible slug and never the private page.
+    const echoed = await invoke('put_page', { slug: 'wiki/agents/alias', content: '---\nid: private-fixture-id\n---\nReplacement' }) as { slug: string; status: string };
+    expect(echoed).toMatchObject({ slug: 'wiki/agents/alias', status: 'created_or_updated' });
     expect((await engine.getPage('wiki/agents/hidden', { sourceId: 'default' }))?.compiled_truth).toContain('private-body-marker');
     expect(await engine.getTimeline('wiki/agents/hidden', { sourceId: 'default' })).toHaveLength(0);
     await engine.softDeletePage('wiki/agents/hidden', { sourceId: 'default' });
@@ -262,6 +265,20 @@ describe('durable delegated provider accounting', () => {
     }, sdkInvocationUsage));
     const rows = await engine.executeRaw<{ status: string; actual_cents: string }>('SELECT status,actual_cents::text FROM mcp_spend_reservations');
     expect(rows[0].status).toBe('settled'); expect(Number(rows[0].actual_cents)).toBeCloseTo(0.0105, 4);
+  });
+  it('delegated local calls honor registered prices while retaining finite caps', async () => {
+    const previous = await engine.getConfig('pricing.overrides');
+    await engine.setConfig('pricing.overrides', '{"litellm:quality":{"input":0,"output":0}}');
+    try {
+      const ctx = await ownedJob(0.05);
+      let calls = 0;
+      await owned(ctx, () => invokeAI({ ...CALL, model: 'litellm:quality' }, async () => { calls++; return result(); }, sdkInvocationUsage));
+      const rows = await engine.executeRaw<{ status: string; actual_cents: string }>('SELECT status,actual_cents::text FROM mcp_spend_reservations');
+      expect(calls).toBe(1);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].status).toBe('settled');
+      expect(Number(rows[0].actual_cents)).toBe(0);
+    } finally { await engine.setConfig('pricing.overrides', previous ?? '{}'); }
   });
   it('finite caps refuse unknown prices or absent enforced bounds before IO', async () => {
     const ctx = await ownedJob(1); let calls = 0;

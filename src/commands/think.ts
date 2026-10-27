@@ -10,7 +10,9 @@ import { runThink, persistSynthesis, stripGapsSection } from '../core/think/inde
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { canonicalLookup } from '../core/model-pricing.ts';
-import { embedQuery } from '../core/embedding.ts';
+import { embedQueryWithPrefix } from '../core/search/query-prefix.ts';
+import { keylessThinkNotice } from '../core/interop-notices.ts';
+import { applyCliOpNotices, captureOpNotice } from '../cli/op-notices.ts';
 
 function flagValue(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -60,6 +62,9 @@ Options:
                            or archived source is a hard error (exit 1).
   --since YYYY-MM-DD       Start of temporal window
   --until YYYY-MM-DD       End of temporal window
+  --reference-date YYYY-MM-DD
+                           Date the question's relative time words ("last month")
+                           resolve against (default: today in brain.timezone)
   --with-calibration       Inject the active calibration profile (anti-bias rewrite)
   --calibration-holder <h> Holder whose calibration profile to use (default: self)
   --json                   Output as JSON
@@ -69,6 +74,9 @@ Without --save, the synthesis is printed to stdout and discarded. With --save,
 the synthesis page is persisted AND printed. If --save is given but no synthesis
 was produced (no LLM available, or empty result), nothing is saved and the command
 exits non-zero.
+
+Dates: the reader sees today's date in brain.timezone and each page's content
+date; see docs/guides/time-aware-recall.md.
 
 Set ANTHROPIC_API_KEY (or run: gbrain config set anthropic_api_key ...) to run
 real synthesis. Without it AND without --save, the gather phase still runs and
@@ -81,7 +89,7 @@ prints what would have been the input (exit 0).
   // #4508: --source and --calibration-holder were MISSING here — the flag and
   // its value joined the positional question, so `think "q" --source X`
   // echoed `# --source X q` and silently ignored the scope.
-  const flagNames = ['--anchor', '--rounds', '--model', '--since', '--until', '--source', '--calibration-holder'];
+  const flagNames = ['--anchor', '--rounds', '--model', '--since', '--until', '--source', '--calibration-holder', '--reference-date'];
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -104,6 +112,7 @@ prints what would have been the input (exit 0).
   const model = flagValue(args, '--model');
   const since = flagValue(args, '--since');
   const until = flagValue(args, '--until');
+  const referenceDate = flagValue(args, '--reference-date');
   // v0.36.1.0 (E1, D22) — anti-bias rewrite mode. Off by default (no
   // regression for existing think users). When on, the active calibration
   // profile gets injected per D22 placement (after retrieval, before question).
@@ -147,6 +156,7 @@ prints what would have been the input (exit 0).
     }
     const raw = await callRemoteTool(cfg!, 'think', {
       question, anchor, rounds, model, since, until,
+      ...(referenceDate ? { reference_date: referenceDate } : {}),
       // save/take intentionally NOT forwarded — server would ignore them;
       // we surface the intent above so users know what they lose.
     }, { timeoutMs: 180_000 });
@@ -167,7 +177,7 @@ prints what would have been the input (exit 0).
       let allowedSources: string[] | undefined;
       const { resolveSourceWithTier, localFederatedSourceIds, ALL_SOURCES } =
         await import('../core/source-resolver.ts');
-      const { isUndefinedTableError } = await import('../core/utils.ts');
+      const { isMissingSchemaObject } = await import('../core/utils.ts');
       try {
         const resolved = await resolveSourceWithTier(engine, source ?? null);
         // __all__ spans the brain; runThink has no sentinel handling of its
@@ -178,15 +188,16 @@ prints what would have been the input (exit 0).
         // Only the structural pre-init failure (no sources table) keeps the
         // legacy unscoped gather; every other resolver error — an unknown
         // ambient source, a connection failure, a genuine bug — propagates.
-        if (source !== undefined || !isUndefinedTableError(err)) throw err;
+        if (source !== undefined || !isMissingSchemaObject(err, 'table', 'sources')) throw err;
       }
       result = await runThink(engine, {
         question, anchor, rounds, save, take, model, since, until,
+        ...(referenceDate ? { referenceDate } : {}),
         // Fail-closed trust: local CLI must say so explicitly, or trajectory
         // injection degrades to visibility='world' rows.
         remote: false,
         // #3734: activate takes' vector retrieval arm for CLI think.
-        embedQuestion: (q) => embedQuery(q),
+        embedQuestion: (q) => embedQueryWithPrefix(engine, q),
         // #4508/#4652: thread the validated scope (RunThinkOpts.sourceId /
         // allowedSources — the array wins inside runGather, same as search).
         ...(sourceId ? { sourceId } : {}),
@@ -203,7 +214,7 @@ prints what would have been the input (exit 0).
 
       // Persist if --save (the runThink path doesn't auto-persist; CLI does it explicitly)
       if (save) {
-        const persisted = await persistSynthesis(engine, result);
+        const persisted = await persistSynthesis(engine, result, { sourceId, allowedSources });
         savedSlug = persisted.slug || undefined;  // '' = persist-skip signal (#10)
         evidenceInserted = persisted.evidenceInserted;
         for (const w of persisted.warnings) result.warnings.push(w);
@@ -250,16 +261,21 @@ prints what would have been the input (exit 0).
     result.modelUsed,
   );
 
+  // F8: keyless-by-design output carries its explanation as an info notice.
+  if (result.synthesis_status === 'no_llm') captureOpNotice(keylessThinkNotice());
+  const { persist_base: _persistBase, ...visible } = result;
+  const { result: jsonDoc, stderr: noticeText } = applyCliOpNotices({
+    ...visible,
+    cost_usd: costUsd ?? null,
+    saved_slug: savedSlug ?? null,
+    evidence_inserted: evidenceInserted,
+    take_row: takeRow,
+  }, json);
   if (json) {
-    console.log(JSON.stringify({
-      ...result,
-      cost_usd: costUsd ?? null,
-      saved_slug: savedSlug ?? null,
-      evidence_inserted: evidenceInserted,
-      take_row: takeRow,
-    }, null, 2));
+    console.log(JSON.stringify(jsonDoc, null, 2));
     return;
   }
+  if (noticeText) process.stderr.write(noticeText);
 
   // Human-readable output
   console.log(`# ${question}\n`);
@@ -272,7 +288,8 @@ prints what would have been the input (exit 0).
   }
   console.log('---');
   const costSuffix = costUsd !== undefined ? ` | Cost: $${costUsd.toFixed(4)}` : '';
-  console.log(`Model: ${result.modelUsed} | Pages: ${result.pagesGathered} | Takes: ${result.takesGathered} | Graph: ${result.graphHits} | Citations: ${result.citations.length}${costSuffix}`);
+  const fallbackNote = result.requested_model ? ` (fallback from ${result.requested_model}${result.fallback_reason ? `: ${result.fallback_reason}` : ''})` : '';
+  console.log(`Model: ${result.modelUsed}${fallbackNote} | Pages: ${result.pagesGathered} | Takes: ${result.takesGathered} | Graph: ${result.graphHits} | Citations: ${result.citations.length}${costSuffix}`);
   if (savedSlug) {
     console.log(`Saved: ${savedSlug} (${evidenceInserted} evidence rows)`);
   }

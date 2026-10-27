@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import type { SearchResult } from '../types.ts';
-import { rerank as gatewayRerank, RerankError, type RerankInput, type RerankResult } from '../ai/gateway.ts';
+import { rerank as gatewayRerank, RerankError, type RerankInput, type RerankMeta, type RerankResult } from '../ai/gateway.ts';
 import { BudgetExhausted } from '../budget/budget-tracker.ts';
 import { logRerankFailure, type RerankFailureReason } from '../rerank-audit.ts';
 import { estimateTokens } from '../chunkers/token-estimate.ts';
@@ -36,10 +36,30 @@ export interface RerankerOpts {
   rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
 
   onSkip?: (reason: RerankSkipReason) => void;
+  /**
+   * Fired when the reranker call failed hard (HTTP error, timeout, budget,
+   * network, …) and the results passed through in RRF order. hybridSearch
+   * stamps it as the `rerank_failed` degraded stage. Best-effort.
+   */
+  onFailure?: (reason: RerankFailedReason) => void;
+  /** System One reranker call facts (resolved model, rubric semantics). Best-effort. */
+  onMeta?: (meta: RerankMeta) => void;
 }
 
 /** The two skip classes (no HTTP call, no per-query audit row). */
 export type RerankSkipReason = 'no_key';
+
+/**
+ * A reranker call that threw (anything but a missing key), as stamped on the
+ * wire: no answer within the timeout, a spend cap, HTTP 429 (provider rate or
+ * concurrency limit), no HTTP response at all (connection refused, DNS — a
+ * wrong base URL looks like this), HTTP 401/403, or any other provider error.
+ */
+export type RerankFailedReason = 'timeout' | 'budget' | 'rate_limited' | 'unreachable' | 'auth' | 'provider_error';
+
+const FAILED_REASON: Partial<Record<RerankFailureReason, RerankFailedReason>> = {
+  timeout: 'timeout', budget: 'budget', rate_limit: 'rate_limited', unreachable: 'unreachable', auth: 'auth',
+};
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
 function hashQuery(query: string): string {
@@ -123,6 +143,7 @@ export async function applyReranker(
   const documents = head.map(r => capRerankDoc(r.chunk_text || r.title || ''));
 
   let reranked: RerankResult[];
+  let rerankMeta: RerankMeta | undefined;
   try {
     const rerankerFn = opts.rerankerFn ?? gatewayRerank;
     reranked = await rerankerFn({
@@ -130,6 +151,7 @@ export async function applyReranker(
       documents,
       timeoutMs: opts.timeoutMs,
       ...(opts.model ? { model: opts.model } : {}),
+      onMeta: (m) => { rerankMeta = m; },
     });
   } catch (err) {
     const reason = classifyRerankFailure(err);
@@ -149,6 +171,8 @@ export async function applyReranker(
     } catch {
       // Audit logging must never break search.
     }
+    const failed = FAILED_REASON[reason] ?? 'provider_error';
+    try { opts.onFailure?.(failed); } catch { /* caller hook must never break search */ }
     return results;
   }
 
@@ -195,9 +219,26 @@ export async function applyReranker(
   // (so a top_n response with fewer items than head.length naturally
   // drops the missing ones — but since we don't pass top_n by default,
   // every input gets a score).
+  // #5428: exact score ties carry no cross-encoder preference, and providers
+  // emit tied rows in arbitrary (call-to-call unstable) order. Within each run
+  // of adjacent, exactly equal finite scores, keep the fused (input) order.
+  // Rows never cross a different score.
+  const ordered = [...reranked];
+  for (let start = 0; start < ordered.length; ) {
+    let end = start + 1;
+    const score = ordered[start].relevanceScore;
+    if (Number.isFinite(score)) {
+      while (end < ordered.length && ordered[end].relevanceScore === score) end++;
+      if (end - start > 1) {
+        const run = ordered.slice(start, end).sort((a, b) => a.index - b.index);
+        ordered.splice(start, run.length, ...run);
+      }
+    }
+    start = end;
+  }
   const seen = new Set<number>();
   const reorderedHead: SearchResult[] = [];
-  for (const r of reranked) {
+  for (const r of ordered) {
     if (r.index >= 0 && r.index < head.length && !seen.has(r.index)) {
       seen.add(r.index);
       const item = head[r.index]!;
@@ -205,6 +246,7 @@ export async function applyReranker(
       // (telemetry, debug, autocut) can see the new ordering signal. Doesn't
       // replace `score` — that's RRF and other consumers may depend on it.
       item.rerank_score = r.relevanceScore;
+      if (rerankMeta?.score_semantics === 'rubric') item.rerank_score_kind = 'rubric';
       // v0.40.4 attribution stamp (D12=A) — rank delta. Positive means
       // rank improved (moved closer to top). new_index is the next
       // push position in reorderedHead; original index was r.index.
@@ -219,6 +261,9 @@ export async function applyReranker(
     if (!seen.has(i)) reorderedHead.push(head[i]!);
   }
 
+  if (rerankMeta) {
+    try { opts.onMeta?.(rerankMeta); } catch { /* caller hook must never break search */ }
+  }
   const combined = [...reorderedHead, ...tail];
   return opts.topNOut !== null && opts.topNOut > 0
     ? combined.slice(0, opts.topNOut)

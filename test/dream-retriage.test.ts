@@ -18,6 +18,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { runDreamRetriage } from '../src/commands/dream-retriage.ts';
+import { _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { runDream } from '../src/commands/dream.ts';
 import { TRIAGE_VERSION, CHARS_PER_TOKEN } from '../src/core/cycle/synthesize.ts';
 import { canonicalLookup } from '../src/core/model-pricing.ts';
@@ -143,6 +144,7 @@ async function withoutAnthropicKey<T>(body: () => Promise<T>): Promise<T> {
 
 afterEach(() => {
   process.exitCode = 0;
+  _resetCliExitVerdictForTests();
 });
 
 describe('dream retriage — dispatch + usage', () => {
@@ -485,7 +487,7 @@ describe('dream retriage — reconcile matrix', () => {
       });
       await withoutAnthropicKey(() =>
         runDreamRetriage(rig.engine, ['--audit-rejects', '100000', '--json']));
-      expect(process.exitCode).toBe(2); // gate fired without --yes
+      expect(process.exitCode).toBe(3); // consent gate fired without --yes (confirmation_required)
       const rows = await rig.engine.executeRaw<{ n: number }>(
         `SELECT COUNT(*)::int AS n FROM dream_verdicts WHERE model <> 'ollama:totally-unpriced-model'`);
       expect(rows[0].n).toBe(0); // nothing audited
@@ -751,7 +753,7 @@ describe('dream retriage — spend gate (C12)', () => {
     await rig.engine.setConfig('dream.triage.max_chars', String(charsForGate));
   }
 
-  test('non-interactive gate: un-triaged files + --json without --yes → exit 2, nothing judged', async () => {
+  test('non-interactive gate: un-triaged files + --json without --yes → exit 3 (confirmation_required), nothing judged', async () => {
     const rig = await setupRig();
     try {
       // Two un-cached files × a priced frontier model × a pricing-derived
@@ -760,7 +762,7 @@ describe('dream retriage — spend gate (C12)', () => {
       writeTranscript(rig.corpusDir, '2026-08-11-a.txt');
       writeTranscript(rig.corpusDir, '2026-08-12-b.txt');
       await withoutAnthropicKey(() => runDreamRetriage(rig.engine, ['--json']));
-      expect(process.exitCode).toBe(2);
+      expect(process.exitCode).toBe(3);
       // Nothing was judged or cached.
       const rows = await rig.engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM dream_verdicts`);
       expect(rows[0].n).toBe(0);

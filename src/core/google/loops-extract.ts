@@ -25,10 +25,17 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { assertUnmanagedCanonicalWriter } from '../persistence/maintenance.ts';
+import { managedFactWritePreflight } from '../facts/managed-fact-write.ts';
 import { loadSuppressions, upsertOpenLoop, type LoopType } from '../loops/loops-store.ts';
 import { isCalendarSystemMail, isNoiseSender, sha8 } from './google-render.ts';
+import { hasBulkCategory } from './gmail-categories.ts';
+import { isExcludedByLabels, loadLoopsExclusionPolicy, NO_EXCLUSION, pageLabelIds, type LoopsExclusionPolicy } from './loops-exclusion.ts';
 import { bareAddress, type GmailMessageMeta, type GmailThreadData } from './types.ts';
+import { resolveCounterparty, type ResolvedCounterparty } from './counterparty.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { deriveTrust } from '../trust/taint.ts';
+import { applyGateDecision, derivedGateConfig, derivedGateInput } from '../trust/derived-gate.ts';
+import { decideFactWrite } from '../write-gate-store.ts';
 
 export const LOOPS_EXTRACT_JOB = 'loops_extract';
 /**
@@ -50,9 +57,17 @@ export const LOOPS_EXTRACT_MAX_PER_SWEEP = 50;
 export const LOOPS_EXTRACT_ENQUEUE_CEILING = 500;
 /** Only threads whose newest message is within this window get extracted. */
 export const LOOPS_EXTRACT_WINDOW_DAYS = 30;
+/**
+ * Judge output caps (#3763 parity with propose_takes). A dense thread can
+ * extract more loops than the base cap carries, and thinking models spend
+ * reasoning tokens inside it. A retry at the same cap truncates identically,
+ * so a `length` stop retries once at the escalated cap; a second truncation
+ * fails the job with the ceiling named.
+ */
+const LOOPS_EXTRACT_MAX_TOKENS = 2048;
+const LOOPS_EXTRACT_RETRY_MAX_TOKENS = 8192;
 
-/** Gmail categories that are bulk by construction. */
-const BULK_CATEGORY_LABELS = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL', 'CATEGORY_FORUMS'];
+export { BULK_CATEGORY_LABELS } from './gmail-categories.ts';
 
 export interface ExtractEligibility {
   eligible: boolean;
@@ -63,7 +78,9 @@ export interface ExtractEligibility {
     | 'spam_or_trash'
     | 'no_substantive_messages'
     | 'bulk_category'
-    | 'list_mail';
+    | 'list_mail'
+    | 'excluded_label'
+    | 'excluded_label_unresolved';
 }
 
 /**
@@ -87,10 +104,18 @@ export interface ExtractEligibility {
  *
  * CATEGORY_UPDATES is deliberately NOT excluded: invoices, contracts and
  * document requests land there, and they carry real obligations.
+ *
+ * #5445: a thread under one of the user's excluded labels (`exclusion`) is
+ * never extracted, and this beats the owner override: warm-up mail is sent
+ * FROM the owner's address, which is exactly why no mute can exclude it. A
+ * policy that could not be resolved (an unknown label name, a failed label
+ * list) fails CLOSED for new paid extraction: `excluded_label_unresolved`,
+ * counted in the sweep summary and retried on the next sweep.
  */
 export function loopExtractionEligibility(
   thread: GmailThreadData,
   myAddresses: Set<string> = new Set(),
+  exclusion: LoopsExclusionPolicy = NO_EXCLUSION,
 ): ExtractEligibility {
   const messages = thread.messages;
   if (messages.length === 0) return { eligible: false, reason: 'no_substantive_messages' };
@@ -103,14 +128,20 @@ export function loopExtractionEligibility(
     return { eligible: false, reason: 'spam_or_trash' };
   }
 
+  // The user's own exclusion, before the owner override (see above).
+  if (isExcludedByLabels(exclusion, labels)) return { eligible: false, reason: 'excluded_label' };
+  if (exclusion.unresolved.length > 0) return { eligible: false, reason: 'excluded_label_unresolved' };
+
   // Machine mail carries no commitments: pure noise senders, and Calendar's
   // invitation/response notices (which come FROM a real colleague, so the
   // sender check alone cannot see them). Computed FIRST: the owner override
   // below only counts messages the owner actually wrote — an "Accepted:" RSVP
   // Calendar sends on the owner's behalf (SENT label, METHOD:REPLY) is still
   // calendar mail, so a pure invitation exchange never pays for a model call.
+  // RFC 3834 auto-submitted mail (tracker notices, auto-replies) is machine
+  // mail by its own declaration and counts exactly like a noise sender.
   const substantive = messages.filter(
-    (m) => !isNoiseSender(m.fromAddress) && !isCalendarSystemMail(m),
+    (m) => !isNoiseSender(m.fromAddress) && !isCalendarSystemMail(m) && !m.autoSubmitted,
   );
   if (substantive.length === 0) return { eligible: false, reason: 'no_substantive_messages' };
 
@@ -121,7 +152,7 @@ export function loopExtractionEligibility(
   if (substantive.some(ownerWrote)) return { eligible: true, reason: 'owner_participated' };
 
   // Bulk by Gmail's own classification, and the owner never joined in.
-  if (BULK_CATEGORY_LABELS.some((l) => labels.has(l))) {
+  if (hasBulkCategory(labels)) {
     return { eligible: false, reason: 'bulk_category' };
   }
 
@@ -273,7 +304,7 @@ export interface LoopsExtractResult {
  */
 export class LoopsExtractRetryableError extends Error {
   constructor(
-    readonly reason: 'llm_unavailable' | 'truncated' | 'parse_barrier',
+    readonly reason: 'llm_unavailable' | 'truncated' | 'parse_barrier' | 'excluded_label_unresolved',
     message: string,
   ) {
     super(message);
@@ -323,7 +354,23 @@ export async function runLoopsExtract(
     return { ...empty, reason: 'suppressed' };
   }
 
-  await assertUnmanagedCanonicalWriter(engine, 'Google loop extraction');
+  // #5445: the label exclusion in force NOW, not at enqueue — a label the user
+  // added after this job was queued still stops it before the model call.
+  // An unresolved policy is retryable (the next sweep re-reads the labels),
+  // never a paid run.
+  const exclusion = await loadLoopsExclusionPolicy(engine, payload.sourceId);
+  if (isExcludedByLabels(exclusion, pageLabelIds(fm))) return { ...empty, reason: 'excluded_label' };
+  if (exclusion.unresolved.length > 0) {
+    throw new LoopsExtractRetryableError(
+      'excluded_label_unresolved',
+      `loops_extract: the loop exclusion labels ${exclusion.unresolved.map((t) => JSON.stringify(t)).join(', ')} are not labels of this account ` +
+        '(or the label list could not be read); no model call is made until a sweep resolves them — retryable',
+    );
+  }
+
+  // Managed brains publish the commitment fact through the coordinator; its
+  // authority and canonical owner are checked here, before the model call.
+  await managedFactWritePreflight(engine, payload.sourceId);
   const { isAvailable, chat } = await import('../ai/gateway.ts');
   // Keyless install / provider outage: NOT a skip. The sweep already refuses to
   // enqueue while chat is unavailable; a job that reaches here mid-outage must
@@ -336,26 +383,30 @@ export async function runLoopsExtract(
   }
 
   // Injection hardening: same sanitation the facts extractor applies.
-  const { INJECTION_PATTERNS } = await import('../think/sanitize.ts');
+  const { INJECTION_PATTERNS, restoreNeutralized } = await import('../think/sanitize.ts');
   // Open-loop extraction is recency-sensitive: the newest outer messages can
   // fulfil an older promise or add a fresh one. Keeping the oldest 12k silently
   // hid the latest reply on long threads. Bound the same payload size, but keep
   // the tail so the newest evidence is always visible to the judge.
-  let content = (page.compiled_truth ?? '').slice(-12_000);
+  const rawContent = (page.compiled_truth ?? '').slice(-12_000);
+  let content = rawContent;
   for (const p of INJECTION_PATTERNS) content = content.replace(p.rx, p.replacement);
 
   let text: string;
   try {
-    const res = await chat({
-      system: JUDGE_SYSTEM,
-      messages: [
-        {
-          role: 'user',
-          content: `<thread subject=${JSON.stringify(page.title ?? '')} account_owner="me">\n${content}\n</thread>\n\nExtract the open loops.`,
-        },
-      ],
-      maxTokens: 2000,
-    });
+    const call = (maxTokens: number) =>
+      chat({
+        system: JUDGE_SYSTEM,
+        messages: [
+          {
+            role: 'user',
+            content: `<thread subject=${JSON.stringify(page.title ?? '')} account_owner="me">\n${content}\n</thread>\n\nExtract the open loops.`,
+          },
+        ],
+        maxTokens,
+      });
+    let res = await call(LOOPS_EXTRACT_MAX_TOKENS);
+    if (res.stopReason === 'length') res = await call(LOOPS_EXTRACT_RETRY_MAX_TOKENS);
     if (res.stopReason === 'refusal' || res.stopReason === 'content_filter') {
       return { ...empty, reason: 'refused' };
     }
@@ -367,7 +418,9 @@ export async function runLoopsExtract(
     if (res.stopReason === 'length') {
       throw new LoopsExtractRetryableError(
         'truncated',
-        'loops_extract: model output truncated (stopReason=length) — retryable',
+        `loops_extract: model output truncated (stopReason=length) at the ${LOOPS_EXTRACT_RETRY_MAX_TOKENS}-token ` +
+          `ceiling after one escalation from ${LOOPS_EXTRACT_MAX_TOKENS}; the thread extracts more loops than the ` +
+          'ceiling carries — retryable',
       );
     }
     text = res.text;
@@ -388,14 +441,25 @@ export async function runLoopsExtract(
   // hallucinated or prompt-injected "quote" is dropped (the loop still
   // lands; fabricated evidence never presents). Whitespace-normalized match:
   // models legitimately collapse newlines inside a quoted sentence.
+  // #7125: the loop text and quote are stored, so a neutralized span the model
+  // copied from the prompt is restored from the raw thread first, and the
+  // quote is checked against the raw thread.
   const wsNorm = (s: string): string => s.replace(/\s+/g, ' ').trim();
-  const haystack = wsNorm(content);
-  const verbatim = (q: string): string => (q && haystack.includes(wsNorm(q)) ? q : '');
-  for (const c of extraction.commitments) c.quote = verbatim(c.quote);
-  for (const d of extraction.decisions_pending) d.quote = verbatim(d.quote);
+  const haystack = wsNorm(rawContent);
+  const restore = (s: string): string => restoreNeutralized(s, rawContent).text;
+  const verbatim = (q: string): string => {
+    const restored = q ? restore(q) : q;
+    return restored && haystack.includes(wsNorm(restored)) ? restored : '';
+  };
+  for (const c of extraction.commitments) { c.text = restore(c.text); c.quote = verbatim(c.quote); }
+  for (const d of extraction.decisions_pending) { d.text = restore(d.text); d.quote = verbatim(d.quote); }
 
   const loopIds: number[] = [];
   const messageDate = typeof fm.date === 'string' ? fm.date : new Date().toISOString();
+  // #5575 I2/B3: the model read only this email page, so its commitment facts carry the page's tier
+  // (a connector page is external_untrusted) and pass the write gate at that tier.
+  const derivation = await deriveTrust(engine, [{ table: 'pages', id: page.id }], { channel: 'derive:loops' });
+  const gateCfg = await derivedGateConfig(engine);
 
   for (const c of extraction.commitments) {
     const loopType: LoopType =
@@ -405,31 +469,45 @@ export async function runLoopsExtract(
     // Projection 1 — facts row (fence-first, deduped/superseding).
     let factId: number | null = null;
     try {
-      const { writeSingleFact } = await import('../facts/write-single.ts');
-      const result = await writeSingleFact(engine, payload.sourceId, {
+      const fact = {
         fact: c.text,
         provenance: `email thread "${(page.title ?? '').slice(0, 80)}" (${payload.slug})`,
-        kind: 'commitment',
+        kind: 'commitment' as const,
         entity: counterpartyRef,
-        visibility: 'private',
+        visibility: 'private' as const,
         validUntil: c.due_iso ? new Date(`${c.due_iso}T23:59:59Z`) : null,
         confidence: 0.85,
-      });
-      factId = result.id;
-    } catch {
-      /* the loop row still lands; facts projection is best-effort */
+      };
+      const gate = decideFactWrite({ fact: fact.fact, source: fact.provenance },
+        { sourceId: payload.sourceId, slug: counterpartyRef, payload: fact, input: derivedGateInput(derivation.trust), cfg: gateCfg });
+      if (gate.action !== 'insert') {
+        // A held or rejected commitment writes no fact; the loop row below still records it for the owner.
+        await maintenanceTransaction(engine, tx => applyGateDecision(tx, gate, { table: 'facts', sourceId: payload.sourceId }, async () => null));
+      } else {
+        const { writeSingleFact } = await import('../facts/write-single.ts');
+        // Loops extraction is a local maintenance job on the owner host, so its
+        // dedup may see facts whose provenance page is private (#5152); an unset
+        // trust would treat every private-sourced repeat as new and insert it.
+        factId = (await writeSingleFact(engine, payload.sourceId, { ...fact, derivation, gate, remote: false })).id;
+      }
+    } catch (err) {
+      // The loop row still lands; the facts projection is best-effort, but its
+      // failure is logged. Slug, source and a bounded error only: the
+      // commitment text and quote stay out of logs.
+      const code = (err as { code?: unknown })?.code;
+      console.warn(`[loops_extract] fact projection failed slug=${payload.slug} source=${payload.sourceId}` +
+        ` (${typeof code === 'string' ? code : err instanceof Error ? err.name : 'error'}): ${(err instanceof Error ? err.message : String(err)).slice(0, 200)}`);
     }
 
-    // Counterparty slug: high-confidence resolutions only. The facts layer's
-    // slugify holding fallback is fine for facts, but a phantom slug on the
-    // loop row would group `gbrain waiting` under a person that doesn't
-    // exist and miss every entity-card lookup.
-    let counterpartySlug: string | null = null;
+    // Counterparty page: high-confidence resolutions only, own source first
+    // and then across sources by identity (#5504; google/counterparty.ts).
+    // The facts layer's slugify holding fallback is fine for facts, but a
+    // phantom slug on the loop row would group `gbrain waiting` under a
+    // person that doesn't exist and miss every entity-card lookup.
+    let counterparty: ResolvedCounterparty | null = null;
     if (counterpartyRef) {
       try {
-        const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
-        const resolved = await resolveEntitySlugWithSource(engine, payload.sourceId, counterpartyRef);
-        if (resolved && resolved.source !== 'fallback_slugify') counterpartySlug = resolved.slug;
+        counterparty = await resolveCounterparty(engine, payload.sourceId, { name: c.counterparty_name, email: c.counterparty_email });
       } catch {
         /* resolution is best-effort */
       }
@@ -441,7 +519,8 @@ export async function runLoopsExtract(
       sourceId: payload.sourceId,
       dedupKey,
       loopType,
-      counterpartySlug,
+      counterpartySlug: counterparty?.slug ?? null,
+      counterpartySourceId: counterparty?.sourceId ?? null,
       counterpartyEmail: c.counterparty_email || null,
       summary: c.text,
       evidence: [{ page_slug: payload.slug, ...(c.quote ? { quote: c.quote } : {}) }],
@@ -456,18 +535,20 @@ export async function runLoopsExtract(
     loopIds.push(id);
 
     // Projection 3 — typed edge thread-page → person-page, so the relational
-    // arm ("who owes me", "who am I waiting on") can traverse it.
-    if (counterpartySlug) {
+    // arm ("who owes me", "who am I waiting on") can traverse it. The edge
+    // points at the page's own source; the fact above stays in the connector
+    // source (#5504).
+    if (counterparty) {
       try {
         await engine.addLink( // gbrain-allow-direct-insert: loops-extract writes its own provenance-tagged edges (link_source google-loops); auto-link reconciliation never manages these
           payload.slug,
-          counterpartySlug,
+          counterparty.slug,
           (c.quote || c.text).slice(0, 200),
           c.direction === 'owed_by_me' ? 'owes_to' : 'awaiting_reply_from',
           'google-loops',
           undefined,
           undefined,
-          { fromSourceId: payload.sourceId, toSourceId: payload.sourceId },
+          { fromSourceId: payload.sourceId, toSourceId: counterparty.sourceId },
         );
       } catch {
         /* edge is best-effort */

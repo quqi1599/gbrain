@@ -18,13 +18,28 @@ test('the CI admin build keeps container dependencies and Vite cache off the hos
   expect(Object.hasOwn(compose.volumes, 'gbrain-ci-admin-node-modules')).toBe(true);
   expect(compose.services.runner.volumes).toContain('gbrain-ci-admin-dist:/app/admin/dist');
   expect(Object.hasOwn(compose.volumes, 'gbrain-ci-admin-dist')).toBe(true);
+  // Compiled-CLI tests must run a Linux binary built in the container, never a
+  // host (e.g. macOS) build leaking through the /app bind mount.
+  expect(compose.services.runner.volumes).toContain('gbrain-ci-bin:/app/bin');
+  expect(Object.hasOwn(compose.volumes, 'gbrain-ci-bin')).toBe(true);
+});
+
+test('the runner compiles its own CLI and avoids GNU-only xargs flags', () => {
+  const template = source.slice(templateStart, templateEnd);
+  // `xargs -a FILE` is GNU-only; BSD xargs (macOS hosts) rejects it.
+  expect(source).not.toMatch(/xargs\s+-a\b/);
+  const install = template.indexOf('bun install --frozen-lockfile');
+  const build = template.indexOf('bun run build', install);
+  expect(install).toBeGreaterThanOrEqual(0);
+  expect(build).toBeGreaterThan(install);
+  expect(build).toBeLessThan(template.indexOf('__RUN_PHASES__'));
 });
 
 describe('ci-local command rendering', () => {
   const cases = [
     { phaseExit: 0, missingTool: '' },
     { phaseExit: 7, missingTool: '' },
-    ...['git', 'python3', 'ps', 'psql', 'jq'].map(missingTool => ({ phaseExit: 0, missingTool })),
+    ...['git', 'python3', 'ps', 'psql', 'cc', 'jq'].map(missingTool => ({ phaseExit: 0, missingTool })),
   ];
   for (const { phaseExit, missingTool } of cases) {
     test(`preserves stderr and exit ${phaseExit}; missing prerequisite ${missingTool || 'none'}`, () => {
@@ -36,10 +51,12 @@ describe('ci-local command rendering', () => {
         mkdirSync(bin);
         // Execute the actual runner template, with installation/configuration
         // commands stubbed so this regression needs neither Docker nor root.
-        for (const name of ['bun', 'git', 'python3', 'ps', 'psql', 'jq']) {
+        for (const name of ['bun', 'git', 'python3', 'ps', 'psql', 'cc', 'jq']) {
           writeFileSync(join(bin, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         }
         writeFileSync(join(bin, 'apt-get'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$INSTALL_LOG"\n', { mode: 0o755 });
+        mkdirSync(join(home, 'scripts'));
+        writeFileSync(join(home, 'scripts', 'ci-hydrate-admin-dist.sh'), 'exit 0\n');
         const phaseLog = join(home, 'phase.log');
         const installLog = join(home, 'install.log');
         const phases = [
@@ -71,7 +88,7 @@ describe('ci-local command rendering', () => {
         expect(result.stdout.includes('phase completed')).toBe(phaseExit === 0);
         expect(existsSync(join(home, '__RUN_PHASES__1'))).toBe(false);
         if (missingTool) {
-          expect(readFileSync(installLog, 'utf8')).toBe('update -qq\ninstall -y -qq git ca-certificates python3 procps postgresql-client jq\n');
+          expect(readFileSync(installLog, 'utf8')).toBe('update -qq\ninstall -y -qq git ca-certificates python3 procps postgresql-client jq build-essential\n');
         } else {
           expect(existsSync(installLog)).toBe(false);
         }
@@ -91,9 +108,13 @@ function runPhases(noShard: boolean, diff: boolean, failStage = '') {
     const trace = join(home, 'trace');
     const put = (path: string, body: string) => writeFileSync(join(home, path), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
     for (const name of ['git', 'python3', 'ps', 'psql', 'apt-get']) put(`bin/${name}`, 'exit 0');
+    put('scripts/ci-hydrate-admin-dist.sh', 'exit 0');
     put('bin/bun', `
 case "$*" in
-  "run scripts/select-e2e.ts") printf '%s\\n' test/e2e/one.test.ts test/e2e/two.test.ts; exit 0 ;;
+  "scripts/lib/ensure-e2e-database.ts "*)
+    printf 'admin_db:%s:%s\\n' "$2" "$3" >> "$TRACE"
+    [ "$FAIL_STAGE" != admin_db ] || exit 7
+    exit 0 ;;
   "run verify") stage=verify ;;
   "run test:serial") stage=serial ;;
   "run test:slow") stage=slow ;;
@@ -117,10 +138,10 @@ for line in {1..35}; do printf 'fixture progress %s\\n' "$line"; done
 set -eu
 case "$DATABASE_URL" in postgresql://postgres:postgres@postgres-*:5432/gbrain_test) ;; *) exit 42 ;; esac
 [ "$GBRAIN_PGBOUNCER_URL" = postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test ] || exit 43
-[ "$GBRAIN_PGBOUNCER_DIRECT_URL" = postgresql://postgres:postgres@postgres-1:5432/gbrain_test ] || exit 44
+[ "$GBRAIN_PGBOUNCER_DIRECT_URL" = postgresql://postgres:postgres@postgres-1:5432/gbrain_ci_admin_test ] || exit 44
 [ "$GBRAIN_CI_REQUIRE_PGBOUNCER" = 1 ] || exit 45
 [ "$GBRAIN_TEST_DB" = 1 ] || exit 46
-printf 'target:%s\\n' "$DATABASE_URL" "$GBRAIN_PGBOUNCER_URL" "$GBRAIN_PGBOUNCER_DIRECT_URL" >> "$TRACE"
+printf 'target:%s\\n' "db=$DATABASE_URL" "pgbouncer=$GBRAIN_PGBOUNCER_URL" "direct=$GBRAIN_PGBOUNCER_DIRECT_URL" >> "$TRACE"
 printf 'e2e:%s:%s\\n' "\${SHARD-all}" "$*" >> "$TRACE"
 [ "$FAIL_STAGE" != e2e ] || exit 7
 `);
@@ -162,8 +183,9 @@ describe('ci-local execution coverage', () => {
         expect(e2e).toHaveLength(noShard ? 1 : 4);
         const targets = result.trace.filter(line => line.startsWith('target:'));
         expect(targets).toHaveLength(noShard ? 3 : 12);
-        for (const target of targets) expect(() => assertSafeE2eDatabaseUrl(target.slice(7), {})).not.toThrow();
-        if (diff) expect(e2e.every(line => line.endsWith('test/e2e/one.test.ts test/e2e/two.test.ts'))).toBe(true);
+        for (const target of targets) expect(() => assertSafeE2eDatabaseUrl(target.slice(target.indexOf('=') + 1), {})).not.toThrow();
+        // --diff no longer narrows: every shard runs run-e2e.sh's full discovery.
+        expect(e2e.every(line => line.endsWith(':'))).toBe(true);
         if (!noShard) {
           expect(result.stdout).toContain('Complete shard logs saved to .context/ci-local-shards/');
           for (const log of result.archivedLogs) {
@@ -174,6 +196,30 @@ describe('ci-local execution coverage', () => {
       });
     }
   }
+
+  for (const noShard of [false, true]) {
+    test(`the PgBouncer admin database is created first and is no shard's database (#6674, no-shard=${noShard})`, () => {
+      const result = runPhases(noShard, false);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      // Shards run concurrently, so their target lines interleave: each line names its role.
+      const role = (name: string) => result.trace.filter(line => line.startsWith(`target:${name}=`)).map(line => new URL(line.slice(line.indexOf('=') + 1)));
+      const shards = role('db');
+      expect(shards).toHaveLength(noShard ? 1 : 4);
+      const admins = new Set(role('direct').map(url => `${url.host}${url.pathname}`));
+      expect([...admins]).toEqual(['postgres-1:5432/gbrain_ci_admin_test']);
+      for (const shard of shards) expect(shard.pathname).not.toBe('/gbrain_ci_admin_test');
+      const created = result.trace.indexOf('admin_db:postgresql://postgres:postgres@postgres-1:5432/gbrain_test:gbrain_ci_admin_test');
+      expect(created).toBeGreaterThanOrEqual(0);
+      expect(created).toBeLessThan(result.trace.findIndex(line => line.startsWith('e2e:')));
+    });
+  }
+
+  test('a failed admin database bootstrap starts no shard', () => {
+    const result = runPhases(false, false, 'admin_db');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('could not create gbrain_ci_admin_test; shards not started');
+    expect(result.trace.some(line => line.startsWith('unit:') || line.startsWith('e2e:'))).toBe(false);
+  });
 
   for (const failStage of ['timeout_guard', 'verify', 'serial', 'slow', 'unit', 'e2e']) {
     test(`a failed ${failStage} stage cannot produce a green local CI result`, () => {
@@ -211,16 +257,54 @@ describe('ci-local execution coverage', () => {
         // the real detector/configuration canary runs separately in CI.
         writeFileSync(join(home, 'scripts/test-gitleaks-config.sh'), 'exit 0\n');
         writeFileSync(join(home, 'scripts/scan-worktree-secrets.sh'), 'gitleaks dir . --redact --no-banner\n');
+        writeFileSync(join(home, 'scripts/ci-doc-checks.sh'), 'printf "%s\\n" docs >> "$SCAN_LOG"\n');
         const result = spawnSync('bash', ['-c', script, join(home, 'scripts/ci-local.sh'), '--diff'], {
           encoding: 'utf8', timeout: 5_000,
           env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SCAN_MODE: gitleaks, SCAN_LOG: log },
         });
         expect(result.status, result.stderr).toBe(gitleaks === 'success' ? 0 : 1);
         const scans = existsSync(log) ? readFileSync(log, 'utf8') : '';
-        expect(scans).toBe(gitleaks === 'success' ? 'dir\ngit\n' : gitleaks === 'failure' ? 'dir\n' : '');
+        expect(scans).toBe(gitleaks === 'success' ? 'dir\ngit\ndocs\n' : gitleaks === 'failure' ? 'dir\n' : '');
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
+    });
+  }
+
+  function diffPreflight(classification: string, docChecks = 'exit 0') {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-ci-diff-'));
+    try {
+      const bin = join(home, 'bin');
+      mkdirSync(bin);
+      mkdirSync(join(home, 'scripts'));
+      writeFileSync(join(bin, 'bun'), `#!/bin/sh\necho ${classification}\n`, { mode: 0o755 });
+      writeFileSync(join(bin, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      writeFileSync(join(home, 'scripts/test-gitleaks-config.sh'), 'exit 0\n');
+      writeFileSync(join(home, 'scripts/scan-worktree-secrets.sh'), 'exit 0\n');
+      writeFileSync(join(home, 'scripts/ci-doc-checks.sh'), `${docChecks}\n`);
+      const end = source.indexOf('# Pre-flight: postgres host ports');
+      return spawnSync('bash', ['-c', `${source.slice(0, end)}\necho FULL_GATE_CONTINUES`, join(home, 'scripts/ci-local.sh'), '--diff'], {
+        encoding: 'utf8', timeout: 5_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  test('doc-only diff fails when a doc check fails (e.g. llms.txt not rebuilt)', () => {
+    const result = diffPreflight('DOC_ONLY', 'echo "Fix: bun run build:llms" >&2; exit 1');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Fix: bun run build:llms');
+    expect(result.stdout).not.toContain('FULL_GATE_CONTINUES');
+  });
+
+  for (const classification of ['SRC', 'EMPTY', 'ERR']) {
+    test(`a ${classification} diff says narrowing is retired and runs the full gate`, () => {
+      const result = diffPreflight(classification);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('E2E narrowing is retired; running the full E2E corpus (see docs/TESTING.md#e2e-selection)');
+      expect(result.stdout).toContain('FULL_GATE_CONTINUES');
     });
   }
 });
@@ -243,7 +327,7 @@ describe('required PgBouncer execution through run-e2e', () => {
         mkdirSync(join(home, 'scripts/lib'), { recursive: true });
         const script = readFileSync(join(import.meta.dir, '../../scripts/run-e2e.sh'), 'utf8');
         writeFileSync(join(home, 'scripts/run-e2e.sh'), script);
-        writeFileSync(join(home, 'scripts/lib/test-env.sh'), 'ensure_pglite_snapshot() { :; }\n');
+        writeFileSync(join(home, 'scripts/lib/test-env.sh'), readFileSync(join(import.meta.dir, '../../scripts/lib/test-env.sh'), 'utf8') + '\nensure_pglite_snapshot() { :; }\n');
         writeFileSync(join(bin, 'psql'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         writeFileSync(join(bin, 'bun'), `#!/bin/sh
 printf '%s\\n' "$GBRAIN_PGBOUNCER_URL" "$GBRAIN_PGBOUNCER_DIRECT_URL" "$GBRAIN_CI_REQUIRE_PGBOUNCER" "$GBRAIN_TEST_DB" "\${GBRAIN_SOURCE-unset}" "\${COVERAGE_DIR:-disabled}" > "$ENV_REPORT"
@@ -316,7 +400,7 @@ describe('local test configuration through run-e2e', () => {
         // Copy the real loader into a separate fixture: its import.meta.dir
         // must resolve ONLY our synthetic .env.testing, never the checkout's.
         writeFileSync(join(fixture, 'scripts/run-e2e.sh'), readFileSync(join(repo, 'scripts/run-e2e.sh')));
-        writeFileSync(join(fixture, 'scripts/lib/test-env.sh'), 'ensure_pglite_snapshot() { :; }\n');
+        writeFileSync(join(fixture, 'scripts/lib/test-env.sh'), readFileSync(join(import.meta.dir, '../../scripts/lib/test-env.sh'), 'utf8') + '\nensure_pglite_snapshot() { :; }\n');
         writeFileSync(join(fixture, 'test/e2e/helpers.ts'), readFileSync(join(repo, 'test/e2e/helpers.ts')));
         symlinkSync(join(repo, 'src'), join(fixture, 'src'), 'dir');
         symlinkSync(join(repo, 'test/helpers'), join(fixture, 'test/helpers'), 'dir');

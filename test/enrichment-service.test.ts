@@ -15,8 +15,16 @@ describe('enrichment-service', () => {
       expect(slugifyEntity("O'Brien", 'person')).toBe('people/obrien');
     });
 
-    test('handles special characters', () => {
-      expect(slugifyEntity('José García', 'person')).toBe('people/jos-garc-a');
+    test('folds Latin accents to their base letter', () => {
+      expect(slugifyEntity('José García', 'person')).toBe('people/jose-garcia');
+    });
+
+    test('preserves non-Latin scripts instead of dropping them', () => {
+      // Was ASCII-only ([a-z0-9]): Cyrillic names slugified to '' or a bare
+      // '-', so every non-Latin person/company collided on the same empty
+      // slug. Assert parsed structure (exact slug), not just non-emptiness.
+      expect(slugifyEntity('Иван Петров', 'person')).toBe('people/иван-петров');
+      expect(slugifyEntity('Тестовая Компания', 'company')).toBe('companies/тестовая-компания');
     });
 
     test('trims leading/trailing hyphens', () => {
@@ -41,6 +49,16 @@ describe('enrichment-service', () => {
       const names = entities.map(e => e.name);
       expect(names).toContain('John Smith');
       expect(names).toContain('Sarah Connor');
+    });
+
+    test('extracts capitalized multi-word names in other scripts', () => {
+      // Was ASCII-only ([A-Z][a-z]+): every non-Latin name-shaped token was
+      // invisible to the extractor, so extract_entities found zero entities
+      // in non-Latin text regardless of how well-formed the names were.
+      const entities = extractEntities('Вчера встретился с Иван Петров и Анна Смирнова.');
+      const names = entities.map(e => e.name);
+      expect(names).toContain('Иван Петров');
+      expect(names).toContain('Анна Смирнова');
     });
 
     test('classifies company names with Corp/Inc/Labs', () => {
@@ -118,35 +136,6 @@ describe('enrichment-service', () => {
     test('does not merge capitalized words across a form feed (U+000C)', () => {
       const entities = extractEntities('Winters\fReyes discussed the proof.');
       expect(entities.some(e => e.name.includes('\f'))).toBe(false);
-    });
-  });
-
-  describe('enrichEntity (mock)', () => {
-    test('module exports enrichEntity function', async () => {
-      const mod = await import('../src/core/enrichment-service.ts');
-      expect(typeof mod.enrichEntity).toBe('function');
-    });
-
-    test('module exports enrichEntities for batch processing', async () => {
-      const mod = await import('../src/core/enrichment-service.ts');
-      expect(typeof mod.enrichEntities).toBe('function');
-    });
-
-    test('module exports extractAndEnrich for text processing', async () => {
-      const mod = await import('../src/core/enrichment-service.ts');
-      expect(typeof mod.extractAndEnrich).toBe('function');
-    });
-  });
-
-  describe('tier auto-escalation logic', () => {
-    // We test the tier suggestion indirectly through the public interface
-    // The actual suggestTier function is private, but its behavior is
-    // observable through enrichEntity's return value (needs engine mock for full test)
-    test('enrichment result includes tier fields', async () => {
-      const mod = await import('../src/core/enrichment-service.ts');
-      // Verify the EnrichmentResult type shape is correct by checking exports
-      expect(mod.enrichEntity).toBeDefined();
-      // Full tier escalation testing requires engine mock (covered in E2E)
     });
   });
 });

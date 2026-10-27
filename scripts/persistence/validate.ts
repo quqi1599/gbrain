@@ -1,17 +1,29 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { availableParallelism, loadavg, tmpdir, totalmem } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import postgres from 'postgres';
+import postgres from '#postgres'
 import { assertSafeE2eDatabaseUrl } from '../../test/helpers/db-guard.ts';
 import { distribution, type HarnessConfig } from './harness.ts';
 import { keylessBrainEnv } from '../../test/helpers/provider-env.ts';
-import { boundedDiagnostic, diagnosticError, retentionMetadata } from './failure-diagnostics.ts';
+import { boundedDiagnostic, connectionDiagnostic, diagnosticError, retentionMetadata } from './failure-diagnostics.ts';
+import { explorationSeeds, replayEntries, runDigest, runRobotPhase, type RobotRun, type RobotScope } from './robot-driver.ts';
+import { shrinkRun } from './shrink.ts';
 
 export interface ValidationOptions {
   engine: 'pglite' | 'postgres'; schedules?: number; operations?: number; seed?: number;
   crashes?: boolean; databaseUrl?: string; manifest?: string;
+  /** Crash-robot ceiling in seconds: a run past it fails; omitted or 0 skips the phase (the CLI defaults to 1200 on PGLite, 880 on Postgres). */
+  robotSeconds?: number;
+  /** `pr` skips the Postgres lease-bound seams; `full` (default) crashes every seam. */
+  robotScope?: RobotScope;
+  /** A UTC day number: the robot also runs that day's explorationSeeds (the nightly). */
+  exploreDay?: number;
+  /** Re-run a recorded manifest's failing crash-robot runs (and nothing else). */
+  replay?: string;
+  /** Shrink the first failing crash-robot run of a manifest to a minimal reproducing sequence. */
+  shrink?: string;
 }
 interface Event { event: string; [key: string]: any; }
 export const CRASH_BOUNDARIES = ['admitted', 'prepared', 'before_publication', 'staging_flushed',
@@ -58,6 +70,39 @@ export function spawnWorker(configPath: string, home: string, role: string, args
     async kill() { if (child.exitCode === null) child.kill('SIGKILL'); await child.exited; await reading; } };
 }
 
+/** A full robot gate ran the whole budget, skipped nothing, and every requested crash happened and recovered cleanly (#6584). */
+export function robotFullGate(robot: Pick<Awaited<ReturnType<typeof runRobotPhase>>, 'violations' | 'fault_hook_errors' | 'faults_not_reached'>
+  & { lease_bound_seams_skipped?: string[]; lease_bound_faults_skipped?: string[] }, scope: RobotScope): boolean {
+  return scope === 'full' && robot.violations.length === 0
+    && robot.fault_hook_errors.length === 0 && robot.faults_not_reached.length === 0
+    && (robot.lease_bound_seams_skipped ?? []).length === 0 && (robot.lease_bound_faults_skipped ?? []).length === 0;
+}
+
+/** A run past its ceiling: the fixed schedule list no longer fits this runner class, so the gate fails instead of covering less. */
+export function robotOverBudget(durationMs: number, seconds: number): string {
+  return `Crash robot over its ceiling: ran ${Math.round(durationMs / 1000)} s against --robot-seconds=${seconds}. Why: every run executes the same `
+    + 'schedule list (scripts/persistence/robot-driver.ts ROBOT_RANDOM_SEEDS) so a passed run of a tree can be reused; past the ceiling the list '
+    + 'no longer fits this runner class. Fix: find the slow runs in the manifest; speed them up, or resize the list and the ceiling together.';
+}
+
+/** One line per robot cell for the job summary: elapsed time as a share of the ceiling, so drift shows long before it fails. */
+export function robotCeilingUse(engine: string, scope: RobotScope, durationMs: number, seconds: number): string {
+  const elapsed = Math.round(durationMs / 1000);
+  return `Crash robot ${engine} (${scope}): ${elapsed} s of its ${seconds} s ceiling (${Math.round(100 * durationMs / (seconds * 1000))}%)\n`;
+}
+
+/** The failing runs plus the exact command that replays them and the one that shrinks the first. */
+export function robotFailure(failing: RobotRun[], options: ValidationOptions): string {
+  const manifest = options.manifest ?? `.context/persistence-${options.engine}-manifest.json`;
+  const env = options.engine === 'postgres' ? 'DATABASE_URL=<test url> ' : '';
+  const lines = failing.slice(0, 5).map(run => `  ${run.schedule} seed=${run.seed} ${run.fault ? `${run.fault.point}#${run.fault.nth}` : run.process ?? 'no crash'} [${runDigest(run)}]: `
+    + (run.violations.length ? run.violations.slice(0, 3).map(v => `${v.class}: ${v.detail}`).join(' | ')
+      : run.hook_error !== undefined ? `fault_hook_error: ${run.hook_error}` : 'fault_not_reached: the worker finished without reaching the requested fault'));
+  return [`Crash robot found ${failing.length} failing run(s):`, ...lines,
+    `Replay: ${env}bun --no-env-file scripts/persistence/validate.ts --engine=${options.engine} --replay=${manifest}`,
+    `Shrink: ${env}bun --no-env-file scripts/persistence/validate.ts --engine=${options.engine} --shrink=${manifest} (writes ${manifest}.shrunk.json)`].join('\n');
+}
+
 /** Every PostgreSQL phase owns a new database; disk PGLite always runs in children. */
 export async function runValidation(options: ValidationOptions) {
   const counts = { schedules: options.schedules ?? 1000, operations: options.operations ?? 10_000 };
@@ -87,7 +132,9 @@ export async function runValidation(options: ValidationOptions) {
         'src/core/persistence/effect-recovery.ts', 'src/core/persistence/effect-model.ts', 'src/core/persistence/effects.ts',
         'src/core/persistence/coordinator.ts', 'src/core/persistence/consumer.ts',
         'src/core/persistence/journal.ts', 'src/core/persistence/activation.ts', 'src/core/persistence/filesystem-guard.ts',
-        'src/core/persistence/identity.ts', 'src/core/persistence/ownership.ts', 'src/core/pglite-engine.ts', 'src/core/postgres-engine.ts'].map(file =>
+        'src/core/persistence/identity.ts', 'src/core/persistence/ownership.ts', 'src/core/pglite-engine.ts', 'src/core/postgres-engine.ts',
+        'src/core/persistence/fault-points.ts', 'scripts/persistence/ops.ts', 'scripts/persistence/model.ts', 'scripts/persistence/generator.ts',
+        'scripts/persistence/crash-robot.ts', 'scripts/persistence/robot-driver.ts', 'scripts/persistence/shrink.ts'].map(file =>
         [file, createHash('sha256').update(readFileSync(resolve(import.meta.dir, '../..', file))).digest('hex')]));
       let databaseUrl: string | undefined;
       if (admin) {
@@ -101,6 +148,36 @@ export async function runValidation(options: ValidationOptions) {
       const path = join(root, 'config.json'); writeFileSync(path, JSON.stringify(config), { mode: 0o600 }); return { config, path };
     }
     function start(path: string, role: string, ...args: string[]) { const child = spawnWorker(path, home, role, args); children.push(child); return child; }
+    const robotOptions = (extra: Partial<Parameters<typeof runRobotPhase>[0]> = {}) => ({ engine: options.engine, seed: options.seed ?? 5105,
+      seconds: options.robotSeconds ?? 0, scope: options.robotScope ?? 'full',
+      extraSeeds: options.exploreDay === undefined ? [] : explorationSeeds(options.exploreDay), scratch, home, admin, databaseUrl: options.databaseUrl, databases,
+      pooledUrl: options.engine === 'postgres' ? process.env.GBRAIN_PGBOUNCER_URL || undefined : undefined,
+      spawn: spawnWorker, track: (child: ReturnType<typeof spawnWorker>) => { children.push(child); }, ...extra });
+    if (options.replay || options.shrink) {
+      const entries = replayEntries((options.replay ?? options.shrink)!, options.engine);
+      if (options.shrink) {
+        manifest.shrink = await shrinkRun(entries.find(e => e.violations.length) ?? entries[0], (run, keep) => runRobotPhase(robotOptions({ replay: [run], ...(keep ? { keep } : {}) })));
+        const shrunkPath = `${resolve(options.shrink)}.shrunk.json`;
+        writeFileSync(shrunkPath, `${JSON.stringify({ engine: options.engine, reproduced: `${manifest.shrink.reproduced}/${manifest.shrink.reruns}`,
+          failing_runs: [manifest.shrink.shrunk] }, null, 2)}\n`);
+        process.stderr.write(`[persistence] shrunk ${manifest.shrink.original.ops} ops to ${manifest.shrink.shrunk.ops?.length}; reproduced ${manifest.shrink.reproduced}/3; ${shrunkPath}\n`
+          + `[persistence] Replay: bun --no-env-file scripts/persistence/validate.ts --engine=${options.engine} --replay=${shrunkPath}\n`);
+        manifest.status = manifest.shrink.accepted ? 'passed' : 'failed'; manifest.full_gate = false; return manifest;
+      }
+      manifest.robot = await runRobotPhase(robotOptions({ replay: entries }));
+      manifest.status = manifest.robot.failing_runs.length ? 'failed' : 'passed'; manifest.full_gate = false;
+      if (manifest.robot.failing_runs.length) throw new Error(robotFailure(manifest.robot.failing_runs, options));
+      return manifest;
+    }
+    if (options.robotSeconds) {
+      manifest.robot = await runRobotPhase(robotOptions());
+      process.stderr.write(`[persistence] ${options.engine}: crash robot ran ${manifest.robot.sequences_x_crash_points} sequence x crash point runs over ${manifest.robot.schedules} schedules\n`);
+      const use = robotCeilingUse(options.engine, options.robotScope ?? 'full', manifest.robot.duration_ms, options.robotSeconds);
+      process.stderr.write(`[persistence] ${use}`);
+      if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, use);
+      if (manifest.robot.failing_runs.length) throw new Error(robotFailure(manifest.robot.failing_runs, options));
+      if (manifest.robot.over_budget) throw new Error(robotOverBudget(manifest.robot.duration_ms, options.robotSeconds));
+    }
     if (options.crashes !== false) for (const boundary of CRASH_BOUNDARIES) {
       const { path } = await phase(`crash-${boundary}`); const requestId = randomUUID();
       const child = start(path, 'crash', boundary, requestId);
@@ -143,11 +220,13 @@ export async function runValidation(options: ValidationOptions) {
         admission: distribution(results.flatMap(row => row.result.admission_ms)),
         caller_completion: distribution(results.flatMap(row => row.result.completion_ms)),
         concurrent_canonical_read: distribution(ownerResults.flatMap(owner => owner.concurrent_read_ms)),
-        peak_owner_rss_bytes: Math.max(...ownerResults.map(owner => owner.peak_rss_bytes)) };
+        peak_owner_rss_bytes: ownerResults.reduce((peak: number | null, owner) =>
+          owner.peak_rss_bytes === null ? peak : Math.max(peak ?? 0, owner.peak_rss_bytes), null) };
     }
     manifest.status = 'passed';
     const executedBoundaries = manifest.crash_cases.map((entry: { boundary: string }) => entry.boundary);
     if (options.crashes !== false) assert.deepEqual(executedBoundaries, [...CRASH_BOUNDARIES]);
+    if (manifest.robot) manifest.robot_full_gate = robotFullGate(manifest.robot, options.robotScope ?? 'full');
     manifest.full_gate = counts.schedules >= 1000 && counts.operations >= 10_000
       && executedBoundaries.length === CRASH_BOUNDARIES.length && CRASH_BOUNDARIES.every((boundary, index) => executedBoundaries[index] === boundary)
       && manifest.crash_cases.every((entry: { staging_cleanup_verified?: boolean }) => entry.staging_cleanup_verified === true)
@@ -166,6 +245,7 @@ export async function runValidation(options: ValidationOptions) {
         assert(response.ok, 'Owner diagnostic endpoint failed'); return response.json();
       }, 1_750))),
     }));
+    if (admin) manifest.connection_diagnostic = await boundedDiagnostic(() => connectionDiagnostic(admin!));
     throw error;
   }
   finally {
@@ -206,10 +286,13 @@ export async function runValidation(options: ValidationOptions) {
 }
 if (import.meta.main) {
   const args = new Map(process.argv.slice(2).map(arg => { const [key, ...value] = arg.replace(/^--/, '').split('='); return [key, value.join('=')]; }));
-  for (const key of args.keys()) assert(['engine', 'schedules', 'operations', 'seed', 'no-crashes', 'manifest'].includes(key), `Unknown option: ${key}`);
+  for (const key of args.keys()) assert(['engine', 'schedules', 'operations', 'seed', 'no-crashes', 'manifest', 'robot-seconds', 'robot-scope', 'explore-day', 'replay', 'shrink'].includes(key), `Unknown option: ${key}`);
   const engine = args.get('engine') ?? 'pglite'; assert(engine === 'pglite' || engine === 'postgres');
+  assert(['pr', 'full'].includes(args.get('robot-scope') ?? 'full'), '--robot-scope is pr or full');
   const result = await runValidation({ engine, schedules: Number(args.get('schedules') ?? 1000), operations: Number(args.get('operations') ?? 10_000),
     seed: Number(args.get('seed') ?? 5105), crashes: !args.has('no-crashes'), databaseUrl: process.env.DATABASE_URL,
+    robotSeconds: Number(args.get('robot-seconds') ?? (engine === 'postgres' ? 880 : 1200)),
+    robotScope: (args.get('robot-scope') ?? 'full') as RobotScope, exploreDay: args.has('explore-day') ? Number(args.get('explore-day')) : undefined, replay: args.get('replay') || undefined, shrink: args.get('shrink') || undefined,
     manifest: args.get('manifest') ?? `.context/persistence-${engine}-manifest.json` });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }

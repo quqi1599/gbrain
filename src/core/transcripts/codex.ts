@@ -5,10 +5,17 @@
  * Verified against a live local rollout 2026-08-14 (see SPEC_TARGET).
  *
  * TURN SELECTION IS STRUCTURAL, not heuristic: the human's typed text is
- * recorded as `event_msg` payload.type='user_message' (payload.message);
+ * recorded as `event_msg` payload.type='user_message' (payload.message) up to
+ * codex 0.152, and as `event_msg` payload.type='item_completed' with
+ * item.type='UserMessage' (text content blocks) from 0.153 on (#5163); a
+ * rollout carrying both shapes for one turn keeps it once
+ * (isRepeatedCodexUserTurn);
  * `response_item` rows with role user/developer are INJECTED context
  * (app-context, plugin lists, instruction preambles) and are skipped
- * wholesale. Assistant text comes from `response_item` payload.type='message'
+ * wholesale. A sub-agent rollout (`session_meta` payload.source.subagent,
+ * e.g. the guardian auto-reviewer) receives its task only as such injected
+ * context, so it has assistant turns and no user turn by design: it reports
+ * `subagentRollout`, never `userTurnsMissing` drift (#6741). Assistant text comes from `response_item` payload.type='message'
  * role='assistant' output_text blocks. reasoning / tool calls / token_count
  * and every other event kind are skipped — the archive records conversation
  * text only (lossy by design).
@@ -24,7 +31,7 @@ import type {
   TranscriptAdapter,
   TranscriptMessage,
 } from './types.ts';
-import { TRANSCRIPT_JSONL_HARD_CAP } from './types.ts';
+import { TRANSCRIPT_JSONL_HARD_CAP, utcTimestamp } from './types.ts';
 
 /**
  * Head window kept when a rollout exceeds the parse budget. Only needs to
@@ -34,19 +41,27 @@ import { TRANSCRIPT_JSONL_HARD_CAP } from './types.ts';
 const CODEX_HEAD_WINDOW_BYTES = 256 * 1024;
 
 export const CODEX_SPEC_TARGET: HostSpecTarget = {
-  id: 'codex-rollout-2026-08',
+  id: 'codex-rollout-2026-10',
   status: 'verified',
-  verifiedAt: '2026-08-14',
+  verifiedAt: '2026-10-05',
   references: [
     'local ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl (codex CLI, live sample 2026-08-14)',
+    'codex-cli 0.154.0 and 0.159.3 rollout line shapes quoted in garrytan/gbrain#5163 (observed 2026-10-05)',
     'test/fixtures/transcripts/codex-rollout.jsonl',
+    'test/fixtures/transcripts/codex-rollout-0154.jsonl',
   ],
   note:
-    'One JSON object per line: {timestamp: ISO, type, payload}. type ' +
+    'One JSON object per line: {timestamp: ISO, type, payload}; 0.159 adds ' +
+    'ordinal/started_at_ms/completed_at_ms, ignored. type ' +
     "'session_meta' header carries payload.{id, session_id, cwd, timestamp, " +
-    "cli_version}; identity = payload.id (per-thread; session_id is the root " +
-    "session shared by forked/subagent threads), first header wins. User turns: type 'event_msg' with payload.type " +
-    "'user_message' (payload.message = typed text). Assistant turns: type " +
+    "cli_version, source}; identity = payload.id (per-thread; session_id is the root " +
+    "session shared by forked/subagent threads), first header wins. payload.source is a string ('cli', 'exec', ...) " +
+    "or {subagent: ...} for a sub-agent thread, whose task arrives only as injected context. User turns: type 'event_msg' with payload.type " +
+    "'user_message' (payload.message = typed text) through 0.152; from 0.153 " +
+    "type 'event_msg' with payload.type 'item_completed' and " +
+    "payload.item.{type:'UserMessage', content:[{type:'text', text}]} (other " +
+    'item types, AgentMessage included, skipped; non-text blocks skipped; ' +
+    'both shapes for one turn kept once). Assistant turns: type ' +
     "'response_item' with payload.{type:'message', role:'assistant', " +
     "content:[{type:'output_text', text}]}. response_item rows with role " +
     'user/developer are injected context and are skipped. reasoning, ' +
@@ -66,6 +81,15 @@ function textFromBlocks(content: unknown, blockType: string): string {
 }
 
 /**
+ * #5163: a rollout written across the 0.152 -> 0.153 change can record one
+ * typed turn as both `user_message` and `item_completed` UserMessage. The
+ * second copy is the same text with no assistant turn between them.
+ */
+export function isRepeatedCodexUserTurn(previous: { role: string; text: string } | undefined, text: string): boolean {
+  return previous?.role === 'user' && previous.text === text;
+}
+
+/**
  * One parsed codex rollout line, classified (mirrors openclaw.ts's
  * mapOpenclawLine precedent: the hook lane's tail-capable parser reuses the
  * SAME line→row mapping as the import adapter, so the dated CODEX_SPEC_TARGET
@@ -81,7 +105,7 @@ function textFromBlocks(content: unknown, blockType: string): string {
  * result rather than with an inferred one.
  */
 export type CodexLineResult =
-  | { kind: 'session'; sessionId?: string; cwd?: string; startedAt?: string; cliVersion?: string; modelProvider?: string }
+  | { kind: 'session'; sessionId?: string; cwd?: string; startedAt?: string; cliVersion?: string; modelProvider?: string; subagent?: true }
   | { kind: 'user'; message: TranscriptMessage }
   | { kind: 'assistant'; message: TranscriptMessage }
   | { kind: 'tool_call'; name: string; input: unknown }
@@ -102,7 +126,7 @@ export function mapCodexLine(entry: unknown): CodexLineResult {
   if (typeof entry !== 'object' || entry === null) return { kind: 'skip' };
   const e = entry as Record<string, unknown>;
   const payload = (typeof e.payload === 'object' && e.payload !== null ? e.payload : {}) as Record<string, unknown>;
-  const lineTs = typeof e.timestamp === 'string' ? e.timestamp : '';
+  const lineTs = utcTimestamp(e.timestamp);
   if (e.type === 'session_meta') {
     return {
       kind: 'session',
@@ -115,14 +139,24 @@ export function mapCodexLine(entry: unknown): CodexLineResult {
         (typeof payload.session_id === 'string' && payload.session_id) ||
         undefined,
       cwd: typeof payload.cwd === 'string' ? payload.cwd : undefined,
-      startedAt: typeof payload.timestamp === 'string' ? payload.timestamp : lineTs || undefined,
+      startedAt: typeof payload.timestamp === 'string' ? utcTimestamp(payload.timestamp) : lineTs || undefined,
       cliVersion: typeof payload.cli_version === 'string' ? payload.cli_version : undefined,
       modelProvider: typeof payload.model_provider === 'string' ? payload.model_provider : undefined,
+      ...(typeof payload.source === 'object' && payload.source !== null && 'subagent' in payload.source ? { subagent: true as const } : {}),
     };
   }
   if (e.type === 'compacted') return { kind: 'boundary' };
   if (e.type === 'event_msg' && payload.type === 'user_message') {
     const text = typeof payload.message === 'string' ? payload.message.trim() : '';
+    return text ? { kind: 'user', message: { role: 'user', timestamp: lineTs, text } } : { kind: 'skip' };
+  }
+  if (e.type === 'event_msg' && payload.type === 'item_completed') {
+    // #5163: codex >= 0.153 records the typed turn only as an item_completed
+    // UserMessage. Every other item type is skipped: AgentMessage duplicates
+    // the response_item output_text row, command/tool items are not text.
+    const item = (typeof payload.item === 'object' && payload.item !== null ? payload.item : {}) as Record<string, unknown>;
+    if (item.type !== 'UserMessage') return { kind: 'skip' };
+    const text = textFromBlocks(item.content, 'text');
     return text ? { kind: 'user', message: { role: 'user', timestamp: lineTs, text } } : { kind: 'skip' };
   }
   if (e.type === 'response_item' && payload.type === 'message' && payload.role === 'assistant') {
@@ -205,6 +239,7 @@ export const codexAdapter: TranscriptAdapter = {
     let sessionId = '';
     let cwd: string | undefined;
     let startedAt = '';
+    let subagent = false;
     const messages: TranscriptMessage[] = [];
     let rawMeta: Record<string, unknown> | undefined;
 
@@ -226,6 +261,7 @@ export const codexAdapter: TranscriptAdapter = {
         if (mapped.sessionId) sessionId = mapped.sessionId;
         if (mapped.cwd) cwd = mapped.cwd;
         if (mapped.startedAt) startedAt = mapped.startedAt;
+        subagent = mapped.subagent === true;
         rawMeta = {
           session_id: sessionId,
           cwd: cwd ?? null,
@@ -235,6 +271,7 @@ export const codexAdapter: TranscriptAdapter = {
         };
         continue;
       }
+      if (mapped.kind === 'user' && isRepeatedCodexUserTurn(messages.at(-1), mapped.message.text)) continue;
       if (mapped.kind === 'user' || mapped.kind === 'assistant') {
         messages.push(mapped.message);
         continue;
@@ -244,6 +281,7 @@ export const codexAdapter: TranscriptAdapter = {
       // the consumer that keeps calls and boundary positions.
     }
 
+    const userless = messages.length > 0 && !messages.some((m) => m.role === 'user');
     let sessions = 0;
     if (messages.length > 0) {
       sessions = 1;
@@ -265,7 +303,9 @@ export const codexAdapter: TranscriptAdapter = {
       truncated,
       sessions,
       zeroSessionsReason:
-        sessions === 0 ? 'no user_message events or assistant message items in rollout' : undefined,
+        sessions === 0 ? 'no user turns (user_message or item_completed UserMessage) or assistant message items in rollout' : undefined,
+      userTurnsMissing: userless && !subagent ? true : undefined,
+      subagentRollout: userless && subagent ? true : undefined,
     };
   },
 };

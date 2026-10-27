@@ -33,7 +33,10 @@ import { scorePush } from './metrics/push.ts';
 import { runWriteBack, type WriteBackScore } from './metrics/write-back.ts';
 import { scoreContinuityPair } from './metrics/continuity.ts';
 import { SeedError, seedBrain, type SeedOutcome } from './seed.ts';
+import { assembleTrustCell, runTrustSuites } from './trust-suites.ts';
+import { configureDecideBrain, decideRowReceipt, decideSpendTotals, spendDelta, type DecideEvalRun } from '../decide-eval-flags.ts';
 import {
+  isTrustSuite,
   round4,
   toPublicTurn,
   type AdapterFixtureView,
@@ -56,6 +59,8 @@ export interface RunBrainBenchOpts {
   budgetUsd?: number;
   /** Progress note sink (CLI wires the shared stderr reporter). */
   onProgress?: (note: string) => void;
+  /** System One arm (`--decide`, src/eval/decide-eval-flags.ts): configures the benchmark brain and adds per-turn receipts. */
+  decide?: DecideEvalRun | null;
 }
 
 export interface RunBrainBenchOutput {
@@ -122,6 +127,7 @@ async function replayFixture(
   lf: LoadedFixture,
   seed: SeedOutcome,
   rowSuites: BrainBenchSuite[],
+  decide?: DecideEvalRun | null,
 ): Promise<TurnRow[]> {
   const view = adapterView(lf);
   const activeSource = view.active_source;
@@ -134,7 +140,9 @@ async function replayFixture(
         priorContext += `\n${turn.text}`;
         continue;
       }
+      const spendBefore = decide ? await decideSpendTotals(engine) : null;
       const result = await adapter.replayTurn(turn, priorContext);
+      const decideReceipt = decide && spendBefore ? decideRowReceipt(decide, result.decide, spendDelta(spendBefore, await decideSpendTotals(engine))) : null;
       const gold = lf.gold.turns[String(turn.turn_id)] ?? null;
       for (const suite of rowSuites) {
         rows.push({
@@ -147,6 +155,7 @@ async function replayFixture(
           gold,
           cross_source_slugs: crossSourceSlugs(result.injectedSlugs, seed.slugSource, activeSource),
           latency_ms: Math.round(result.latencyMs * 1000) / 1000,
+          ...(decideReceipt ? { decide: decideReceipt } : {}),
         });
       }
       priorContext += `\n${turn.text}`;
@@ -215,7 +224,13 @@ export async function runBrainBench(
   // Continuity pairs are orchestrated separately from regular fixtures.
   const pairFixtures = new Map<string, { writer?: LoadedFixture; reader?: LoadedFixture }>();
   const regular: LoadedFixture[] = [];
+  // Memory-trust fixtures run on their own persistence-enabled brain after everything else (trust-scenario.ts).
+  const trustFixtures: LoadedFixture[] = [];
   for (const lf of eligible) {
+    if (lf.fixture.suites.some(isTrustSuite)) {
+      trustFixtures.push(lf);
+      continue;
+    }
     const cont = lf.fixture.continuity;
     if (cont && wantedSuites.has('continuity')) {
       const p = pairFixtures.get(cont.pair_id) ?? {};
@@ -236,6 +251,7 @@ export async function runBrainBench(
     stored_rows: 0, matched_any_gold: 0, fixtures: [], failed_items: [],
   };
   const continuityByReader = new Map<HarnessName, ContinuityAgg>();
+  let trustAgg: Awaited<ReturnType<typeof runTrustSuites>> | null = null;
 
   // RUN-scoped --llm budget (review finding: a per-invocation cap would
   // multiply by fixture count — ~$550 worst case on the committed corpus).
@@ -246,6 +262,7 @@ export async function runBrainBench(
   const engine = await createBenchmarkBrain();
   let fixturesRun = 0;
   try {
+    if (opts.decide) await configureDecideBrain(engine, opts.decide, { includeSearchPins: true });
     // ---- regular fixtures: seed once, replay all adapters, then mutate ----
     for (const lf of regular) {
       const id = lf.fixture.fixture_id;
@@ -269,7 +286,7 @@ export async function runBrainBench(
       if (retrievalSuites.length > 0) {
         for (const harness of harnessList) {
           const adapter = await adapterFor(harness);
-          const rows = await replayFixture(engine, adapter, lf, seed, retrievalSuites);
+          const rows = await replayFixture(engine, adapter, lf, seed, retrievalSuites, opts.decide);
           turnRows.push(...rows);
         }
       }
@@ -348,7 +365,7 @@ export async function runBrainBench(
       // Every requested harness reads the SAME persisted state (read-only).
       for (const readerHarness of harnessList) {
         const readerAdapter = await adapterFor(readerHarness);
-        const readerRows = await replayFixture(engine, readerAdapter, reader, mergedSeed, ['continuity']);
+        const readerRows = await replayFixture(engine, readerAdapter, reader, mergedSeed, ['continuity'], opts.decide);
         turnRows.push(...readerRows);
 
         const activeSource = reader.fixture.active_source ?? 'default';
@@ -363,6 +380,13 @@ export async function runBrainBench(
         agg.failed_items.push(...score.failed_items.map((f) => `${f} [reader: ${readerHarness}]`));
         continuityByReader.set(readerHarness, agg);
       }
+    }
+
+    // ---- memory-trust suites: real tiered writes, one source per fixture (trust-suites.ts) ----
+    if (trustFixtures.length > 0) {
+      trustAgg = await runTrustSuites(trustFixtures, { harnesses: harnessList, adapterFor, progress });
+      turnRows.push(...trustAgg.turnRows);
+      fixturesRun += trustFixtures.length;
     }
   } finally {
     for (const a of adapters.values()) {
@@ -379,7 +403,9 @@ export async function runBrainBench(
   const cells: SuiteMetrics[] = [];
   for (const harness of harnessList) {
     for (const suite of opts.suites) {
-      const cell = assembleCell(harness, suite, turnRows, writeBackAgg, continuityByReader, opts.llm);
+      const cell = isTrustSuite(suite)
+        ? (trustAgg ? assembleTrustCell(harness, suite, trustAgg, SEAM[harness]) : null)
+        : assembleCell(harness, suite, turnRows, writeBackAgg, continuityByReader, opts.llm);
       if (cell) cells.push(cell);
     }
   }

@@ -4,7 +4,9 @@
  * attribution rule gets a direct fixture — no filesystem needed.
  */
 import { describe, test, expect } from 'bun:test';
-import { classifyFile } from '../../scripts/classify-tests.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { classifyFile, generate } from '../../scripts/classify-tests.ts';
 
 describe('classify-tests detectors', () => {
   test('repo-anchored readFileSync binding attributes the referencing suite', () => {
@@ -32,6 +34,18 @@ describe('classify-tests detectors', () => {
       "const out = readFileSync(join(tmpdir, 'AGENTS.md'), 'utf-8');",
       "describe('scaffolder output', () => {",
       "  test('emits agents md', () => { expect(out).toContain('gbrain'); });",
+      '});',
+    ].join('\n');
+    expect(classifyFile('test/fake.test.ts', src).rows).toHaveLength(0);
+  });
+
+  test('a dynamic import of src/ beside a non-repo read is behavioral', () => {
+    const src = [
+      "describe('init writes config', () => {",
+      "  test('reads its own config', async () => {",
+      "    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));",
+      "    const { PGLiteEngine } = await import('../src/core/pglite-engine.ts');",
+      '  });',
       '});',
     ].join('\n');
     expect(classifyFile('test/fake.test.ts', src).rows).toHaveLength(0);
@@ -80,6 +94,19 @@ describe('classify-tests detectors', () => {
     expect(rows[0].detector).toBe('doctor-source-helper');
   });
 
+  test('per-surface source helpers (A10) mark the suite structural', () => {
+    const src = [
+      "import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';",
+      "describe('sync pin', () => {",
+      "  test('contains', () => { expect(surfaceSource('sync')).toContain('x'); });",
+      "  test('orders', () => { const s = surfaceFileSource('sync', 'src/commands/sync.ts'); expect(s.indexOf('a')).toBeLessThan(s.indexOf('b')); });",
+      '});',
+    ].join('\n');
+    const rows = classifyFile('test/fake.test.ts', src).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].detector).toBe('source-surface-helper');
+  });
+
   test('detector outside any describe attributes to file-level pseudo-suite', () => {
     const src = [
       "const SRC = readFileSync('src/core/operations.ts', 'utf-8');",
@@ -116,4 +143,11 @@ describe('classify-tests detectors', () => {
     ].join('\n');
     expect(classifyFile('test/fake.test.ts', src).rows).toHaveLength(0);
   });
+});
+
+describe('structural-suites manifest', () => {
+  test('scripts/structural-suites.tsv matches a fresh classification of the test tree', () => {
+    const committed = readFileSync(join(import.meta.dir, '..', '..', 'scripts', 'structural-suites.tsv'), 'utf-8');
+    expect(committed).toBe(generate().tsv);
+  }, 60_000);
 });

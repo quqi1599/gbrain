@@ -61,12 +61,34 @@ const __prefixStore = new AsyncLocalStorage<string>();
 // onto the JSON-RPC channel. One direction only — never unset at runtime
 // (the serve process is stdio-MCP for its whole lifetime).
 let __stdoutLoggingRedirected = false;
+let __consoleBeforeRedirect: Pick<Console, 'log' | 'info' | 'debug'> | null = null;
 
 // CLI `--json` mode: stdout is reserved for the JSON envelope (and any JSON
 // status lines). Scoped, not process-wide: rebinding console.log here would
 // also push the envelope itself to stderr. slog consults it; serr is stderr
 // already; direct console.log(JSON.stringify(..)) sites are untouched.
 const __humanToStderr = new AsyncLocalStorage<true>();
+
+// #6317: a resident serve running a delegated managed sync captures the
+// drain's human lines for the polling CLI instead of printing them to its
+// own stderr. Scoped like the prefix: it rides every await (and Bun's
+// timers) under the wrap, so the drain's progress and stall lines, which an
+// interval prints, reach the sink too.
+const __lineSink = new AsyncLocalStorage<(line: string) => void>();
+
+/**
+ * Run `fn` with every `slog` / `serr` line delivered to `sink` (one call
+ * per formatted line, prefix applied, no trailing newline) instead of the
+ * process streams. Nests with `withSourcePrefix`; the innermost sink wins.
+ */
+export function withHumanLineSink<T>(sink: (line: string) => void, fn: () => Promise<T>): Promise<T> {
+  return __lineSink.run(sink, fn);
+}
+
+function deliverToSink(sink: (line: string) => void, args: unknown[], prefix: string | null): void {
+  const text = prefix === null ? formatArgs(args) : prefixLines(formatArgs(args), prefix);
+  for (const line of text.split('\n')) sink(line);
+}
 
 /**
  * Run `fn` with every `slog` line (prefixed or not) routed to stderr, so a
@@ -91,6 +113,8 @@ export function redirectStdoutLoggingToStderr(): void {
   if (__stdoutLoggingRedirected) return;
   __stdoutLoggingRedirected = true;
   // eslint-disable-next-line no-console
+  __consoleBeforeRedirect = { log: console.log, info: console.info, debug: console.debug };
+  // eslint-disable-next-line no-console
   const toStderr = (...args: unknown[]): void => console.error(...args);
   // eslint-disable-next-line no-console
   console.log = toStderr;
@@ -108,11 +132,16 @@ export function isStdoutLoggingRedirected(): boolean {
 }
 
 /**
- * Test-only reset. Does NOT restore the original console bindings (tests
- * that need those should snapshot them before calling the redirect).
+ * Test-only reset: clears the flag and puts back the console bindings the
+ * redirect replaced. Bun runs many test files in one process, so a reset that
+ * left console.log bound to stderr sent every later file's stdout logging to
+ * stderr.
  */
 export function _resetStdoutRedirectForTests(): void {
   __stdoutLoggingRedirected = false;
+  if (!__consoleBeforeRedirect) return;
+  Object.assign(console, __consoleBeforeRedirect);
+  __consoleBeforeRedirect = null;
 }
 
 /**
@@ -147,6 +176,8 @@ export function getSourcePrefix(): string | null {
  */
 export function slog(...args: unknown[]): void {
   const prefix = getSourcePrefix();
+  const sink = __lineSink.getStore();
+  if (sink) { deliverToSink(sink, args, prefix); return; }
   const toStderr = __stdoutLoggingRedirected || __humanToStderr.getStore() === true;
   if (prefix === null) {
     // Back-compat fast path: bare console.log semantics. (Under the stdio
@@ -168,6 +199,8 @@ export function slog(...args: unknown[]): void {
  */
 export function serr(...args: unknown[]): void {
   const prefix = getSourcePrefix();
+  const sink = __lineSink.getStore();
+  if (sink) { deliverToSink(sink, args, prefix); return; }
   if (prefix === null) {
     // eslint-disable-next-line no-console
     console.error(...args);

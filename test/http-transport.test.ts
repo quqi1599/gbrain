@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createHash } from 'crypto';
 import { startHttpTransport } from '../src/mcp/http-transport.ts';
 import { RateLimiter } from '../src/mcp/rate-limit.ts';
-import { GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
+import { contractFor } from './helpers/instructions-parity.ts';
 
 type SqlResult = unknown[] | unknown;
 type SqlHandler = (query: string, values: unknown[]) => SqlResult | Promise<SqlResult>;
@@ -92,7 +92,9 @@ function makeFakeEngine(cfg: FakeEngineConfig = {}): FakeEngine {
     const norm = normalizeSql(query);
 
     // SELECT id, name, permissions FROM access_tokens WHERE token_hash = $1 AND revoked_at IS NULL
-    if (norm.startsWith('select id, name from access_tokens') ||
+    // F3: validateToken reads `SELECT * FROM access_tokens` (every schema generation).
+    if (norm.startsWith('select * from access_tokens') ||
+        norm.startsWith('select id, name from access_tokens') ||
         norm.startsWith('select id, name, permissions from access_tokens') ||
         norm.startsWith('select id, name, permissions, scopes from access_tokens')) {
       const tokenHash = values[0] as string;
@@ -235,7 +237,16 @@ describe('http-transport: auth', () => {
     expect(body.jsonrpc).toBe('2.0');
   });
 
-  test('initialize returns the same canonical agent contract as stdio', async () => {
+  async function listedTools(url: string): Promise<string[]> {
+    const r = await fetch(`${url}/mcp`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${VALID_TOKEN}`, 'Content-Type': 'application/json' },
+      body: rpc('tools/list', {}),
+    });
+    return ((await r.json()) as { result: { tools: Array<{ name: string }> } }).result.tools.map(t => t.name);
+  }
+
+  test('initialize returns the contract generated for this token (F1)', async () => {
     const r = await fetch(`${srv.url}/mcp`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${VALID_TOKEN}`, 'Content-Type': 'application/json' },
@@ -247,7 +258,8 @@ describe('http-transport: auth', () => {
     });
     expect(r.status).toBe(200);
     const body = await r.json() as { result?: { instructions?: string } };
-    expect(body.result?.instructions).toBe(GBRAIN_MCP_INSTRUCTIONS);
+    // F1: the contract for exactly this token's tools/list.
+    expect(body.result?.instructions).toStartWith(contractFor(await listedTools(srv.url)));
   });
 
   test('initialize appends the deployment identity to the canonical contract (#4748)', async () => {
@@ -269,7 +281,7 @@ describe('http-transport: auth', () => {
       const body = await r.json() as { result?: { instructions?: string } };
       // Append-only: the canonical safety contract is preserved verbatim
       // and the identity rides UNDER it.
-      expect(body.result?.instructions).toStartWith(GBRAIN_MCP_INSTRUCTIONS);
+      expect(body.result?.instructions).toStartWith(contractFor(await listedTools(identityServer.url)));
       expect(body.result?.instructions).toEndWith(
         'Deployment identity:\nCOMPANY BRAIN — shared business memory.',
       );
@@ -565,6 +577,10 @@ describe('http-transport: body cap', () => {
         body: big,
       });
       expect(r.status).toBe(413);
+      const body = await r.json() as { error: string; suggestion: string };
+      expect(body.error).toBe('payload_too_large');
+      expect(body.suggestion).toBe('Nothing was processed: this transport reads at most 100 bytes per request (GBRAIN_HTTP_MAX_BODY_BYTES on the brain host). Send put_pages as smaller batches, a new request_id per call. '
+        + 'Do not split a page: one page over this limit goes by file instead, so ask the user to write it into the brain repository and run gbrain sync, or to run gbrain import <file> or gbrain put <slug> < file on the brain host.');
     } finally { srv.stop(); }
   });
 

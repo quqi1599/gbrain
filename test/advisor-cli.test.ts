@@ -9,9 +9,10 @@
  *     `critical`) keys on engine.getConfig('version') vs LATEST_VERSION,
  *     collect-chronicle emits `warn` from engine.findOntologyConflicts, and
  *     collect-stalled-jobs emits `info` (stale_sync) from engine.executeRaw.
- *   - --apply's TTY gate (confirmTty checks process.stdin.isTTY BEFORE any
- *     read) and its spawn seam (child_process.spawnSync, spied via the module
- *     namespace — Bun named imports are live bindings, so no mock.module).
+ *   - --apply's consent gate (requireConsent: exit 3 with the payload when
+ *     non-interactive without --yes) and its spawn seam (child_process.spawn
+ *     behind spawnCliChild, spied via the module namespace — Bun named imports
+ *     are live bindings, so no mock.module).
  *
  * Hermeticity (non-serial rules): no bare process.env mutation — withEnv +
  * emptyHome() point GBRAIN_HOME at a fresh temp dir per call, which isolates
@@ -25,6 +26,7 @@
 
 import { describe, test, expect, spyOn } from 'bun:test';
 import * as childProcess from 'child_process';
+import { setCliExitVerdict } from '../src/core/cli-force-exit.ts';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -33,7 +35,8 @@ import { LATEST_VERSION } from '../src/core/migrate.ts';
 import { DEFAULT_EMBEDDING_MODEL } from '../src/core/ai/defaults.ts';
 import { getRecipe } from '../src/core/ai/recipes/index.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
-import type { AdvisorReport } from '../src/core/advisor/types.ts';
+import { COLLECTORS } from '../src/core/advisor/run.ts';
+import type { AdvisorCollector, AdvisorFinding, AdvisorReport } from '../src/core/advisor/types.ts';
 import { withEnv, emptyHome } from './helpers/with-env.ts';
 
 /** The env key the EFFECTIVE default embedding model requires (dynamic so a
@@ -93,7 +96,7 @@ function fakeEngine(opts: FakeEngineOpts = {}): BrainEngine {
 }
 
 interface CapturedRun {
-  exitCode: 0 | 1 | 2;
+  exitCode: 0 | 1 | 2 | 3;
   stdout: string;
   stderrLines: string[];
 }
@@ -122,6 +125,7 @@ async function runCaptured(engine: BrainEngine, args: string[]): Promise<Capture
     process.stdout.write = origStdoutWrite;
     stdin.isTTY = origIsTTY;
     errSpy.mockRestore();
+    setCliExitVerdict(0); // a consent refusal records exit 3 for the CLI seam
   }
 }
 
@@ -169,25 +173,140 @@ describe('runAdvisorCli exit-verdict mapping (E2 contract: 0 clean / 1 warn / 2 
   });
 });
 
-describe('runAdvisorCli --apply', () => {
-  test('non-TTY stdin → confirm refused: exit 1, "Aborted. Nothing was run.", spawnSync never invoked', async () => {
-    const spawnSpy = spyOn(childProcess, 'spawnSync').mockImplementation(
-      (() => ({ status: 0 })) as never,
-    );
+const CLI_THROWN_SECRET = 'connect ECONNREFUSED postgres://alice-example:hunter2@db.example.invalid:5432/brain';
+
+const throwingCollector: AdvisorCollector = {
+  id: 'throwing-check',
+  collect: async () => { throw new Error(CLI_THROWN_SECRET); },
+};
+const cleanCollector: AdvisorCollector = { id: 'clean-check', collect: async () => [] };
+const criticalCollector: AdvisorCollector = {
+  id: 'critical-check',
+  collect: async () => [{
+    id: 'crit', severity: 'critical', title: 'a critical thing', fix: { command_argv: null },
+    collector: 'critical-check', ask_user: true,
+  } satisfies AdvisorFinding],
+};
+
+/** Swap the shared COLLECTORS array contents for fn (restored in finally). */
+async function withCollectors<T>(swap: AdvisorCollector[], fn: () => Promise<T>): Promise<T> {
+  const saved = COLLECTORS.slice();
+  COLLECTORS.splice(0, COLLECTORS.length, ...swap);
+  try {
+    return await fn();
+  } finally {
+    COLLECTORS.splice(0, COLLECTORS.length, ...saved);
+  }
+}
+
+describe('runAdvisorCli collector failure (#6936: a failed check must not read healthy)', () => {
+  test('--json: a thrown collector → collector_failed warn finding, exit 1, no leaked error text', async () => {
+    await withEnv(hermeticEnv(), async () => {
+      const run = await withCollectors([throwingCollector, cleanCollector], () => runCaptured(fakeEngine(), ['--json']));
+      const report = parseReport(run.stdout);
+      expect(report.findings.map((f) => f.id)).toEqual(['collector_failed:throwing-check']);
+      expect(report.findings[0]!.fix.dispatch_id).toBeUndefined();
+      expect(report.worst).toBe('warn');
+      expect(run.exitCode).toBe(1);
+      const all = run.stdout + run.stderrLines.join('\n');
+      expect(all).not.toContain('hunter2');
+      expect(all).not.toContain('ECONNREFUSED');
+      expect(all).not.toContain('db.example.invalid');
+    });
+  });
+
+  test('human render: not healthy, names the failed check, exit 1, no leaked error text', async () => {
+    await withEnv(hermeticEnv(), async () => {
+      const run = await withCollectors([throwingCollector, cleanCollector], () => runCaptured(fakeEngine(), []));
+      expect(run.stdout).not.toContain('looks healthy');
+      expect(run.stdout).toContain('throwing-check');
+      expect(run.stdout).toContain('could not complete');
+      expect(run.exitCode).toBe(1);
+      const all = run.stdout + run.stderrLines.join('\n');
+      expect(all).not.toContain('hunter2');
+      expect(all).not.toContain('ECONNREFUSED');
+    });
+  });
+
+  test('critical from another collector still wins: worst critical, exit 2, failure also listed', async () => {
+    await withEnv(hermeticEnv(), async () => {
+      const run = await withCollectors([throwingCollector, criticalCollector], () => runCaptured(fakeEngine(), ['--json']));
+      const report = parseReport(run.stdout);
+      expect(report.findings.map((f) => f.id)).toEqual(['crit', 'collector_failed:throwing-check']);
+      expect(report.worst).toBe('critical');
+      expect(run.exitCode).toBe(2);
+    });
+  });
+
+  test('a clean run with no failures still exits 0 and renders healthy', async () => {
+    await withEnv(hermeticEnv(), async () => {
+      const human = await withCollectors([cleanCollector], () => runCaptured(fakeEngine(), []));
+      expect(human.stdout).toContain('looks healthy');
+      expect(human.exitCode).toBe(0);
+      const json = await withCollectors([cleanCollector], () => runCaptured(fakeEngine(), ['--json']));
+      expect(parseReport(json.stdout)).toMatchObject({ findings: [], worst: null });
+      expect(json.exitCode).toBe(0);
+    });
+  });
+
+  test('--apply can never run a collector_failed finding', async () => {
+    const spawnSpy = spyOn(childProcess, 'spawn');
     try {
-      await withEnv(hermeticEnv(), async () => {
-        // pending_migration is the runnable finding (dispatch_id apply_migrations).
-        const run = await runCaptured(fakeEngine({ schemaVersion: '1' }), [
-          '--apply',
-          'apply_migrations',
-        ]);
-        expect(run.stderrLines).toContain('About to run: gbrain apply-migrations --yes');
-        expect(run.stderrLines).toContain('Aborted. Nothing was run.');
-        expect(run.exitCode).toBe(1);
-        // The spy intercepts advisor.ts's own `spawnSync` binding (live-binding
-        // interop, verified by the mocked return above: had the spawn path run,
-        // status 0 would have produced exit 0, not 1).
+      await withEnv({ ...hermeticEnv(), GBRAIN_NON_INTERACTIVE: '1' }, async () => {
+        const run = await withCollectors([throwingCollector], () =>
+          runCaptured(fakeEngine(), ['--apply', 'collector_failed:throwing-check', '--yes']),
+        );
+        expect(run.exitCode).toBe(2);
+        expect(run.stderrLines.join('\n')).toContain('No runnable finding');
         expect(spawnSpy.mock.calls.length).toBe(0);
+      });
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+});
+
+describe('runAdvisorCli --apply', () => {
+  test('C4: non-interactive without --yes → exit 3, consent payload names the command and its cost, nothing spawned', async () => {
+    const spawned: string[][] = [];
+    const realSpawn = childProcess.spawn;
+    const spawnSpy = spyOn(childProcess, 'spawn').mockImplementation(((cmd: string, args: string[], opts: unknown) => {
+      spawned.push([cmd, ...(args ?? [])]);
+      return (realSpawn as (...a: unknown[]) => unknown)(cmd, args, opts);
+    }) as never);
+    try {
+      await withEnv({ ...hermeticEnv(), GBRAIN_NON_INTERACTIVE: '1' }, async () => {
+        // pending_migration is the runnable finding (dispatch_id apply_migrations).
+        const run = await runCaptured(fakeEngine({ schemaVersion: '1' }), ['--apply', 'apply_migrations', '--json']);
+        expect(run.stderrLines).toContain('About to run: gbrain apply-migrations --yes');
+        expect(run.exitCode).toBe(3);
+        const payload = JSON.parse(run.stdout);
+        expect(payload).toMatchObject({ code: 'confirmation_required', effects: ['persistent_install'] });
+        expect(payload.fix.argv).toEqual(['gbrain', 'advisor', '--apply', 'apply_migrations', '--json', '--yes']);
+        expect(payload.user_message).toContain('gbrain apply-migrations --yes');
+        expect(payload.risk).toContain('Cost: no model spend');
+        expect(spawned.filter((c) => c[0] === 'gbrain')).toEqual([]);
+      });
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('C4: --apply <id> --yes runs the fix non-interactively (structured argv, no shell)', async () => {
+    const calls: Array<{ cmd: string; args: string[]; opts: { shell?: boolean } }> = [];
+    const spawnSpy = spyOn(childProcess, 'spawn').mockImplementation(((cmd: string, args: string[], opts: { shell?: boolean }) => {
+      calls.push({ cmd, args, opts });
+      const { EventEmitter } = require('node:events') as typeof import('node:events');
+      const child = new EventEmitter();
+      setTimeout(() => child.emit('close', 0), 0);
+      return child;
+    }) as never);
+    try {
+      await withEnv({ ...hermeticEnv(), GBRAIN_NON_INTERACTIVE: '1' }, async () => {
+        const run = await runCaptured(fakeEngine({ schemaVersion: '1' }), ['--apply', 'apply_migrations', '--yes']);
+        expect(run.exitCode).toBe(0);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ cmd: 'gbrain', args: ['apply-migrations', '--yes'], opts: { shell: false } });
       });
     } finally {
       spawnSpy.mockRestore();

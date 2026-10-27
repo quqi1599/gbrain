@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { runGather } from '../src/core/think/gather.ts';
+import { runThink } from '../src/core/think/index.ts';
 import {
   filterPagesToWindow,
   parseTemporalWindow,
@@ -70,6 +71,16 @@ describe('temporal-window parsing', () => {
 });
 
 describe('effective-date policy', () => {
+  test('effective date strings must be real calendar days', () => {
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2026-02-31' })).toBeNull();
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2026-02-28' })).toBe(Date.UTC(2026, 1, 28, 12));
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2024-02-29' })).toBe(Date.UTC(2024, 1, 29, 12));
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2023-02-29' })).toBeNull();
+    const year50 = new Date(12 * 3600_000);
+    year50.setUTCFullYear(50, 0, 1);
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '0050-01-01' })).toBe(year50.getTime());
+  });
+
   const result = (slug: string, effective_date: string | null): SearchResult => ({
     slug, effective_date, page_id: 1, title: slug, type: 'note', chunk_text: '',
     chunk_source: 'compiled_truth', chunk_id: 1, chunk_index: 0, score: 1, stale: false,
@@ -118,4 +129,32 @@ describe('engine and gather enforcement', () => {
     expect(gathered.pages.map(page => page.slug)).toContain('brain/ops/2026-06-01');
     expect(gathered.diagnostics.window).toBeUndefined();
   });
+
+  test('hard-excluded recent pages cannot leak into or starve the temporal floor (#6890)', async () => {
+    // No lexical overlap: these pages can only enter through the dated floor.
+    await seed('reports/allowed-floor', 'quux eligible evidence', '2026-07-18T12:00:00Z');
+    for (let i = 0; i < 51; i++) {
+      await seed(`synthesis/floor-${i}`, 'quux previous synthesis', '2026-07-18T12:00:00Z');
+    }
+    await seed('test/default-excluded-floor', 'quux default excluded', '2026-07-18T12:00:00Z');
+    const prior = process.env.GBRAIN_SEARCH_EXCLUDE;
+    try {
+      process.env.GBRAIN_SEARCH_EXCLUDE = 'synthesis/';
+      const gathered = await runGather(engine, { question: 'unmatchedfloorquestion', window, remote: false });
+      expect(gathered.warnings).not.toContain('GATHER_WINDOW_FLOOR_FAILED');
+      expect(gathered.pages.map(page => page.slug)).toContain('reports/allowed-floor');
+      expect(gathered.pages.some(page => page.slug.startsWith('synthesis/') || page.slug.startsWith('test/'))).toBe(false);
+      const result = await runThink(engine, {
+        question: 'unmatchedfloorquestion', since: '2026-07-17', until: '2026-07-18',
+        remote: false, stubResponse: { answer: 'stubbed', citations: [], gaps: [] },
+      });
+      expect(result.feedback_evidence?.map(page => page.slug)).toContain('reports/allowed-floor');
+      expect(result.feedback_evidence?.some(page => page.slug.startsWith('synthesis/') || page.slug.startsWith('test/'))).toBe(false);
+      // This is search policy, not a global listing/visibility mutation.
+      expect((await engine.listPages({ slugPrefix: 'synthesis/', limit: 100 })).length).toBe(51);
+    } finally {
+      if (prior === undefined) delete process.env.GBRAIN_SEARCH_EXCLUDE;
+      else process.env.GBRAIN_SEARCH_EXCLUDE = prior;
+    }
+  }, 60_000);
 });

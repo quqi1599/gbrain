@@ -8,6 +8,7 @@ import type { MembershipSnapshot } from '../../src/core/shared-skills/membership
 import { sharedSkillKey } from '../../src/core/shared-skills/membership-types.ts';
 import { setSharedSkillPolicy } from '../../src/core/shared-skills/policy.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { parseRescopeTokenArgs, rescopeLegacyToken } from '../../src/core/grants/legacy-token.ts';
 import { sharedSkillResourceUri } from '../../src/mcp/skill-resources.ts';
 import { resetStrictParamsModeCache } from '../../src/mcp/validate-params.ts';
 import { ASSET_PATH, blobResource, call, FULL_POLICY, READ_OPERATIONS, skillFiles, textResource, withTransportFixture } from './shared-skills-transports.ts';
@@ -69,8 +70,11 @@ export function sharedSkillsTransportCases(databaseUrl?: string) {
       expect(await call<typeof legacy>(reader, 'list_skills', { schema_version: 1 })).toEqual(legacy);
       const legacySkill = await call(reader, 'get_skill', { name: 'alpha' });
       expect(legacySkill.schema_version).toBe(1); expect(legacySkill.body).toBe(original.body);
-      expect((await call(reader, 'get_skill', { name: 'alpha', source_id: 'default' })).body).toBe(original.body);
-      expect((await call<{ packs: { installed: boolean }[] }>(reader, 'list_brain_skillpack')).packs[0].installed).toBe(false);
+      const resident = await call<{ name: string; body: string }>(reader, 'get_skill', { name: 'alpha', source_id: 'default' });
+      expect(resident.body).toBe(original.body); expect(resident.name).toBe('alpha'); expect(Object.keys(resident)).not.toContain('slug');
+      const packs = await call<{ packs: { installed: boolean; skills: { name: string }[] }[] }>(reader, 'list_brain_skillpack');
+      expect(packs.packs[0].installed).toBe(false); expect(packs.packs[0].skills.map(s => s.name)).toEqual(['alpha']);
+      expect(JSON.stringify(packs)).not.toContain('"slug"');
       expect((await reader.listResources()).resources.some(r => r.uri === 'gbrain://skills')).toBe(true);
       const resourceCatalog = JSON.parse(await textResource(reader, 'gbrain://skills'));
       expect(resourceCatalog.skills[0].revision).toBe(original.revision);
@@ -165,8 +169,12 @@ export function sharedSkillsTransportCases(databaseUrl?: string) {
         await expect(reader.readResource({ uri: sharedSkillResourceUri(visible.qualified_id, visible.revision, path) })).rejects.toThrow();
       }
       expect(JSON.stringify(await reader.readResource({ uri: 'gbrain://skills' }))).not.toContain('Hidden-source canary');
+      // A raw permissions edit (an older gbrain binary) after the token's first read converted it is
+      // grant drift: the operations axis denies everything until an operator adopts one side.
       await f.engine.executeRaw('UPDATE access_tokens SET permissions=$2::text::jsonb WHERE id=$1::uuid',
         [f.peers.reader.id, JSON.stringify({ source_id: 'default', allowed_operations: ['list_skills'] })]);
+      expect((await reader.listTools()).tools.map(t => t.name)).toEqual([]);
+      await rescopeLegacyToken(f.engine, parseRescopeTokenArgs(['--id', f.peers.reader.id, '--adopt-permissions']));
       expect((await reader.listTools()).tools.map(t => t.name)).toEqual(['list_skills']);
       await expect(call(reader, 'get_skill', { schema_version: 2, name: 'alpha' })).rejects.toMatchObject({ code: 'permission_denied' });
       await expect(reader.readResource({ uri: sharedSkillResourceUri(visible.qualified_id, visible.revision) })).rejects.toThrow();

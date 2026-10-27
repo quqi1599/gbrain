@@ -3,12 +3,13 @@ import { createHash } from 'node:crypto';
 import { redirectUriMatches } from '@modelcontextprotocol/sdk/server/auth/handlers/authorize.js';
 import type { AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { InvalidClientError, InvalidGrantError, InvalidRequestError, ServerError, TooManyRequestsError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidClientError, InvalidGrantError, InvalidRequestError, InvalidTargetError, ServerError, TooManyRequestsError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { SqlQuery } from './sql-query.ts';
 import { generateToken, hashToken } from './utils.ts';
 import { hasScope, parseScopeString } from './scope.ts';
-import { intersectGrantedScopes } from './grants/model.ts';
+import { TOKEN_TTL_MAX_SECONDS, intersectGrantedScopes } from './grants/model.ts';
 import { safeHexEqual } from './timing-safe.ts';
+import { clientHoldsAuthorization, GrantError, recordFirstConsentInTransaction } from './grants/service.ts';
 
 export type OAuthTransaction = <T>(fn: (sql: SqlQuery) => Promise<T>) => Promise<T>;
 type ClientRow = Record<string, unknown>;
@@ -25,6 +26,33 @@ function grantScopes(row: ClientRow, requested?: string[]): string[] {
   return (requested?.length ? requested : allowed).filter(scope => hasScope(allowed, scope));
 }
 
+/**
+ * #5222 — the one RFC 8707 resource canonicalizer, shared by /authorize, code
+ * exchange, refresh and bearer verification. `canonical` is the server's /mcp
+ * resource, derived from the configured public URL and never from `Host` or
+ * forwarded headers. The issuer origin is an alias of it (some clients send
+ * the origin root even after reading the protected-resource metadata). URL
+ * parsing normalizes scheme and host case and default ports; a trailing
+ * slash is ignored. Anything else is `invalid_target`, naming the accepted
+ * resource so the client fails loudly instead of looping on a token /mcp
+ * will refuse.
+ */
+export function canonicalOAuthResource(requested: URL | string, canonical: URL): URL {
+  const accepted = `use ${canonical.toString()} (or its origin ${canonical.origin})`;
+  let url: URL;
+  try {
+    url = new URL(requested.toString());
+  } catch {
+    throw new InvalidTargetError(`Invalid resource; ${accepted}`);
+  }
+  const path = url.pathname.replace(/\/+$/, '');
+  if (url.origin === canonical.origin && !url.username && !url.password && !url.search && !url.hash
+    && (path === '' || path === canonical.pathname.replace(/\/+$/, ''))) {
+    return new URL(canonical.toString());
+  }
+  throw new InvalidTargetError(`Resource ${url.toString()} is not served here; ${accepted}`);
+}
+
 /** Compare policy, not a mutable reference or only the display name. */
 function policyDigest(row: ClientRow): string {
   const fields = ['client_id', 'client_name', 'redirect_uris', 'grant_types', 'scope',
@@ -32,7 +60,7 @@ function policyDigest(row: ClientRow): string {
     'source_id', 'federated_read', 'bound_tools', 'bound_source_id', 'bound_brain_id',
     'bound_slug_prefixes', 'bound_max_concurrent', 'budget_usd_per_day', 'surface', 'token_ttl',
     'allowed_operations', 'delegated_slug_prefixes', 'delegated_namespace', 'grant_profile',
-    'grant_revision', 'grant_repair_reasons'];
+    'grant_revision', 'grant_repair_reasons', 'registered_via'];
   return hashToken(JSON.stringify(fields.map(field => row[field] ?? null)));
 }
 
@@ -51,6 +79,12 @@ export interface OAuthConsentDetails {
   delegatedSlugPrefixes: string[] | null;
   delegatedNamespace: string | null;
   expiresAt: number;
+  /**
+   * #6202: `editable` only for a self-registered client's first consent
+   * (`registered_via='dcr'`, revision 0, no `client_credentials`, a source
+   * grant); `options` are the active sources then, `[]` otherwise.
+   */
+  sourceChoice: { editable: boolean; options: Array<{ id: string; name: string }> };
 }
 interface PendingAuthorization {
   details: OAuthConsentDetails;
@@ -81,7 +115,14 @@ export class OAuthGrants {
     tokenTtl: number;
     refreshTtl: number;
     now?: () => number;
+    /** #5222: the canonical /mcp resource; unset keeps exact-match resource semantics. */
+    resourceUrl?: URL;
   }) {}
+
+  private canonicalResource(requested: URL | undefined): URL | undefined {
+    if (!requested || !this.options.resourceUrl) return requested;
+    return canonicalOAuthResource(requested, this.options.resourceUrl);
+  }
 
   private now(): number { return (this.options.now ?? Date.now)(); }
   private async locked<T>(clientId: string, fn: (sql: SqlQuery, row: ClientRow) => Promise<T>): Promise<T> {
@@ -113,6 +154,7 @@ export class OAuthGrants {
   }
 
   async begin(clientId: string, params: AuthorizationParams): Promise<string> {
+    const resource = this.canonicalResource(params.resource);
     this.assertCapacity(clientId);
     if (!/^[A-Za-z0-9_-]{43}$/.test(params.codeChallenge)) throw new InvalidRequestError('S256 PKCE challenge required');
     const [row] = await this.options.sql`SELECT * FROM oauth_clients WHERE client_id = ${clientId}`;
@@ -123,6 +165,12 @@ export class OAuthGrants {
     if (!Array.isArray(row.redirect_uris) || !row.redirect_uris.some(uri => typeof uri === 'string' && redirectUriMatches(params.redirectUri, uri))) {
       throw new InvalidRequestError('Redirect URI does not match registered client');
     }
+    const editable = row.registered_via === 'dcr' && Number(row.grant_revision) === 0
+      && !row.grant_types.includes('client_credentials') && row.source_grant !== 'none'
+      && !await clientHoldsAuthorization(this.options.sql, clientId);
+    const options = editable
+      ? (await this.options.sql`SELECT id, name FROM sources WHERE archived = false ORDER BY id`).map(r => ({ id: String(r.id), name: String(r.name) }))
+      : [];
     // No await between the capacity check and insert: concurrent DB reads cannot overfill the store or a client's budget.
     this.assertCapacity(clientId);
     const id = generateToken('');
@@ -136,10 +184,11 @@ export class OAuthGrants {
       delegatedTools: Array.isArray(row.bound_tools) ? [...row.bound_tools] as string[] : null,
       delegatedSlugPrefixes: Array.isArray(row.delegated_slug_prefixes) ? [...row.delegated_slug_prefixes] as string[] : null,
       delegatedNamespace: typeof row.delegated_namespace === 'string' ? row.delegated_namespace : null,
-      resource: params.resource?.toString() ?? null, expiresAt: this.now() + 10 * 60_000,
+      resource: resource?.toString() ?? null, expiresAt: this.now() + 10 * 60_000,
+      sourceChoice: { editable, options },
     };
     this.pending.set(id, {
-      details, params: { ...params, scopes: [...details.scopes], resource: params.resource ? new URL(params.resource) : undefined },
+      details, params: { ...params, scopes: [...details.scopes], resource },
       policy: policyDigest(row), status: 'pending',
     });
     return id;
@@ -159,8 +208,12 @@ export class OAuthGrants {
     try { this.details(id); return true; } catch { return false; }
   }
 
-  async decide(id: string, approve: boolean): Promise<string> {
-    this.details(id);
+  async decide(id: string, approve: boolean, choice?: { sourceId: string }): Promise<string> {
+    const { sourceChoice } = this.details(id);
+    if (choice !== undefined && (!approve || !sourceChoice.editable || !sourceChoice.options.some(o => o.id === choice.sourceId))) {
+      // Refused before the claim: the request stays pending and the owner can reload it.
+      throw new OAuthConsentError(403, 'invalid_consent', 'Reload this request and review it again before approving.');
+    }
     const pending = this.pending.get(id)!;
     pending.status = 'processing'; // claim synchronously before the first await
     const redirect = new URL(pending.params.redirectUri);
@@ -174,6 +227,15 @@ export class OAuthGrants {
       const code = await this.locked(pending.details.clientId, async (sql, row) => {
         if (pending.details.expiresAt <= this.now()) throw new OAuthConsentError(410, 'authorization_expired', 'This request expired. Restart the connection from your client.');
         if (policyDigest(row) !== pending.policy) throw new OAuthConsentError(409, 'client_policy_changed', 'Client permissions changed. Restart the connection and review the new request.');
+        if (sourceChoice.editable) {
+          // The first consent always consumes eligibility (revision 0 → 1), with or without a new source.
+          try {
+            await recordFirstConsentInTransaction(sql, pending.details.clientId, choice?.sourceId, 'owner');
+          } catch (error) {
+            if (error instanceof GrantError) throw new OAuthConsentError(409, 'client_policy_changed', 'Client permissions changed. Restart the connection and review the new request.');
+            throw error;
+          }
+        }
         const code = generateToken('gbrain_code_');
         await sql`
           INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
@@ -194,6 +256,7 @@ export class OAuthGrants {
   }
 
   async exchangeCode(clientId: string, code: string, verifier?: string, redirectUri?: string, resource?: URL, secretHash?: string): Promise<OAuthTokens> {
+    const requested = this.canonicalResource(resource);
     return this.locked(clientId, async (sql, client) => {
       this.assertCredentialPolicy(client, secretHash);
       const [row] = await sql`SELECT * FROM oauth_codes WHERE code_hash = ${hashToken(code)} AND client_id = ${clientId} FOR UPDATE`;
@@ -204,7 +267,7 @@ export class OAuthGrants {
         || createHash('sha256').update(verifier).digest('base64url') !== row.code_challenge) {
         throw new InvalidGrantError('Invalid S256 PKCE verifier');
       }
-      const target = this.resource(row.resource, resource);
+      const target = this.resource(row.resource, requested);
       const scopes = this.currentScopes(client, row.scopes as string[]);
       await sql`DELETE FROM oauth_codes WHERE code_hash = ${hashToken(code)} AND client_id = ${clientId}`;
       return this.issue(sql, client, scopes, target, true);
@@ -212,6 +275,7 @@ export class OAuthGrants {
   }
 
   async refresh(clientId: string, token: string, requested?: string[], resource?: URL, secretHash?: string): Promise<OAuthTokens> {
+    const requestedResource = this.canonicalResource(resource);
     return this.locked(clientId, async (sql, client) => {
       this.assertCredentialPolicy(client, secretHash);
       const [row] = await sql`SELECT * FROM oauth_tokens WHERE token_hash = ${hashToken(token)} AND token_type = 'refresh' AND client_id = ${clientId} FOR UPDATE`;
@@ -221,7 +285,7 @@ export class OAuthGrants {
       if (requested?.some(scope => !hasScope(original, scope))) throw new InvalidGrantError('Requested scope exceeds refresh token grant');
       if (requested?.some(scope => !hasScope(parseScopeString(client.scope as string | undefined), scope))) throw new InvalidGrantError('Requested scope exceeds current client grant');
       const scopes = this.currentScopes(client, requested ?? original);
-      const target = this.resource(row.resource, resource);
+      const target = this.resource(row.resource, requestedResource);
       await sql`DELETE FROM oauth_tokens WHERE token_hash = ${hashToken(token)} AND token_type = 'refresh' AND client_id = ${clientId}`;
       return this.issue(sql, client, scopes, target, true);
     });
@@ -238,10 +302,17 @@ export class OAuthGrants {
     if (secretHash && expires > 0 && expires <= Math.floor(this.now() / 1000)) throw new InvalidClientError('Client credentials expired');
   }
 
+  /** `requested` is already canonical; a stored origin-bound grant from before #5222 canonicalizes the same way. */
   private resource(stored: unknown, requested?: URL): URL | undefined {
     if (typeof stored === 'string' && stored) {
-      if (requested && requested.toString() !== stored) throw new InvalidGrantError('Requested resource exceeds the approved grant');
-      return new URL(stored);
+      let approved: URL;
+      try {
+        approved = this.canonicalResource(new URL(stored))!;
+      } catch {
+        throw new InvalidGrantError('The approved grant is bound to a resource this server does not serve; reconnect the client');
+      }
+      if (requested && requested.toString() !== approved.toString()) throw new InvalidGrantError('Requested resource exceeds the approved grant');
+      return approved;
     }
     return requested; // pre-resource grants remain valid on upgrade
   }
@@ -278,16 +349,16 @@ export class OAuthGrants {
   private async issue(sql: SqlQuery, client: ClientRow, scopes: string[], resource: URL | undefined, refresh: boolean): Promise<OAuthTokens> {
     const clientId = client.client_id as string;
     const override = Number(client.token_ttl);
-    const ttl = Number.isFinite(override) && override > 0 ? override : this.options.tokenTtl;
+    const ttl = Math.min(Number.isFinite(override) && override > 0 ? override : this.options.tokenTtl, TOKEN_TTL_MAX_SECONDS);
     const now = Math.floor(this.now() / 1000);
     const access = generateToken('gbrain_at_');
-    await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
-      VALUES (${hashToken(access)}, ${'access'}, ${clientId}, ${oauthPgArray(scopes)}, ${now + ttl}, ${resource?.toString() ?? null})`;
+    await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource, created_at)
+      VALUES (${hashToken(access)}, ${'access'}, ${clientId}, ${oauthPgArray(scopes)}, ${now + ttl}, ${resource?.toString() ?? null}, to_timestamp(${now}))`;
     const result: OAuthTokens = { access_token: access, token_type: 'bearer', expires_in: ttl, scope: scopes.join(' ') };
     if (refresh) {
       const token = generateToken('gbrain_rt_');
-      await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
-        VALUES (${hashToken(token)}, ${'refresh'}, ${clientId}, ${oauthPgArray(scopes)}, ${now + this.options.refreshTtl}, ${resource?.toString() ?? null})`;
+      await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource, created_at)
+        VALUES (${hashToken(token)}, ${'refresh'}, ${clientId}, ${oauthPgArray(scopes)}, ${now + this.options.refreshTtl}, ${resource?.toString() ?? null}, to_timestamp(${now}))`;
       result.refresh_token = token;
     }
     return result;

@@ -154,6 +154,12 @@ export interface RecommendationContext {
    * needed. Compute via `embeddingProviderConfigured()`.
    */
   embeddingProviderConfigured?: boolean;
+  /**
+   * E2: embeddings are off by choice (`init --no-embedding`). No embed step is
+   * planned and `missing_embeddings` classifies as `human_only` with the
+   * enable reason, never as a remediable or blocked gap.
+   */
+  embeddingsDisabled?: boolean;
   /** Configured chat / synthesis model id. */
   chatModel?: string;
   /** Whether the chat provider has a usable API key. */
@@ -166,6 +172,12 @@ export interface RecommendationContext {
    * cohort is re-embedded instead of grandfathered forever.
    */
   nullSignatureCohort?: number;
+  /**
+   * #5609: why `extract --stale` cannot run on this brain right now (it would
+   * fail every dispatch). Probed by `staleExtractionBlocked()`; when set, the
+   * `extract.stale` step is withheld and its check classifies as blocked.
+   */
+  staleExtractionBlocked?: string;
 }
 
 /** Triage result for one check. */
@@ -218,7 +230,7 @@ export function computeRecommendations(
   // wrong in) vector search.
   // ---------------------------------------------------------------------
   const nullSigCohort = ctx.nullSignatureCohort ?? 0;
-  if ((health.missing_embeddings > 0 || nullSigCohort > 0) && ctx.embeddingProviderConfigured !== false) {
+  if ((health.missing_embeddings > 0 || nullSigCohort > 0) && ctx.embeddingProviderConfigured !== false && !ctx.embeddingsDisabled) {
     const params = {
       stale: true,
       sourceId: ctx.sourceId,
@@ -281,7 +293,7 @@ export function computeRecommendations(
     });
   }
 
-  if (health.stale_pages > 0) {
+  if (health.stale_pages > 0 && !ctx.staleExtractionBlocked) {
     const params = { stale: true, ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}) };
     out.push({
       id: 'extract.stale',
@@ -349,9 +361,15 @@ function classifyOne(check: Check, ctx: RecommendationContext): CheckClassificat
       }
       return { check: check.name, status: 'remediable' };
     case 'missing_embeddings':
+      if (ctx.embeddingsDisabled) {
+        return { check: check.name, status: 'human_only', reason: 'embeddings disabled by choice (keyless brain); enabling them is the user\'s decision' };
+      }
       if (ctx.embeddingProviderConfigured === false) {
         return { check: check.name, status: 'blocked', reason: 'embedding provider not configured' };
       }
+      return { check: check.name, status: 'remediable' };
+    case 'links_extraction_lag':
+      if (ctx.staleExtractionBlocked) return { check: check.name, status: 'blocked', reason: ctx.staleExtractionBlocked };
       return { check: check.name, status: 'remediable' };
     case 'dead_links':
       if (!ctx.repoPath) {

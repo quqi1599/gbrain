@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 import { activatePersistence, type ActivationReport } from './activation.ts';
 import { existingLocalHostId, localHostId } from './identity.ts';
 import { acquireWorktree, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
@@ -7,6 +7,9 @@ import type { NativeLockHandle } from './native-lock.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
+import { assertWriterAdminUnlocked } from './admin-lock.ts';
+import { notQuiescedError } from './blocking-effects.ts';
+import { NOT_PAGE_EMBEDDING_LEASE } from '../page-embedding-lease.ts';
 
 export async function activateSharedSkillPersistence(engine: BrainEngine,
   options: { confirmQuiesced?: boolean; dryRun?: boolean; expectedState?: string } = {}): Promise<{ activated: boolean; protocol_version: 2; filesystem_sources: number; drift_audit?: ActivationReport['drift_audit'] }> {
@@ -24,7 +27,11 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
       if (!binding || binding.owner_host_id !== hostId || binding.state !== 'active' || !binding.local_path) throw quiescence();
       bindings.push(binding);
     }
-    if (!bindings.length) throw new OperationError('writer_registration_required', 'Shared publication requires a registered canonical source root.');
+    if (!bindings.length) {
+      throw opError('writer_registration_required', 'Shared publication requires a registered canonical source root.',
+        'No active source has a registered canonical owner, so shared skill publication was not enabled. Check writer status; claiming a source root is a deliberate topology change the operator reviews.',
+        { fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--json'], consent: [], actor: 'agent', why: 'Shows each source\'s canonical owner and claim, read-only.', requires_exclusive: false } });
+    }
     return bindings;
   };
   const initial = await loadBindings(engine);
@@ -35,15 +42,16 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
   const locks: NativeLockHandle[] = [];
   try {
     for (const binding of [...new Map(initial.map(row => [row.worktree_id, row])).values()]) {
-      const lock = await acquireWorktree(binding);
+      const lock = await acquireWorktree(binding, 0, undefined, undefined, { yieldLanes: true });
       if (!lock) throw quiescence();
       locks.push(lock);
     }
     return await engine.transaction(async tx => {
-      await declarePersistenceProtocol(tx);
       await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true)");
       await assertWriterAdminState(tx, options.expectedState);
       await tx.executeRaw('SELECT singleton FROM persistence_brain WHERE singleton=1 FOR UPDATE');
+      await declarePersistenceProtocol(tx);
+      await assertWriterAdminUnlocked(tx);
       await tx.executeRaw('SELECT id FROM persistence_worktrees ORDER BY id FOR UPDATE');
       await tx.executeRaw('SELECT id FROM sources ORDER BY id FOR SHARE');
       await tx.executeRaw('LOCK TABLE gbrain_cycle_locks IN SHARE MODE');
@@ -51,9 +59,11 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
       const identity = (rows: WorktreeBinding[]) => JSON.stringify(rows.map(row => [row.source_id, row.source_incarnation, row.worktree_id,
         row.owner_host_id, String(row.owner_epoch), String(row.topology_generation), row.relative_path, row.local_path, row.coordination_path]));
       if (identity(current) !== identity(initial)
-        || (await tx.executeRaw('SELECT id FROM gbrain_cycle_locks LIMIT 1')).length
-        || (await tx.executeRaw("SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1")).length
-        || (await tx.executeRaw("SELECT id FROM persistence_effects WHERE state IN ('queued','running') OR recovery IS NOT NULL LIMIT 1")).length) throw quiescence();
+        || (await tx.executeRaw(`SELECT id FROM gbrain_cycle_locks WHERE ${NOT_PAGE_EMBEDDING_LEASE} LIMIT 1`)).length) throw quiescence();
+      if ((await tx.executeRaw("SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1")).length
+        || (await tx.executeRaw("SELECT id FROM persistence_effects WHERE state IN ('queued','running') OR recovery IS NOT NULL LIMIT 1")).length) {
+        throw await notQuiescedError(tx, quiescence().message, { queuedEffects: true });
+      }
       if (options.dryRun) return { activated: false, protocol_version: 2, filesystem_sources: current.length,
         ...(base.drift_audit ? { drift_audit: base.drift_audit } : {}) };
       for (const binding of current) await tx.executeRaw(`INSERT INTO persistence_writer_protocols(worktree_id,host_id,owner_epoch,protocol_version)

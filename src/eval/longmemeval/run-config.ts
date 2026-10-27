@@ -48,6 +48,16 @@ export interface RetrievalPins {
    * receipt's hash is unchanged.
    */
   search_pins?: Record<string, string>;
+  /** `--eval-pool-depth N` (recall experiment): present only when set, so every other receipt's hash is unchanged. */
+  eval_pool_depth?: number;
+  /** System One arm (`--decide`): slots, provider, calibrations, thresholds, force_on, split. Present only when a slot is on or shadow. */
+  decide?: Record<string, unknown>;
+  /** Eval-only fact-key / time-scope arms (retrieval-arms.ts). Present only when an arm is on. */
+  retrieval_arms?: Record<string, unknown>;
+  /** Per-chunk synopsis tier pins (model, prompt version, doc cap, max tokens). Present only when the resolved mode builds synopsis vectors. */
+  contextual_synopsis?: Record<string, unknown>;
+  /** `--via-operation`: the operation, the `expand` sent and the agent-shaped context (via-operation.ts). Present only on that path. */
+  via_operation?: Record<string, unknown>;
 }
 
 /** Stable JSON: sorted keys at every level so key order can never move the hash. */
@@ -159,6 +169,11 @@ export interface RunConfigInput {
   excluded_abstention: number;
   question_ids_file: string | null;
   errors: number;
+  reader?: { mode: string; prompt_version: string; prompt_sha: string; max_tokens: number; model: string; config_hash: string };
+  /** Run-level roll-up of the rows' `decide` receipts (System One arms only). */
+  decide_summary?: Record<string, unknown>;
+  /** `--via-operation` per-arm roll-up: tree, latency p50/p95, model calls per query, CRAG grades, expansion outcomes. */
+  via_operation_summary?: Record<string, unknown>;
 }
 
 /** The `run_config` object stamped on the by_type_summary (schema v2). */
@@ -176,6 +191,10 @@ export function buildRunConfig(input: RunConfigInput): Record<string, unknown> {
     topK: p.top_k,
     trajectory: p.trajectory,
     ...(p.search_pins && Object.keys(p.search_pins).length > 0 ? { search_pins: p.search_pins } : {}),
+    ...(p.eval_pool_depth ? { eval_pool_depth: p.eval_pool_depth } : {}),
+    ...(p.decide ? { decide: p.decide } : {}),
+    ...(p.contextual_synopsis ? { contextual_synopsis: p.contextual_synopsis } : {}),
+    ...(p.via_operation ? { via_operation: p.via_operation } : {}),
     dataset_sha256: input.dataset_sha256,
     dataset_questions: input.dataset_questions,
     question_ids_file: input.question_ids_file,
@@ -192,7 +211,22 @@ export function buildRunConfig(input: RunConfigInput): Record<string, unknown> {
     slug_collisions: input.slug_collisions,
     excluded_abstention: input.excluded_abstention,
     errors: input.errors,
+    ...(input.reader ? { reader: input.reader } : {}),
+    ...(input.decide_summary ? { decide_summary: input.decide_summary } : {}),
+    ...(input.via_operation_summary ? { via_operation_summary: input.via_operation_summary } : {}),
   };
+}
+
+/** D12: duplicate question_ids keep the first occurrence; `warn` gets one line per dropped duplicate. */
+export function dedupeQuestions<Q extends { question_id: string }>(questions: readonly Q[], warn: (line: string) => void): Q[] {
+  const seen = new Set<string>();
+  const out: Q[] = [];
+  for (const q of questions) {
+    if (seen.has(q.question_id)) { warn(`[longmemeval] WARN duplicate question_id ${q.question_id} — keeping the first\n`); continue; }
+    seen.add(q.question_id);
+    out.push(q);
+  }
+  return out;
 }
 
 /** The `question_date` field is optional on disk; the reader emits `Current Date:` only when present. */

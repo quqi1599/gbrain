@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import {
   resolveEntitySlug,
   resolveEntitySlugWithSource,
+  looksLikeSlug,
   slugify,
   type ResolutionSource,
 } from '../src/core/entities/resolve.ts';
@@ -39,6 +40,8 @@ beforeAll(async () => {
     { slug: 'people/charlie-example', title: 'Charlie Example', type: 'person' },
     { slug: 'people/charlie-bankcroft', title: 'Charlie Bankcroft', type: 'person' },
     { slug: 'people/dave-example', title: 'Dave Example', type: 'person' },
+    { slug: 'people/한글-예시', title: '한글 예시', type: 'person' },
+    { slug: '한글-개념', title: '한글 개념', type: 'concept' },
     { slug: 'companies/stripe', title: 'Stripe', type: 'company' },
     { slug: 'companies/stripe-atlas', title: 'Stripe Atlas', type: 'company' },
     { slug: 'companies/benton-capital', title: 'Benton Capital', type: 'company' },
@@ -139,6 +142,11 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toBe('people/alice-example');
   });
 
+  it('exact match works for fully-qualified Unicode slugs', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people/한글-예시');
+    expect(result).toBe('people/한글-예시');
+  });
+
   it('multi-word input does NOT trigger prefix expansion', async () => {
     // "Alice Example" should go through fuzzy match, not prefix expansion
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Alice Example');
@@ -146,8 +154,16 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toContain('alice-example');
   });
 
-  it('preserves a high-specificity multi-token typo match', async () => {
+  it('does not attach a near-name to an existing person (a typo and a different person look alike)', async () => {
+    // "Alice Exampl" is one edit from "Alice Example", exactly as "Carol Exampl" is
+    // one edit from "Carol Example": trigram similarity cannot tell a typo from a
+    // different person, so the reference keeps its own slug.
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Alice Exampl');
+    expect(result).toBe('alice-exampl');
+  });
+
+  it('resolves the same person written in another order or case', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'example, ALICE');
     expect(result).toBe('people/alice-example');
   });
 
@@ -306,19 +322,22 @@ describe('resolveEntitySlugWithSource — fuzzy_match branch', () => {
     expect(result!.source).toBe<ResolutionSource>('fuzzy_match');
   });
 
-  it('returns fuzzy_match for prefix-expansion (bare first name "Alice")', async () => {
+});
+
+describe('resolveEntitySlugWithSource — prefix_expansion branch', () => {
+  it('returns prefix_expansion for a bare first name ("Alice")', async () => {
     // Bare name "Alice" doesn't exact-match any slug, fuzzy fails the
     // 0.4 threshold on short trigrams, so prefix expansion fires and
-    // resolves to people/alice-example. We tag this branch as
-    // fuzzy_match (not fallback_slugify) so trajectory routing knows
-    // it's a real-page resolution.
+    // resolves to people/alice-example. Tagged prefix_expansion: a
+    // real-page resolution, but chosen only because it is the sole
+    // people/alice-* page, so fact writes flag it as unverified.
     const result = await resolveEntitySlugWithSource(
       engine as unknown as BrainEngine,
       'default',
       'Alice',
     );
     expect(result!.slug).toBe('people/alice-example');
-    expect(result!.source).toBe<ResolutionSource>('fuzzy_match');
+    expect(result!.source).toBe<ResolutionSource>('prefix_expansion');
   });
 });
 
@@ -456,5 +475,86 @@ describe('alias_exact — liveness before uniqueness (v0.46.15 codex ship-review
     await engine.setPageAliases('people/twin-b', 'default', ['twinsy']);
     const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'twinsy');
     expect(r!.source).not.toBe<ResolutionSource>('alias_exact');
+  });
+});
+
+describe('Unicode slug shape (#5421)', () => {
+  it('a non-Latin slug without a slash takes the exact-match path', async () => {
+    expect(await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', '한글-개념'))
+      .toEqual({ slug: '한글-개념', source: 'exact_page' });
+  });
+
+  it('a fully-qualified non-Latin slug takes the exact-match path', async () => {
+    expect(await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'people/한글-예시'))
+      .toEqual({ slug: 'people/한글-예시', source: 'exact_page' });
+  });
+
+  it('accepts Unicode letters and numbers but still rejects uppercase, whitespace and punctuation', () => {
+    expect(looksLikeSlug('people/한글-예시')).toBe(true);
+    expect(looksLikeSlug('한글_예시2')).toBe(true);
+    expect(looksLikeSlug('people/alice-example')).toBe(true);
+    expect(looksLikeSlug('People/Alice-Example')).toBe(false);
+    expect(looksLikeSlug('people/Alice-example')).toBe(false);
+    expect(looksLikeSlug('people/한글 예시')).toBe(false);
+    expect(looksLikeSlug('people/alice.example')).toBe(false);
+  });
+
+  it('mixed-case Latin input never takes the exact-match path', async () => {
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'People/Alice-Example');
+    expect(r!.source).not.toBe<ResolutionSource>('exact_page');
+  });
+
+  it('a non-Latin slug that exists only in another source never wins', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('unicode-other', 'Unicode other')`);
+    await engine.putPage('people/다른-예시', {
+      type: 'person', title: '다른 예시', compiled_truth: 'Other source', frontmatter: {},
+    }, { sourceId: 'unicode-other' });
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'people/다른-예시');
+    expect(r!.source).not.toBe<ResolutionSource>('exact_page');
+    expect(await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'unicode-other', 'people/다른-예시'))
+      .toEqual({ slug: 'people/다른-예시', source: 'exact_page' });
+  });
+});
+
+describe('non-Latin fallback slugs (#6691)', () => {
+  let e: PGLiteEngine;
+  beforeAll(async () => {
+    e = new PGLiteEngine();
+    await e.connect({ database_url: '' });
+    await e.initSchema();
+  });
+  afterAll(async () => { await e.disconnect(); });
+  const resolve = (raw: string) => resolveEntitySlug(e as unknown as BrainEngine, 'default', raw);
+
+  it('a non-Latin name with no page mints the slug sync would mint, never an empty slug', async () => {
+    expect(await resolve('Мария')).toBe('мария');
+    expect(await resolve('Иван Петров')).toBe('иван-петров');
+    expect(await resolve('席位')).toBe('席位');
+    expect(await resolveEntitySlugWithSource(e as unknown as BrainEngine, 'default', 'Мария'))
+      .toEqual({ slug: 'мария', source: 'fallback_slugify' });
+  });
+
+  it('a path-shaped non-Latin ref keeps every segment', async () => {
+    expect(await resolve('people/Мария Example')).toBe('people/мария-example');
+  });
+
+  it('input with no letters or numbers resolves to null instead of an empty slug', async () => {
+    expect(await resolve('!!!')).toBeNull();
+    expect(await resolveEntitySlugWithSource(e as unknown as BrainEngine, 'default', '—')).toBeNull();
+  });
+
+  it('Latin names keep their ASCII fallback slugs', async () => {
+    expect(await resolve("O'Brien Example")).toBe('o-brien-example');
+    expect(await resolve('AT&T')).toBe('at-t');
+    expect(await resolve('Søren Example')).toBe('soren-example');
+    expect(await resolve('Đăng Example')).toBe('dang-example');
+    expect(await resolve('José García')).toBe('jose-garcia');
+  });
+
+  it('an empty entity slug filters listFactsSince to nothing, never to every entity', async () => {
+    await e.insertFact({ fact: 'Alice ships weekly', entity_slug: 'people/alice-example', source: 'test', visibility: 'world' }, { source_id: 'default' });
+    const since = new Date(Date.now() - 60_000);
+    expect((await e.listFactsSince('default', since, { entitySlug: 'people/alice-example' })).length).toBe(1);
+    expect(await e.listFactsSince('default', since, { entitySlug: '' })).toEqual([]);
   });
 });

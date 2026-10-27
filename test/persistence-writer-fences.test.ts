@@ -10,12 +10,12 @@ import { softDeleteSource, restoreSource, purgeExpiredSources } from '../src/cor
 import { runGitHubSync } from '../src/core/github-source.ts';
 import { runGoogleSync } from '../src/core/google/google-source.ts';
 import { importFromContent } from '../src/core/import-file.ts';
-import { operationsByName } from '../src/core/operations.ts';
 import { pullRepo, cloneRepo } from '../src/core/git-remote.ts';
 import { hardenBrainRepo } from '../src/core/brain-repo-durability.ts';
 import { recordManagedRoots, registeredManagedRoots } from '../src/core/persistence/root-registry.ts';
 import { assertManagedFilesystemWrite, withFilesystemPublication } from '../src/core/persistence/filesystem-guard.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -35,7 +35,7 @@ beforeAll(async () => {
     await engine.executeRaw('DELETE FROM sources WHERE id=$1', [sourceId]);
     await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)',
       [sourceId, root, JSON.stringify({ managed_clone: true, remote_url: 'https://example.com/brain.git' })]);
-    await engine.executeRaw("INSERT INTO sources(id,name,archived,archive_expires_at) VALUES($1,$1,true,now()-interval '1 hour')", [`${sourceId}-expired`]);
+    await engine.executeRaw("INSERT INTO sources(id,name,archived,archived_at,archive_expires_at) VALUES($1,$1,true,now()-interval '4 days',now()-interval '1 hour')", [`${sourceId}-expired`]);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
   }
 }, 120_000);
@@ -69,10 +69,6 @@ test('unregistered source lifecycle and unsupported legacy writers refuse before
         () => runGitHubSync(engine, sourceId, {} as never, {} as never),
         () => runGoogleSync(engine, sourceId, {} as never, {} as never),
         () => importFromContent(engine, 'blocked', 'canonical material', { sourceId, noEmbed: true }),
-        () => operationsByName.add_link!.handler({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
-          logger: { info() {}, warn() {}, error() {} } }, { from: 'notes/example', to: 'notes/other' }),
-        () => operationsByName.remove_link!.handler({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
-          logger: { info() {}, warn() {}, error() {} } }, { from: 'notes/example', to: 'notes/other' }),
       ]) await expect(work()).rejects.toMatchObject({ code: 'writer_coordinator_required' });
       expect(readFileSync(join(root, 'sentinel.md'), 'utf8')).toBe('canonical sentinel');
       expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1', [sourceId])).toHaveLength(1);
@@ -89,10 +85,10 @@ test('free-text aliases and sync checkpoints require an authorized publication t
     await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
       await tx.executeRaw("UPDATE sources SET last_commit='owned' WHERE id=$1", [sourceId]);
       await tx.executeRaw('INSERT INTO page_aliases(source_id,alias_norm,slug) VALUES($1,$2,$3)', [sourceId, 'example alias', 'notes/example']);
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [sourceId]))[0].last_commit).toBe('owned');
     await expect(engine.executeRaw("UPDATE sources SET last_commit='after-capability' WHERE id=$1", [sourceId])).rejects.toThrow('writer_coordinator_required');
-    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM page_aliases WHERE source_id=$1', [sourceId])));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM page_aliases WHERE source_id=$1', [sourceId]), TEST_WRITE_ATTRIBUTION));
   }
 });
 
@@ -108,7 +104,7 @@ test('durable root records fence new processes, symlink aliases and separate use
       expect(() => assertManagedFilesystemWrite(target)).toThrow('managed canonical worktree');
     }
     expect(() => cloneRepo('https://example.com/brain.git', root)).toThrow('managed canonical worktree');
-    expect(() => pullRepo(root)).toThrow('managed canonical worktree');
+    await expect(pullRepo(root)).rejects.toThrow('managed canonical worktree');
     await expect(hardenBrainRepo({ repoPath: root, sourceId })).rejects.toMatchObject({ code: 'writer_coordinator_required' });
     let inherited: (() => void) | undefined;
     await withFilesystemPublication([root], async () => {

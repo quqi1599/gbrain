@@ -58,10 +58,12 @@ gbrain search "<relevant terms>" --limit 10
 ```
 
 For concept-shaped or synonym-phrased claims, escalate to `gbrain query
-"<question>"` (LLM expansion recovers phrasings `search` misses). Also grep
-the brain repo checkout directly — resolve it once from config:
+"<question>"` (LLM expansion recovers phrasings `search` misses). To list
+every indexed page carrying the claim, use a keyword search (it pages every
+match); grep the checkout only for edits not yet synced:
 
 ```bash
+gbrain search '"<wrong claim terms>"' --match keyword
 BRAIN_DIR=$(gbrain config get sync.repo_path)
 grep -ri "<wrong claim terms>" "$BRAIN_DIR/people/" "$BRAIN_DIR/companies/" "$BRAIN_DIR/concepts/" 2>/dev/null
 ```
@@ -166,8 +168,8 @@ The wrong fact may have propagated into OTHER brain pages, synthesis output,
 or memory files.
 
 ```bash
-grep -ri "<wrong claim terms>" "$BRAIN_DIR" 2>/dev/null | grep -v ".git"
-gbrain search "<wrong claim terms>" --limit 20
+gbrain search '"<wrong claim terms>"' --match keyword
+grep -ri "<wrong claim terms>" "$BRAIN_DIR" 2>/dev/null | grep -v ".git"   # edits not yet synced
 ```
 
 Fix ALL instances, not just the first one found. Re-sync after repo edits.
@@ -257,6 +259,14 @@ answer bank).
   citation-fixer.
 - frontmatter-guard (host-side) — structural page validation (YAML shape),
   not claim truth.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `forget <fact-id>` / `remember` returns `fact_not_found` or `fact_already_expired`: re-run `recall` to get the current fact id; never forget by guessing an id.
+- A page fix returns `revision_conflict`: re-read the page, apply the correction to the current text, and save with the new revision.
+- `write_pending` (exit 10): the correction is accepted but not committed; poll `gbrain write-request <request_id>` before telling the user it is fixed.
 
 ## Anti-Patterns
 

@@ -62,6 +62,43 @@ export async function routeThinClientCommand(
   const sub = args[0];
   const rest = args.slice(1);
 
+  if (command === 'sources' && sub === 'shared-skills') {
+    if (rest.includes('--help') || rest.includes('-h')) {
+      console.log((await import('./sources-shared-skills.ts')).SOURCES_SHARED_SKILLS_HELP);
+      return true;
+    }
+    const [id, action] = rest.filter(arg => !arg.startsWith('-'));
+    if (!id || !/^[a-z0-9-]{1,32}$/.test(id)) return false;
+    const { sharedSkillsRemoteRefusal } = await import('../core/shared-skills/source-opt-out.ts');
+    const { exitCliError } = await import('../cli/cli-error.ts');
+    exitCliError(sharedSkillsRemoteRefusal(id, action === 'on' || action === 'off' ? action : 'status'), 'sources');
+  }
+
+  if (command === 'beliefs' && sub === 'changes' && !rest.includes('--help') && !rest.includes('-h')) {
+    if (rest.includes('--source') || rest.some(a => a.startsWith('--source='))) return false; // the remote token names the source
+    const { beliefsChangesArgs } = await import('./beliefs.ts');
+    const { renderBeliefChanges } = await import('../core/belief/changes.ts');
+    const { opError, OperationError } = await import('../core/ops/contract.ts');
+    const { writeCliError } = await import('../cli/cli-error.ts');
+    const { jsonRequested, setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+    try {
+      const { entities, since } = beliefsChangesArgs(args);
+      const result = await call(cfg, 'delta', { since, beliefs: true, ...(entities.length ? { entities: entities.join(',') } : {}) }) as { beliefs?: import('../core/belief/changes.ts').BeliefChanges };
+      if (!result?.beliefs) throw opError('unavailable', 'The remote brain\'s delta does not return belief changes: the brain host runs a gbrain older than the belief ledger weekly diff.', 'Upgrade gbrain on the brain host (gbrain upgrade there).');
+      if (jsonRequested(args)) printJson(result.beliefs);
+      else console.log(renderBeliefChanges(result.beliefs));
+    } catch (error) {
+      if (!(error instanceof OperationError)) throw error;
+      setCliExitVerdict(writeCliError(error, 'beliefs', { json: jsonRequested(args) }));
+    }
+    return true;
+  }
+
+  if (command === 'config') {
+    const { tryRunConfigThinClient } = await import('./config.ts');
+    return tryRunConfigThinClient(args);
+  }
+
   if (command === 'takes') {
     switch (sub) {
       case 'list': {
@@ -81,6 +118,7 @@ export async function routeThinClientCommand(
         return true;
       }
       case 'scorecard': {
+        if (rest.includes('--group-by') || rest.includes('--min-n')) return false; // W7: private journal groups, host-bound
         const holder = rest[0] && !rest[0].startsWith('--') ? rest[0] : flagValue(rest, '--holder');
         printJson(await call(cfg, 'takes_scorecard', { ...(holder ? { holder } : {}) }));
         return true;
@@ -103,7 +141,7 @@ export async function routeThinClientCommand(
   }
 
   if (command === 'search') {
-    if (sub === 'modes' && !rest.includes('--reset') && !rest.includes('--source')) {
+    if (sub === 'modes' && !rest.includes('--reset') && !rest.includes('--source') && !rest.includes('--mode')) {
       printJson(await call(cfg, 'search_modes', {}));
       return true;
     }
@@ -115,7 +153,7 @@ export async function routeThinClientCommand(
       printJson(await call(cfg, 'search_tune', {}));
       return true;
     }
-    return false; // modes --reset / modes --source (the reset dry-run) / tune --apply / diagnose — host-side config or live probe
+    return false; // modes --reset / modes --mode|--source (the reset dry-run) / tune --apply / diagnose — host-side config or live probe
   }
 
   if (command === 'jobs' && sub === 'stats') {

@@ -158,7 +158,7 @@ describe('request_tools catalog (no args)', () => {
     // catalog includes them alongside the submit_agent/get_agent_job pair.
     expect(names).toEqual([
       'cancel_job', 'get_agent_job', 'get_job', 'get_job_progress',
-      'list_jobs', 'request_tools', 'submit_agent',
+      'list_jobs', 'request_tools', 'submit_agent', 'wait_job',
     ]);
   });
 
@@ -198,6 +198,76 @@ describe('request_tools {tools: [...]} descriptor fetch (D5)', () => {
     expect(body.tools[0].inputSchema.properties.slug).toBeDefined();
     const raw = res.content[0].text;
     expect(raw).not.toContain('no_such_tool_xyz');
+  });
+
+  test('a starter ceiling still returns every parameter the starter tool list omits (GBRA-156)', async () => {
+    const res = await dispatchToolCall(engine, 'request_tools', { tools: ['get_page', 'capture', 'query'] }, {
+      ...HTTP, surfaceCeiling: 'starter',
+    });
+    const body = parsed(res);
+    const byName = new Map(body.tools.map((t: { name: string; inputSchema: { properties: Record<string, unknown> } }) => [t.name, t.inputSchema.properties]));
+    for (const name of ['get_page', 'capture', 'query']) {
+      const op = operations.find(o => o.name === name)!;
+      expect(Object.keys(byName.get(name) as Record<string, unknown>).sort(), name).toEqual(Object.keys(op.params).sort());
+    }
+  });
+});
+
+describe('D1: request_tools with an empty or unknown-only list returns the catalog', () => {
+  const RO = () => ({ ...HTTP, auth: authFor('ro-client', ['read']) });
+
+  test('{tools: []} returns the grouped catalog (master returned {tools: []})', async () => {
+    const res = await dispatchToolCall(engine, 'request_tools', { tools: [] }, RO());
+    expect(res.isError ?? false).toBe(false);
+    const body = parsed(res);
+    expect(body.tools).toEqual([]);
+    const catalog = parsed(await dispatchToolCall(engine, 'request_tools', {}, RO())).catalog;
+    expect(body.catalog).toEqual(catalog);
+    expect(body.total_tools).toBe(flatNames(catalog).length);
+    expect(body.did_you_mean).toBeUndefined();
+    expect(body.note).toContain('catalog lists every tool you can call');
+  });
+
+  test('unknown-only list: catalog plus a did-you-mean drawn from caller-visible ops only', async () => {
+    const res = await dispatchToolCall(engine, 'request_tools', { tools: ['get_pagez', 'serch'] }, RO());
+    const body = parsed(res);
+    expect(body.tools).toEqual([]);
+    expect(body.did_you_mean).toEqual(['get_page', 'search']);
+    const visible = new Set(flatNames(body.catalog));
+    for (const name of body.did_you_mean) expect(visible.has(name)).toBe(true);
+    expect(res.content[0].text).not.toContain('get_pagez');
+    expect(res.content[0].text).not.toContain('serch');
+  });
+
+  test('a near-miss of an invisible op never suggests it (put_page is write-scope)', async () => {
+    const body = parsed(await dispatchToolCall(engine, 'request_tools', { tools: ['put_pagex'] }, RO()));
+    expect(flatNames(body.catalog)).not.toContain('put_page');
+    expect(body.did_you_mean ?? []).not.toContain('put_page');
+    expect(body.did_you_mean ?? []).not.toContain('put_pages');
+  });
+
+  test('existing-but-invisible name and nonexistent name: byte-identical HTTP envelopes', async () => {
+    // put_page exists but needs write scope; gut_page exists nowhere. Both sit
+    // closest to the visible get_page, so the only thing that could differ is
+    // whether the op exists, and it must not show.
+    expect(operations.some(o => o.name === 'put_page')).toBe(true);
+    expect(operations.some(o => o.name === 'gut_page')).toBe(false);
+    const invisible = await dispatchToolCall(engine, 'request_tools', { tools: ['put_page'] }, RO());
+    const nonexistent = await dispatchToolCall(engine, 'request_tools', { tools: ['gut_page'] }, RO());
+    expect(parsed(invisible).did_you_mean).toEqual(['get_page']);
+    expect(JSON.stringify(invisible)).toBe(JSON.stringify(nonexistent));
+    // Far from every visible name (admin-only vs nonexistent): no suggestion either way.
+    expect(operations.some(o => o.name === 'sync_brain')).toBe(true);
+    const admin = await dispatchToolCall(engine, 'request_tools', { tools: ['sync_brain'] }, RO());
+    const none = await dispatchToolCall(engine, 'request_tools', { tools: ['zzqx_nothing_here'] }, RO());
+    expect(parsed(admin).did_you_mean).toBeUndefined();
+    expect(JSON.stringify(admin)).toBe(JSON.stringify(none));
+  });
+
+  test('a mixed list keeps the descriptor behavior (no catalog)', async () => {
+    const body = parsed(await dispatchToolCall(engine, 'request_tools', { tools: ['get_page', 'no_such_tool_xyz'] }, RO()));
+    expect(body.tools.map((t: { name: string }) => t.name)).toEqual(['get_page']);
+    expect(body.catalog).toBeUndefined();
   });
 });
 

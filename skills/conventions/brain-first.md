@@ -5,6 +5,67 @@
 Sub-agents and fresh sessions inherit gbrain tools but not the knowledge of
 when and how to use them. This file is that knowledge.
 
+## Retrieval: gbrain first
+
+For anything in the brain, search gbrain, then read the page a hit names. Don't
+`grep`, `rg` or `cat` the brain checkout, or run SQL over pages and
+frontmatter, before gbrain: gbrain reads the index across sources, ranks results,
+filters by type, date and source, and returns the slug to read next. Use the
+files only when gbrain is unreachable or for an edit not yet synced.
+
+Prefer the gbrain MCP tools (`search`, `query`, `get_page`, `recall`) when your
+harness has the server connected: it stays connected, so each call skips the
+CLI's startup, which costs seconds per call on a large pooled Postgres brain.
+The CLI commands below take the same filters.
+
+```bash
+gbrain search "Acme Example"                                    # names, codes, exact phrases
+gbrain search '"ZEBRA-42" OR "inventory sync"' --match keyword  # every page with any term (instead of grep)
+gbrain query "why did the launch move"                          # questions and concepts
+gbrain search "launch" --types '["meeting","person"]'           # only these page types
+gbrain query "launch" --since 2026-09-01 --until 2026-09-30     # date window (also --since 30d)
+gbrain search "launch" --source source-a --limit 5 --json | jq -r '.[].slug'
+gbrain get companies/acme-example                               # read the page a hit points to
+gbrain recall "Alice Example"                                   # facts saved with remember
+gbrain backlinks companies/acme-example --type meeting          # pages that link here (instead of grepping a slug)
+gbrain timeline companies/acme-example --since 2026-10-01       # dated events on one page
+gbrain list --type meeting --limit 50                           # enumerate by type or --tag (instead of SQL)
+```
+
+- `--types` takes a JSON array. `--since`/`--until` are `query` flags
+  (YYYY-MM-DD or 7d/2w/1y) and match each page's effective date: its
+  frontmatter date, else when it was imported.
+- Keyword search matches words, not slugs: search `"Acme Example"`, and use
+  `backlinks` to find pages linking to `companies/acme-example`.
+- Without `--source`, a search reads the resolved source (a notice names it
+  when it routes); `--source __all__` searches every source.
+- Notices and `[AGENT]` blocks go to stderr, so `--json` stdout is clean JSON.
+  Read a degraded notice before concluding the brain has nothing. Never send
+  stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
+  then reads as "no results". Check the exit code too.
+
+<a id="identity-exact-match"></a>
+## Identity needs an exact match
+
+Resolving an email sender, a calendar attendee or a contact to a person page is
+an identity decision, and a search's top hit is not one: ranking always returns
+something, so taking it files strangers onto known contacts. Use the exact
+lookup:
+
+```bash
+gbrain whois alice@acme-example.com --source-id __all__ --json   # an email address
+gbrain whois "Alice Example" --source-id __all__ --json          # a display name
+```
+
+`whois` returns the entity pages whose frontmatter email, title or declared
+alias equals the query, ignoring case, accents and quotes, and never anything
+fuzzy. Look up the email address first and the display name only when the
+address has no match. One match is the person. `matches: []` means no exact
+match: treat the sender as new or ask the user. `ambiguous: true` means
+several pages match: ask, or resolve by the email address. Never fall back to
+a search's top hit, a partial name or a similar address, and never merge a
+stranger into a known contact's page.
+
 ## Available GBrain Tools
 
 Your tool inventory includes these (prefixed `gbrain__` in OpenClaw):
@@ -12,7 +73,7 @@ Your tool inventory includes these (prefixed `gbrain__` in OpenClaw):
 | Tool | Use for |
 |------|---------|
 | `gbrain__search` / `search` | Exact tokens / known names — cheap hybrid, no expansion |
-| `gbrain__query` / `query` | Concept / landscape questions — hybrid + LLM expansion |
+| `gbrain__query` / `query` | Concept / landscape questions — hybrid; `expand: true` adds LLM expansion |
 | `gbrain__get_page` / `get_page` | Direct page read when you know the slug |
 | `gbrain__get_links` / `get_links` | Outgoing links from a page |
 | `gbrain__get_backlinks` / `get_backlinks` | Who references this entity |
@@ -33,9 +94,9 @@ Route by the SHAPE of the question, then escalate:
 1. **Exact known token / name / structured field** → **`search`** — cheap
    hybrid (vector + keyword, no expansion; embedding-only cost).
 2. **Concept / landscape / synonym-phrased question** ("all the X that do Y",
-   "the landscape of Z") → **`query`** FIRST — multi-query expansion recovers
-   phrasings `search` misses. Costs one extra LLM expansion call; worth it
-   for these.
+   "the landscape of Z") → **`query`** FIRST — meaning-match and reranking recover
+   phrasings `search` misses. `expand: true` adds one LLM expansion call
+   when the results look thin.
 3. **`get_page`** if you found a slug — read the full compiled truth.
 4. **External APIs only after steps 1-2 return nothing useful.**
 

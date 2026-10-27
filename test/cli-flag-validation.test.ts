@@ -22,7 +22,7 @@ import {
   findUnknownFlag,
   findUnknownOpFlag,
   CLI_ONLY,
-} from '../src/cli.ts';
+} from '../src/cli/main.ts';
 import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
 import { operations, operationsByName } from '../src/core/operations.ts';
 import { buildFlagRegistry } from '../scripts/generate-flag-registry.ts';
@@ -107,6 +107,12 @@ describe('#2185 acceptance — real usage stays legal', () => {
     expect(validateCommandFlags('sync', ['--full'])).toBeNull();
   });
 
+  test('#7599: serve does not take sync --watch from the pool-profile module it imports', () => {
+    expect(validateCommandFlags('serve', ['--watch'])).toBe('--watch');
+    expect(validateCommandFlags('sync', ['--watch'])).toBeNull();
+    for (const args of [['--access', 'read-only'], ['--access=read-only']]) expect(validateCommandFlags('serve', args)).toBeNull();
+  });
+
   test('scope flags require direct consumption on upgrade surfaces', () => {
     expect(validateCommandFlags('reindex', ['--markdown', '--type', 'atom'])).toBeNull();
     expect(validateCommandFlags('upgrade', ['--type', 'atom'])).toBe('--type');
@@ -137,7 +143,7 @@ describe('#2185 acceptance — real usage stays legal', () => {
   });
 
   test('--json=<v> is coherent between validator and parser (no positional corruption)', async () => {
-    const { parseOpArgs } = await import('../src/cli.ts');
+    const { parseOpArgs } = await import('../src/cli/main.ts');
     const search = operationsByName.search;
     // Validator accepts any --json form.
     expect(findUnknownOpFlag(search, ['--json=true', 'needle'])).toBeNull();
@@ -155,7 +161,7 @@ describe('#2185 acceptance — real usage stays legal', () => {
 
 describe('#2185 parseOpArgs inline = form (regression rule: changed token consumption)', () => {
   test('string and number params via =, positional untouched', async () => {
-    const { parseOpArgs } = await import('../src/cli.ts');
+    const { parseOpArgs } = await import('../src/cli/main.ts');
     const search = operationsByName.search;
     const p = parseOpArgs(search, ['needle', '--limit=5']);
     expect(p.query).toBe('needle');
@@ -163,7 +169,7 @@ describe('#2185 parseOpArgs inline = form (regression rule: changed token consum
   });
 
   test('boolean =false negates; =0 keeps the raw!==false rule (pinned semantics)', async () => {
-    const { parseOpArgs } = await import('../src/cli.ts');
+    const { parseOpArgs } = await import('../src/cli/main.ts');
     const withBool = operations.find(o =>
       o.cliHints && Object.values(o.params).some(pp => pp.type === 'boolean'))!;
     const key = Object.entries(withBool.params).find(([, pp]) => pp.type === 'boolean')![0];
@@ -173,7 +179,7 @@ describe('#2185 parseOpArgs inline = form (regression rule: changed token consum
   });
 
   test('undeclared =-form key keeps the historical junk-fallthrough (validator rejects it first)', async () => {
-    const { parseOpArgs } = await import('../src/cli.ts');
+    const { parseOpArgs } = await import('../src/cli/main.ts');
     const search = operationsByName.search;
     // The validator is the strict gate; the parser's legacy behavior for
     // undeclared keys is unchanged — pinned so a refactor can't silently
@@ -196,7 +202,7 @@ describe('#2185 red-team regressions', () => {
   });
 
   test('--dry-run is a real CLI-local boolean on op commands (trailing position sets it)', async () => {
-    const { parseOpArgs } = await import('../src/cli.ts');
+    const { parseOpArgs } = await import('../src/cli/main.ts');
     // An op WITHOUT a declared dry_run param — pre-fix, trailing --dry-run
     // set NOTHING (ctx.dryRun stayed false → the REAL destructive action
     // ran despite the rehearsal request), and leading --dry-run consumed
@@ -225,6 +231,16 @@ describe('#2185 red-team regressions', () => {
     // backfill genuinely consumes it (has('--dry-run') in backfill.ts) —
     // the gate must not strip real consumers.
     expect(CLI_FLAG_REGISTRY['backfill']).toContain('--dry-run');
+  });
+
+  test('the internal run-child argv builder does not legalise its flags for importers', () => {
+    // autopilot imports job-isolation.ts only to resolve the child CLI; the
+    // module's `jobs run-child --job-id N [--allow-shell-jobs]` literals are
+    // the worker-to-child argv, not autopilot flags.
+    expect(validateCommandFlags('autopilot', ['--status', '--allow-shell-jobs'])).toBe('--allow-shell-jobs');
+    expect(validateCommandFlags('autopilot', ['--status', '--job-id', '1'])).toBe('--job-id');
+    expect(validateCommandFlags('jobs', ['work', '--allow-shell-jobs'])).toBeNull();
+    expect(validateCommandFlags('jobs', ['run-child', '--job-id', '1', '--allow-shell-jobs'])).toBeNull();
   });
 });
 
@@ -270,7 +286,7 @@ describe('#2185 subprocess smokes — end-to-end error surface', () => {
 
   test('init --migrate-only --dry-run fails loud BEFORE any engine work', () => {
     const r = run(['init', '--migrate-only', '--dry-run']);
-    expect(r.status).toBe(1);
+    expect(r.status).toBe(2);
     expect(r.stderr).toContain("unknown flag --dry-run for 'gbrain init'");
     // Pre-engine: no migration output may appear.
     expect(r.stderr).not.toContain('migration');
@@ -278,7 +294,7 @@ describe('#2185 subprocess smokes — end-to-end error surface', () => {
 
   test('typo on an op command fails loud with the command named', () => {
     const r = run(['search', 'needle', '--jsno']);
-    expect(r.status).toBe(1);
+    expect(r.status).toBe(2);
     expect(r.stderr).toContain("unknown flag --jsno for 'gbrain search'");
   });
 
@@ -292,7 +308,7 @@ describe('#2185 subprocess smokes — end-to-end error surface', () => {
     // --quiet is a parseGlobalFlags global: it never reaches the validator.
     // The bogus flag proves validation still ran on what remained.
     const r = run(['init', '--migrate-only', '--quiet', '--definitely-bogus-xyz']);
-    expect(r.status).toBe(1);
+    expect(r.status).toBe(2);
     expect(r.stderr).toContain("unknown flag --definitely-bogus-xyz for 'gbrain init'");
     expect(r.stderr).not.toContain('--quiet');
   });
@@ -301,8 +317,100 @@ describe('#2185 subprocess smokes — end-to-end error surface', () => {
     // Fast path: --help short-circuits AFTER global parse, so a bogus flag
     // alongside --source proves ordering: --source accepted, bogus rejected.
     const r = run(['search', 'needle', '--source', 'nope-source', '--definitely-bogus-xyz']);
-    expect(r.status).toBe(1);
+    expect(r.status).toBe(2);
     expect(r.stderr).toContain("unknown flag --definitely-bogus-xyz for 'gbrain search'");
     expect(r.stderr).not.toContain('unknown flag --source');
+  });
+});
+
+describe('#5700 parseOpArgs refuses to swallow a known flag as a value', () => {
+  test('a non-boolean flag followed by a known flag of the same command is an argument error', async () => {
+    const { parseOpArgs } = await import('../src/cli/main.ts');
+    const put = operations.find(o => o.cliHints?.name === 'put')!;
+    // The reported shape: `gbrain put x --content --source default` with the
+    // body on stdin used to store the literal "--source" as the page body,
+    // drop the real --source, and never read the pipe (content already set).
+    expect(() => parseOpArgs(put, ['repro-a', '--content', '--source', 'default'])).toThrow(
+      /--content requires a value, but '--source' is a flag/,
+    );
+    // The inline = spelling of the swallowed flag is refused the same way.
+    expect(() => parseOpArgs(put, ['repro-e', '--content', '--source=default'])).toThrow(
+      /--content requires a value, but '--source=default' is a flag/,
+    );
+    // A CLI-local boolean in the value slot is the same mistake.
+    expect(() => parseOpArgs(put, ['repro', '--content', '--dry-run'])).toThrow(
+      /--content requires a value, but '--dry-run' is a flag/,
+    );
+    // The --no-<boolean> form counts as a known flag too.
+    expect(() => parseOpArgs(put, ['repro', '--content', '--no-allow-empty'])).toThrow(
+      /--content requires a value, but '--no-allow-empty' is a flag/,
+    );
+  });
+
+  test('the stdin-capable flag names the stdin recovery; other flags do not', async () => {
+    const { parseOpArgs } = await import('../src/cli/main.ts');
+    const put = operations.find(o => o.cliHints?.name === 'put')!;
+    expect(() => parseOpArgs(put, ['repro', '--content', '--source', 'default'])).toThrow(
+      "--content requires a value, but '--source' is a flag; omit --content (or put it last) to read stdin.",
+    );
+    expect(() => parseOpArgs(put, ['repro', '--source-kind', '--content', 'x'])).toThrow(
+      "--source-kind requires a value, but '--content' is a flag.",
+    );
+  });
+
+  test('flag order alone still decides nothing: both orders reach the same params', async () => {
+    const { parseOpArgs } = await import('../src/cli/main.ts');
+    const put = operations.find(o => o.cliHints?.name === 'put')!;
+    // Working order — --content last, body from stdin (unit test: no pipe, so
+    // content stays unset and applyStdinParam would fill it).
+    const ok = parseOpArgs(put, ['repro-b', '--source', 'default', '--content']);
+    expect(ok.source).toBe('default');
+    expect(ok.slug).toBe('repro-b');
+    expect(ok.content).toBeUndefined();
+  });
+
+  test('a value that merely starts with -- is still a value', async () => {
+    const { parseOpArgs } = await import('../src/cli/main.ts');
+    const put = operations.find(o => o.cliHints?.name === 'put')!;
+    // Markdown bodies legitimately start with "--" (an em-dash list, a YAML
+    // comment). Only a token this command knows as a flag is refused.
+    const p = parseOpArgs(put, ['repro', '--content', '-- a body', '--source', 'default']);
+    expect(p.content).toBe('-- a body');
+    expect(p.source).toBe('default');
+    // An unknown flag-looking token is the validator's business, not the
+    // parser's — it stays a value here, exactly as before.
+    expect(parseOpArgs(put, ['repro', '--content', '--not-a-real-flag']).content).toBe('--not-a-real-flag');
+  });
+
+  test('findUnknownOpFlag still rejects a real unknown flag next to a known one', () => {
+    // The mirror keeps consuming the known flag's value, so the bogus flag
+    // after it is still seen.
+    const put = operations.find(o => o.cliHints?.name === 'put')!;
+    expect(findUnknownOpFlag(put, ['repro', '--source', 'default', BOGUS])).toBe(BOGUS);
+    expect(findUnknownOpFlag(put, ['repro', '--content', 'body', BOGUS])).toBe(BOGUS);
+  });
+});
+
+describe('#5700 subprocess smoke — the reported invocation fails loud', () => {
+  const run = (args: string[]) =>
+    spawnSync('bun', ['src/cli.ts', ...args], {
+      encoding: 'utf-8',
+      timeout: 30_000,
+      env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },
+    });
+
+  test('put --content --source <id> exits 2 naming both flags', () => {
+    const r = run(['put', 'repro-a', '--content', '--source', 'default']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("--content requires a value, but '--source' is a flag");
+    // Pre-write: the page must not have been created with a flag token body.
+    expect(r.stdout).not.toContain('created_or_updated');
+  });
+
+  test('put --help documents stdin and that --content needs a value', () => {
+    const r = run(['put', '--help']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('gbrain put <slug> [options] < file   (--content read from stdin)');
+    expect(r.stdout).toMatch(/--content .*\(required: --content needs a value; omit --content, or put it last, to read stdin\)/);
   });
 });

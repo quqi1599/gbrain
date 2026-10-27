@@ -2,7 +2,8 @@
 
 GBrain's Minion worker ships with a full set of built-in handlers,
 registered by `registerBuiltinHandlers` in `src/commands/jobs.ts` —
-that registry is the source of truth. Examples: `sync`, `embed`,
+that registry is the source of truth (handler bodies live in
+`src/core/minions/handlers/`). Examples: `sync`, `embed`,
 `lint`, `import`, `extract`, `backlinks`, `autopilot-cycle`, `shell`,
 `subagent`, `orphans`, `integrity`, plus dream-cycle phases and other
 maintenance jobs. Submitting an unknown job name with
@@ -102,7 +103,13 @@ network library they use.
 
 **Idempotency.** The queue enforces unique `idempotency_key` at the DB
 layer, so you don't need to worry about double-submits from a cron that
-fires while the previous invocation is still running.
+fires while the previous invocation is still running. A dead or cancelled
+job does not hold its key: the next submit with that key clears it from the
+old row and records it there as `data.__released_idempotency_key`, which is
+why many rows (subagent rows especially) carry that field. It is bookkeeping,
+not a parameter: the dream paid-loop breaker, the synthesize daily cap and
+doctor's queue checks read it so a resubmitted key's earlier deaths and
+submissions still count.
 
 ## Gbrain's migration flow
 

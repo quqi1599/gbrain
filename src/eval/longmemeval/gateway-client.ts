@@ -14,6 +14,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import type { ThinkLLMClient } from '../../core/think/index.ts';
 import { chat as gatewayChat } from '../../core/ai/gateway.ts';
 import { normalizeModelId } from '../../core/model-id.ts';
+import { readerUsageFromGateway } from './reader.ts';
 
 export function makeGatewayThinkClient(): ThinkLLMClient {
   return {
@@ -36,6 +37,7 @@ export function makeGatewayThinkClient(): ThinkLLMClient {
         system,
         messages,
         maxTokens: params.max_tokens,
+        allowFallback: false,
       });
       return {
         id: '',
@@ -46,7 +48,9 @@ export function makeGatewayThinkClient(): ThinkLLMClient {
         model: result.responseModel ?? result.model,
         content: [{ type: 'text', text: result.text }],
         usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens },
-        stop_reason: result.stopReason === 'length' ? 'max_tokens' : 'end_turn',
+        // A1: the provider-normalized record the reader keeps on every row (cache and reasoning subsets included).
+        gbrain_usage: readerUsageFromGateway(result.usage),
+        stop_reason: result.stopReason === 'length' ? 'max_tokens' : result.stopReason === 'end' ? 'end_turn' : result.stopReason ?? null,
       } as unknown as Anthropic.Message;
     },
   };

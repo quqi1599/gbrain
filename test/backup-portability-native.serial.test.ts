@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { AgentInstallError, checkedManagedPaths, confinedPath, privateWrite, readInstallReceipt, sha256, type AgentInstallReceipt } from '../src/core/agent-install/state.ts';
 import { extractPgliteDump, readBackupArchive, writeBackupArchive } from '../src/core/backup/archive.ts';
@@ -13,6 +13,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { getEmbeddingDimensions } from '../src/core/ai/gateway.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
 import * as privacy from '../src/core/backup/private-path.ts';
 
@@ -169,7 +170,7 @@ beforeAll(async () => {
       await tx.setConfig('sync.repo_path', join(root, 'memory', 'nested'));
       await tx.setConfig('mcp.skills_dir', join(root, 'instructions', 'nested'));
       await tx.setConfig('connectors.chatgpt.auto_sync', 'true');
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     const queue = new MinionQueue(engine);
     await queue.add('subagent', { fixture: 'unfinished' }, {}, { allowProtectedSubmit: true });
     const completed = await queue.add('subagent', { fixture: 'completed' }, {}, { allowProtectedSubmit: true });
@@ -186,7 +187,23 @@ beforeAll(async () => {
 
 afterAll(() => { if (temporary) fs.rmSync(temporary, { recursive: true, force: true }); });
 
+/**
+ * A fresh Windows runner's first PowerShell launch pays the engine's cold start (3-15 s on CI, against
+ * 0.2-1.5 s once warm), which can exceed the production 15 s bound on its own. The console probe compares
+ * window modes, so it first waits for one PowerShell that loads the ACL types to report it is ready.
+ */
+async function powershellReady(): Promise<number> {
+  const started = performance.now();
+  const output = await new Promise<string>((done, fail) => childProcess.execFile(
+    join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "[void][System.Security.AccessControl.DirectorySecurity]::new(); [Console]::Write('ready')"],
+    { encoding: 'utf8', maxBuffer: 64 * 1024, windowsHide: true }, (error, stdout) => error ? fail(error) : done(stdout)));
+  if (output !== 'ready') throw new Error(`Windows PowerShell started but did not report ready (stdout ${JSON.stringify(output.slice(0, 200))}); run powershell.exe -NoProfile on this runner to see why`);
+  return Math.round(performance.now() - started);
+}
+
 test.skipIf(process.platform !== 'win32' || process.env.GBRAIN_TEST_BACKUP_CONSOLE_PROBE !== '1')('private ACL setup compares hidden and visible PowerShell windows', async () => {
+  const readyMs = await powershellReady();
   const observations = [];
   for (const mode of ['hidden', 'visible', 'visible', 'hidden'] as const) {
     const path = join(temporary, `console-${observations.length} [literal] 'é`);
@@ -243,7 +260,7 @@ test.skipIf(process.platform !== 'win32' || process.env.GBRAIN_TEST_BACKUP_CONSO
       sameIdentity: before.dev === after.dev && before.ino === after.ino && before.birthtimeNs === after.birthtimeNs,
       empty: after.isDirectory() && fs.readdirSync(path).length === 0 });
   }
-  process.stderr.write(`Windows backup console controls: ${JSON.stringify({ arch: process.arch, runtime: Bun.version, observations })}\n`);
+  process.stderr.write(`Windows backup console controls: ${JSON.stringify({ arch: process.arch, runtime: Bun.version, readyMs, observations })}\n`);
   for (const observation of observations) {
     expect(observation.launches).toBe(1);
     expect(observation.bounded).toBe(true);
@@ -1132,4 +1149,37 @@ for (const failureCode of [null, 'EPERM', 'EIO'] as const) test(failureCode
     expect((await databaseState(into)).facts).toEqual(original.facts);
   }
   await expectOriginal();
+}, 120_000);
+
+test('restore flushes every restored cluster file in the tree sync before the ready receipt, none while extracting', async () => {
+  // win32-arm64 (2026-10-22, native-only probe runs): a per-file flush while extracting the cluster cost 11-22 s per
+  // restore, and the tree sync flushed every file again; the tree sync alone keeps the durability contract.
+  const into = join(temporary, 'single-flush');
+  const open = fs.openSync; const fsync = fs.fsyncSync;
+  const handles = new Map<number, { path: string; flags: string }>();
+  const extracted: string[] = [];
+  const treeSynced = new Set<string>();
+  const cluster = join('restored', '.gbrain', 'brain.pglite') + sep;
+  const opened = spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
+    const fd = open(path, flags, mode);
+    const at = String(path).indexOf(cluster);
+    if (String(path).startsWith(join(into, '.restore-')) && at >= 0) handles.set(fd, { path: String(path).slice(at + cluster.length), flags: String(flags) });
+    return fd;
+  });
+  const synced = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+    const handle = handles.get(fd);
+    if (handle?.flags === 'wx') extracted.push(handle.path);
+    if (handle?.flags === 'r+') treeSynced.add(handle.path);
+    fsync(fd);
+  });
+  try { expect((await restorePgliteBackup({ archive, into })).root).toBe(into); }
+  finally { opened.mockRestore(); synced.mockRestore(); }
+  expect(JSON.parse(fs.readFileSync(join(into, 'restore-receipt.json'), 'utf8')).state).toBe('ready');
+  const published = (function walk(dir: string, prefix: string): string[] {
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => entry.isDirectory()
+      ? walk(join(dir, entry.name), prefix + entry.name + sep) : [prefix + entry.name]);
+  })(join(into, '.gbrain', 'brain.pglite'), '');
+  expect(published.length).toBeGreaterThan(100);
+  expect(extracted).toEqual([]);
+  expect(published.filter(path => !treeSynced.has(path))).toEqual([]);
 }, 120_000);

@@ -23,12 +23,13 @@ The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atom
 
 | Provider | env vars | default dims | cost ($/1M tokens) | local? | multimodal? |
 |---|---|---|---|---|---|
-| `voyage` (**default** — `voyage-4` @ 1024d; `rerank-2.5` reranker on the same key) | `VOYAGE_API_KEY` | 1024 | 0.06 (`voyage-4`) | no | yes (`voyage-multimodal-3`) |
+| `voyage` (**default** — `voyage-4` @ 1024d; `rerank-3-lite` reranker on the same key) | `VOYAGE_API_KEY` | 1024 | 0.06 (`voyage-4`) | no | yes (`voyage-multimodal-3`) |
 | `openai` | `OPENAI_API_KEY` | 1536 | 0.13 | no | no |
 | `openrouter` | `OPENROUTER_API_KEY` | per-model (1536 for the default `openai/text-embedding-3-small`; unlisted ids require explicit dims) | 0.02 | no | model-dependent |
 | `google` | `GOOGLE_GENERATIVE_AI_API_KEY` | 768 | 0.025 | no | no |
 | `azure-openai` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | 1536 | 0.13 | no | no |
 | `minimax` | `MINIMAX_API_KEY` | 1536 | 0.07 | no | no |
+| `mistral` | `MISTRAL_API_KEY` | 1024 | 0.10 | no | no |
 | `dashscope` | `DASHSCOPE_API_KEY` | 1024 | varies | no | no |
 | `zhipu` | `ZHIPUAI_API_KEY` | 1024 | varies | no | no |
 | `ollama` | (none — runs locally) | 768 | 0 | yes | no |
@@ -67,7 +68,7 @@ The doctor distinguishes two repair paths:
 - **Cost-sensitive, English-only**: Ollama (free, local) or Voyage (paid, best quality per dollar).
 - **Quality-first**: Voyage `voyage-4-large` (1024-2048 dims, ~3-4× more dense tokens than OpenAI tiktoken).
 - **Code-heavy brain (gstack per-worktree, source repos)**: Voyage `voyage-code-3` (1024 default; supports 256/512/1024/2048), or `voyage-code-4` (hosted, flexible dims, $0.12/M). Tuned on programming languages. Voyage publishes head-to-head numbers showing it outperforms their general flagships on code retrieval ([voyageai.com/blog](https://voyageai.com/blog)). For gstack's per-worktree pglite-backed code brain, this is the right default — see Topology 3 in `docs/architecture/topologies.md`.
-- **Reranking pair**: Voyage `rerank-2.5` ($0.05/M; `rerank-2.5-lite` at $0.02/M for cost-sensitive setups) is the mode-bundle default and rides the same `VOYAGE_API_KEY` as embeddings. Voyage's preview `rerank-3` / `rerank-3-lite` pair is also allowlisted — opt in with `gbrain config set search.reranker.model voyage:rerank-3` (the default stays on `rerank-2.5` so upgrades never move you); without the key search fails open in fusion order and `gbrain search modes` says so.
+- **Reranking pair**: Voyage `rerank-3-lite` ($0.02/M) is the mode-bundle default and rides the same `VOYAGE_API_KEY` as embeddings; `rerank-3` ($0.05/M) and the older `rerank-2.5` / `rerank-2.5-lite` are also allowlisted. A brain that set `search.reranker.model` keeps its own model; `gbrain config set search.reranker.model voyage:rerank-2.5` restores the previous default. Without the key search fails open in fusion order and `gbrain search modes` says so.
 - **Local reranking (no API spend)**: `llama-server-reranker` recipe — point gbrain at your own `llama-server --reranking` instance running Qwen3-Reranker. Same `gateway.rerank()` seam, $0 per call. Walkthrough in [`docs/ai-providers/llama-server-reranker.md`](../ai-providers/llama-server-reranker.md).
 - **One key for many hosted models**: OpenRouter. Set `OPENROUTER_API_KEY` and use `openrouter:<provider>/<model>` for chat against GPT-5.2, Claude 4.x, Gemini 3, DeepSeek, and dozens more without juggling per-provider keys. Embedding catalog includes OpenAI, Google, Qwen, BGE-M3.
 - **Enterprise compliance**: Azure OpenAI (data residency + private endpoints) or self-hosted via llama-server / Ollama.
@@ -81,24 +82,28 @@ The doctor distinguishes two repair paths:
 
 The main alternative to the Voyage default (its flexible-dim `text-embedding-3` models can keep an existing column width during a provider migration). Set `OPENAI_API_KEY`. Models: `text-embedding-3-large` (3072 max, 1536 default), `text-embedding-3-small` (1536). Matryoshka via the `dimensions` field — gbrain pins it from `embedding_dimensions` config so existing 1536-dim brains stay aligned across SDK upgrades.
 
-Optional `OPENAI_BASE_URL` — point the native OpenAI provider at an OpenAI-compatible gateway. A bare host is normalized to carry the `/v1` suffix automatically (so `https://gw.example.com` and `https://gw.example.com/v1` both work); when unset, the SDK's default endpoint is untouched. With `OPENAI_BASE_URL` set, embedding does not require `OPENAI_API_KEY` — the override targets local OpenAI-compatible servers (LM Studio, vLLM) that ignore auth, so gbrain sends a placeholder key instead of refusing. `ANTHROPIC_BASE_URL` gets the same normalization for Anthropic chat/expansion calls.
+Optional `OPENAI_BASE_URL` — point the native OpenAI provider at an OpenAI-compatible gateway. A bare host is normalized to carry the `/v1` suffix automatically (so `https://gw.example.com` and `https://gw.example.com/v1` both work); when unset, the SDK's default endpoint is untouched. With `OPENAI_BASE_URL` set, embedding does not require `OPENAI_API_KEY` — the override targets local OpenAI-compatible servers (LM Studio, vLLM) that ignore auth, so gbrain sends a placeholder key instead of refusing. `ANTHROPIC_BASE_URL` gets the same normalization for Anthropic chat/expansion calls; `GOOGLE_GENERATIVE_AI_BASE_URL` does the same for Gemini with `/v1beta` ([Google Gemini](../ai-providers/google.md)).
 
 ### Voyage AI
 
-**The default provider** — new installs get `voyage-4` @ 1024d ($0.06/M) plus the `rerank-2.5` reranker on the same key. Best-in-class quality on the Voyage 4 family (Jan 2026 release). Set `VOYAGE_API_KEY`. Models: `voyage-4-large`, `voyage-4`, `voyage-4-lite`, `voyage-4-nano`, `voyage-code-4` (code-tuned, hosted, flexible dims, $0.12/M), `voyage-3.5`, `voyage-code-3`, `voyage-finance-2`, `voyage-law-2`, `voyage-multimodal-3` (text + image).
+**The default provider** — new installs get `voyage-4` @ 1024d ($0.06/M) plus the `rerank-3-lite` reranker on the same key. Best-in-class quality on the Voyage 4 family (Jan 2026 release). Set `VOYAGE_API_KEY`. Models: `voyage-4-large`, `voyage-4`, `voyage-4-lite`, `voyage-4-nano`, `voyage-code-4` (code-tuned, hosted, flexible dims, $0.12/M), `voyage-3.5`, `voyage-code-3`, `voyage-finance-2`, `voyage-law-2`, `voyage-multimodal-3` (text + image).
 
 Voyage 4 family shares an embedding space across all variants, so you can index with `voyage-4` and later point the query model at `voyage-4-large` or `voyage-4-lite` without reindexing. Dims: 256, 512, 1024, 2048. **2048 exceeds pgvector's HNSW cap of 2000** — those brains fall back to exact vector scans (still correct, just slower).
 
-Voyage also serves four hosted rerankers at `POST /v1/rerank` — `rerank-2.5` ($0.05/M) and `rerank-2.5-lite` ($0.02/M), plus the preview `rerank-3` ($0.05/M) and `rerank-3-lite` ($0.02/M) (2.5 pair verified 2026-08-15, rerank-3 pair 2026-09-06). All four share one request/response wire, so switching is a config change and nothing else.
+Routed through the Vercel AI Gateway (`provider_base_urls.voyage` = `https://ai-gateway.vercel.sh/v1`), the embedding request also carries the width as `providerOptions.voyage.outputDimension`, which the gateway reads instead of Voyage's root `output_dimension`; that field is sent only when the hostname is exactly `ai-gateway.vercel.sh`, because Voyage's own API rejects it with HTTP 400. If a proxy returns a different width than `embedding_dimensions`, the embed fails before anything is written and the error names the proxy as the likely cause; fix the proxy's width parameter before considering a migration.
 
-`rerank-2.5` is the mode-bundle reranker default, so no config row is needed for it (an explicit `search.reranker.model` equal to it is exactly what `gbrain doctor`'s `search_mode` check calls redundant). Moving to the preview generation is one command:
+Voyage also serves four hosted rerankers at `POST /v1/rerank` — its current `rerank-3` ($0.05/M) and `rerank-3-lite` ($0.02/M), plus the older `rerank-2.5` ($0.05/M) and `rerank-2.5-lite` ($0.02/M) (prices verified 2026-10-14). All four share one request/response wire, so switching is a config change and nothing else.
+
+`rerank-3-lite` is the mode-bundle reranker default, so no config row is needed for it (an explicit `search.reranker.model` equal to it is exactly what `gbrain doctor`'s `search_mode` check calls redundant). It replaced `rerank-2.5` as the default after gbrain-evals #148 (v0.10.93) measured 60% lower rerank cost at 50 candidates × 1,400 tokens with quality within noise. The new default reaches only brains that never set `search.reranker.model`; a brain with an explicit model keeps it.
+
+To go back to the previous default, or to move to `rerank-3`, set the model explicitly:
 
 ```bash
-gbrain config set search.reranker.model voyage:rerank-3
-gbrain models doctor          # green `reranker_config voyage:rerank-3` is the whole test
+gbrain config set search.reranker.model voyage:rerank-2.5   # roll back to the previous default
+gbrain models doctor          # green `reranker_config voyage:rerank-2.5` is the whole test
 ```
 
-**Say to your agent:** *"switch my reranker to voyage rerank-3"* — *"check my model config"* (your agent runs `gbrain config set search.reranker.model voyage:rerank-3` then `gbrain models doctor`).
+**Say to your agent:** *"switch my reranker back to voyage rerank-2.5"* — *"check my model config"* (your agent runs `gbrain config set search.reranker.model voyage:rerank-2.5` then `gbrain models doctor`).
 
 **For brains that index source code** (gstack's per-worktree pglite-backed code brain — see Topology 3 in `docs/architecture/topologies.md`), prefer `voyage-code-3` over `voyage-4-large`. Voyage tunes it on programming languages and publishes head-to-head numbers vs their general flagships on code retrieval. Configure at install time:
 
@@ -112,9 +117,11 @@ To switch an existing brain, run `gbrain migrate embeddings --to voyage:voyage-c
 
 ### Google Gemini
 
-Set `GOOGLE_GENERATIVE_AI_API_KEY` (the AI Studio public API key). Models: `gemini-embedding-2` (current, GA 2026-04-22) and `gemini-embedding-001`. Default 768 dims; Matryoshka up to 3072 (`--embedding-dimensions 1536` / `3072`). Cheap. The two models' vector spaces are not interchangeable — to move an existing brain from `-001` to `-2`, use `gbrain migrate embeddings --to google:gemini-embedding-2 --dim <N>`, not `config set`.
+Set `GOOGLE_GENERATIVE_AI_API_KEY` (the AI Studio public API key). Models: `gemini-embedding-2` (current, GA 2026-04-22) and `gemini-embedding-001`. Default 768 dims; Matryoshka up to 3072 (`--embedding-dimensions 1536` / `3072`). Cheap. The two models' vector spaces are not interchangeable — to move an existing brain from `-001` to `-2`, use `gbrain migrate embeddings --to google:gemini-embedding-2 --dim <N>`, not `config set`. Optional `GOOGLE_GENERATIVE_AI_BASE_URL` points native Gemini chat, expansion and embedding requests at a proxy or gateway; a URL without a version segment gets `/v1beta`. See [Google Gemini](../ai-providers/google.md).
 
 GCP service-account / Vertex AI auth (Vertex ADC) is not supported; only the AI Studio API key path is wired.
+
+`gemini-embedding-001` takes at most 2,048 tokens per input and the endpoint truncates longer inputs silently (`autoTruncate` defaults on), which embeds a lossy vector rather than failing. gbrain declares the cap so chunks on `-001` are capped at 1,228 estimated tokens and split instead (see [Per-input token caps](#per-input-token-caps)). `gemini-embedding-2`'s per-input limit is not declared yet.
 
 ### OpenRouter
 
@@ -138,6 +145,12 @@ Unlike vanilla OpenAI, Azure uses `api-key:` header (not `Authorization: Bearer`
 
 Models: `text-embedding-3-large`, `text-embedding-3-small`, `text-embedding-ada-002` (your Azure deployment must serve the requested model).
 
+### Mistral AI
+
+Set `MISTRAL_API_KEY`. Model: `mistral-embed` (fixed 1024 dims; the API rejects any dimension parameter, so leave `--embedding-dimensions` at 1024). Chat and expansion run on the same key (`mistral:mistral-large-latest`, `mistral:mistral-small-latest`; unpriced in gbrain's tables, so a user cost cap needs `gbrain pricing set`), so a brain can keep embed + expansion + chat on one provider.
+
+Region: `api.mistral.ai` (the default) is EU-hosted by default, but Mistral's terms allow a request to be served outside the EU unless your organization disables transfers; the default endpoint carries no regional-inference assurance. Inference pinned to the EU is Mistral's opt-in regional endpoint, billed at 1.1x list price: `gbrain config set provider_base_urls.mistral https://api.eu.mistral.ai/v1`, then verify with `gbrain config get provider_base_urls.mistral`. gbrain does not switch to it for you, and ships no separate `mistral-eu` recipe.
+
 ### MiniMax (海螺AI)
 
 Set `MINIMAX_API_KEY`. Optional `MINIMAX_GROUP_ID` for org-scoped accounts. Model: `embo-01` (1536 dims).
@@ -146,13 +159,17 @@ MiniMax's API takes a `type: 'db' | 'query'` field for asymmetric retrieval. gbr
 
 ### DashScope (Alibaba)
 
-Set `DASHSCOPE_API_KEY`. International endpoint at `dashscope-intl.aliyuncs.com` by default; override `provider_base_urls.dashscope` for the China endpoint. Models: `text-embedding-v3` (current; Matryoshka 64-1024 dims), `text-embedding-v2`.
+Set `DASHSCOPE_API_KEY`. International endpoint at `dashscope-intl.aliyuncs.com` by default; override `provider_base_urls.dashscope` for the China endpoint. Models: `text-embedding-v3` (current; Matryoshka 64-1024 dims), `text-embedding-v2`, `text-embedding-v1`.
 
 CJK-dominant content tokenizes denser than OpenAI tiktoken; gbrain declares `chars_per_token: 2` so the batch pre-split leaves headroom.
+
+Per-input caps are declared (see [Per-input token caps](#per-input-token-caps)): `text-embedding-v1` / `v2` take at most 2,048 tokens per input (one over-length item fails the whole request with a 400), `v3` takes 8,192. New chunks on v1/v2 are capped at 1,228 estimated tokens instead of 2,000; a brain chunked before this declaration is split on its next `gbrain embed` / `embed --stale` pass and the split pieces re-embed.
 
 ### Zhipu AI (BigModel)
 
 Set `ZHIPUAI_API_KEY`. Models: `embedding-3` (current; Matryoshka 256-2048 dims), `embedding-2`. The default is 1024 (HNSW-compatible). The 2048-dim option works but falls into the exact-scan branch (see Voyage 4 Large note above).
+
+Per-input caps are declared: `embedding-3` takes at most 3,072 tokens per string (chunks capped at 1,843 estimated tokens), `embedding-2` 512 (chunks capped at 307). See [Per-input token caps](#per-input-token-caps).
 
 ### Ollama (local)
 
@@ -221,6 +238,12 @@ Three numbers matter:
 
 For most users: **stay at 1024 or 1536**. Bigger isn't better below the noise floor; smaller saves disk + RAM with marginal recall loss on Matryoshka providers.
 
+## Per-input token caps
+
+Some hosted encoders reject (or silently truncate) any SINGLE input over a per-input token limit, far below their batch budget. A recipe declares the documented limit per model (`max_input_tokens`), and the chunker caps new chunks at `floor(limit × 0.6)` estimated tokens, never above the 2,000-token default, splitting rather than truncating; `gbrain embed` and `embed --stale` split already-stored chunks the same way before sending them. Declared today: NVIDIA `nvidia/nv-embedqa-e5-v5` 512; Zhipu `embedding-2` 512, `embedding-3` 3,072; DashScope `text-embedding-v1` / `v2` 2,048, `v3` 8,192; Google `gemini-embedding-001` 2,048; OpenAI `text-embedding-3-*` 8,191; Mistral `mistral-embed` 8,192 (the last three are above the default chunk cap, so chunking is unchanged). `GBRAIN_MAX_CHUNK_TOKENS` overrides the resolved cap for a model no recipe declares.
+
+When a model declares no cap and the provider answers a single input with an over-length 400 (`input length exceeds the context length`, `exceeds maximum allowed token size N`, `Range of input length should be [1, N]`, …), the embed pass derives a smaller cap from the failure (the limit the message names × 0.6, otherwise half the largest failed chunk's estimate), keeps it for that model for the rest of the process, and splits the failing page at once; the pieces embed on the next pass, and later pages are split before their first request. The descent is finite: three attempts per page per process and never below 128 tokens, after which the failure is reported with the fix (`GBRAIN_MAX_CHUNK_TOKENS=<limit>`, a recipe `max_input_tokens` entry, or `embed_skip` on the page). A model whose cap IS declared gets no derived cap: the declaration is what to correct. Unrelated 400s (bad key, unknown model) and batch-level token errors never rewrite a chunk.
+
 ## Bulk-embed failure knobs
 
 Two env vars tune how bulk embeds (`gbrain embed --stale` and the autopilot/minion cycles that ride the same stale path) behave under sustained failures. Both matter most against local serial servers (Ollama at `-np 1`, llama-server), where re-sending doomed requests compounds into congestion collapse:
@@ -228,7 +251,7 @@ Two env vars tune how bulk embeds (`gbrain embed --stale` and the autopilot/mini
 | Env var | Default | What it does |
 |---|---|---|
 | `GBRAIN_EMBED_QUARANTINE_AFTER` | 3 | Consecutive zero-progress attempts (no chunk embedded) before a page is quarantined for the rest of the process. An attempt that embeds ANY chunk resets the page's counter — partial progress shrinks the stale set, so the next pass sends a smaller request, not the identical doomed one. Quarantine is keyed per page (`source_id::slug`) and announced once on stderr; later passes skip quarantined pages with a count. Process-lifetime by design: restarting retries deliberately, and `frontmatter.embed_skip` is the permanent block. Non-numeric or non-positive values fall back to 3. |
-| `GBRAIN_EMBED_MAX_BATCH_TOKENS` | (unset) | Token cap per embedding request for recipes that ship without one — ollama, llama-server, lmstudio, and litellm declare `no_batch_cap` because real capacity depends on the operator's server. When set, chunk texts are pre-split into sub-batches within `cap × safety_factor` (default 0.8) tokens, estimated via the recipe's `chars_per_token` (default 4). A recipe-declared cap always wins; invalid values are ignored. Read once from the environment at process start, never at call time. Without it, `no_batch_cap` recipes still get a conservative 16-item sub-batch cap so the per-call embed timeout bounds a fixed amount of work. |
+| `GBRAIN_EMBED_MAX_BATCH_TOKENS` | (unset) | Token cap per embedding request for recipes that ship without one. ollama, lmstudio, and litellm declare `no_batch_cap` because real capacity depends on the operator's server; llama-server declares no token cap either, so the env cap applies to it too. When set, chunk texts are pre-split into sub-batches within `cap × safety_factor` (default 0.8) tokens, estimated via the recipe's `chars_per_token` (default 4). A recipe-declared cap always wins; invalid values are ignored. Read once from the environment at process start, never at call time. Without it, `no_batch_cap` recipes still get a conservative 16-item sub-batch cap so the per-call embed timeout bounds a fixed amount of work. llama-server is not a `no_batch_cap` recipe: it ships `max_batch_items: 32` (its launch `--batch-size` default), so it gets that item cap rather than the 16-item fallback. The `chars_per_token` estimate is tuned for English; CJK text usually tokenizes far denser (often close to one token per character), so the default estimate can undercount several-fold. Set the cap with headroom against your model's real tokenizer. The pre-splitter never splits an individual text, so one oversized input is still sent whole; llama-server returns an error for a single embedding input larger than its physical batch (`-ub`, see [llama.cpp #7389](https://github.com/ggml-org/llama.cpp/pull/7389)). Raise `-ub` or lower your chunk size if long chunks fail. |
 
 ## My provider isn't listed
 
@@ -237,7 +260,7 @@ Four options:
 1. **Use OpenRouter** when the provider/model is available through OR's OpenAI-compatible API (covers most hosted chat models + a growing embedding catalog).
 2. **Use LiteLLM proxy** (above) — the universal escape hatch. Works for 100+ providers.
 3. **Open a feature request** at [github.com/garrytan/gbrain/issues](https://github.com/garrytan/gbrain/issues) with the provider's API docs URL and a setup snippet. Recipes are ~30-40 lines of TypeScript.
-4. **Submit a recipe**: clone, copy `src/core/ai/recipes/voyage.ts` as the gold-standard openai-compat template, register in `src/core/ai/recipes/index.ts`, add a per-recipe smoke test under `test/ai/recipe-<name>.test.ts`. The recipe contract test (`test/ai/recipes-contract.test.ts`) and IRON RULE regression test pin the structural invariants.
+4. **Submit a recipe**: clone, copy `src/core/ai/recipes/voyage.ts` as the gold-standard openai-compat template, register in `src/core/ai/recipes/index.ts`, add a per-recipe smoke test under `test/ai/recipe-<name>.test.ts`. The IRON RULE regression test (`test/ai/recipes-existing-regression.test.ts`) pins the shared auth contract for the existing recipes.
 
 ## Switching providers on an existing brain
 

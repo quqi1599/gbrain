@@ -55,7 +55,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { currentTextProjectionFilter } from '../search/safe-chunks.ts';
+import { chunkVisibleFilter } from '../search/safe-chunks.ts';
 
 /**
  * Bump this ISO timestamp whenever the extractor or resolver shape
@@ -141,7 +141,7 @@ export async function resolveSymbolEdgesIncremental(
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
         WHERE p.source_id = $1 AND p.deleted_at IS NULL AND NOT s.archived
-          AND ${currentTextProjectionFilter('p')}
+          AND ${chunkVisibleFilter('p', 'cc')}
           AND (cc.edges_backfilled_at IS NULL
                OR cc.edges_backfilled_at < $2::timestamptz)
         ORDER BY cc.id
@@ -155,7 +155,7 @@ export async function resolveSymbolEdgesIncremental(
         `SELECT cc.id, cc.page_id, p.slug FROM content_chunks cc
          JOIN pages p ON p.id=cc.page_id JOIN sources s ON s.id=p.source_id
          WHERE cc.id=ANY($1::int[]) AND p.source_id=$2 AND p.deleted_at IS NULL AND NOT s.archived
-           AND ${currentTextProjectionFilter('p')}
+           AND ${chunkVisibleFilter('p', 'cc')}
            AND (cc.edges_backfilled_at IS NULL OR cc.edges_backfilled_at < $3::timestamptz)
          ORDER BY cc.id`, [chunks.map(chunk => chunk.id), opts.sourceId, EDGE_EXTRACTOR_VERSION_TS],
       );
@@ -211,7 +211,7 @@ async function processChunkBatch(
   for (const e of edges) {
     const pageId = pageByChunkId.get(e.from_chunk_id);
     if (pageId === undefined) continue;
-    lookups.add(`${pageId} ${e.to_symbol_qualified}`);
+    lookups.add(`${pageId}\0${e.to_symbol_qualified}`);
   }
 
   // One-shot per-page candidate map. We pre-load all qualified symbol names
@@ -219,6 +219,7 @@ async function processChunkBatch(
   const candidatesByKey = new Map<string, ChunkCandidate[]>();
   if (pagesToProbe.length > 0) {
     const rows = await engine.executeRaw<{ id: number; page_id: number; symbol_name_qualified: string }>(
+      // chunk-visibility-ok: code symbol candidates: code pages are never segmented (chooseBodyStorage)
       `SELECT id, page_id, symbol_name_qualified
          FROM content_chunks
         WHERE page_id = ANY($1::int[])
@@ -226,7 +227,7 @@ async function processChunkBatch(
       [pagesToProbe],
     );
     for (const r of rows) {
-      const key = `${r.page_id} ${r.symbol_name_qualified}`;
+      const key = `${r.page_id}\0${r.symbol_name_qualified}`;
       const list = candidatesByKey.get(key) ?? [];
       list.push({ id: r.id, page_id: r.page_id });
       candidatesByKey.set(key, list);
@@ -239,11 +240,13 @@ async function processChunkBatch(
   for (const e of edges) {
     stats.edges_examined += 1;
     const pageId = pageByChunkId.get(e.from_chunk_id);
-    if (pageId === undefined) {
+    // A member call with an untyped receiver (`segments.join()`) never
+    // invokes a same-file top-level function (gbrain-evals N13-8).
+    if (pageId === undefined || e.edge_metadata?.member_call === true) {
       stats.edges_unmatched += 1;
       continue;
     }
-    const key = `${pageId} ${e.to_symbol_qualified}`;
+    const key = `${pageId}\0${e.to_symbol_qualified}`;
     const candidates = candidatesByKey.get(key) ?? [];
     if (candidates.length === 1) {
       toResolve.push({ edgeId: e.id, chunkId: candidates[0]!.id });
@@ -291,11 +294,12 @@ async function processChunkBatch(
 
 /**
  * Read the resolution outcome from a single edge's metadata, if any.
- * Returns null when the edge hasn't been processed by the resolver yet.
+ * 'unresolved' also covers edges the resolver hasn't processed yet (no
+ * outcome keys written) — the two are indistinguishable by design.
  *
- * Public helper for downstream code (two-pass.ts, code_blast op) that
- * wants to use the resolver's output without parsing edge_metadata JSON
- * directly.
+ * Public helper for downstream code that wants to use the resolver's
+ * output without parsing edge_metadata JSON directly. Consumer: the
+ * two-pass structural walk (src/core/search/two-pass.ts).
  */
 export type EdgeResolution =
   | { kind: 'resolved'; chunk_id: number }

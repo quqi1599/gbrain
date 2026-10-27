@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { readVectorPool, searchVectorPool, type VectorPoolAttempt } from '../../src/core/search/vector-pool.ts';
+import { INDEX_WALK_ESCALATIONS, POOL_MAX_SCAN_TUPLES, readVectorPool, searchIndexWalk, searchVectorPool, type VectorPoolAttempt, type VectorPoolBatch } from '../../src/core/search/vector-pool.ts';
 import { supportsHnswIterativeScan } from '../../src/core/vector-index.ts';
 import type { SearchOpts } from '../../src/core/types.ts';
 
@@ -97,5 +97,119 @@ describe('bounded vector candidate safety', () => {
     }, async () => true, meta => events.push(meta));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ reason: 'deadline', candidatePool: 1, incomplete: true, exactFallback: true });
+  });
+  test('#5824: a short raw window with stale rows asks hasMore about the fresh count, not the raw count', async () => {
+    // 60 raw candidates came back (window cut short), 4 of them fresh. The
+    // guarded witness sees 30 fresh eligible rows: more than the 4 seen, but
+    // fewer than the 60 raw rows, so comparing against the raw count would
+    // stop here with 4 rows and no metadata.
+    const asked: number[] = [];
+    const attempts: VectorPoolAttempt[] = [];
+    const events: PoolMeta[] = [];
+    const rows = await searchVectorPool(10, 100, true, true, 'pglite', async attempt => {
+      attempts.push(attempt);
+      const first = attempts.length === 1;
+      return { rows: Array.from({ length: first ? 4 : 10 }, (_, page_id) => ({ page_id })), candidatePool: first ? 60 : 400, eligiblePool: first ? 4 : 30 };
+    }, async pool => { asked.push(pool); return 30 > pool; }, meta => events.push(meta));
+    expect(asked).toEqual([4]);
+    expect(attempts.map(a => a.innerLimit)).toEqual([100, 400]);
+    expect(rows).toHaveLength(10);
+    expect(events).toEqual([]);
+  });
+
+  test('a 10% filter fills its first pooled window instead of accepting a short one (E5.4)', async () => {
+    // A fake HNSW scan under a 10% filter: it visits at most maxScanTuples
+    // tuples, so it finds a tenth of that many eligible chunks, and four of
+    // them share a page. At 2,000 tuples the window comes back at 200 of 250
+    // chunks, which already covers 50 pages, so the pool used to accept it.
+    const attempts: VectorPoolAttempt[] = [];
+    const rows = await searchVectorPool(50, 250, true, true, 'postgres', async attempt => {
+      attempts.push(attempt);
+      const eligible = Math.min(attempt.innerLimit, Math.floor(attempt.maxScanTuples * 0.1));
+      return { rows: Array.from({ length: Math.min(50, Math.floor(eligible / 4)) }, (_, page_id) => ({ page_id })), candidatePool: eligible };
+    }, async () => true, () => {});
+    expect(rows).toHaveLength(50);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]!.maxScanTuples).toBe(POOL_MAX_SCAN_TUPLES);
+    expect(attempts[0]!.maxScanTuples * 0.1).toBeGreaterThanOrEqual(attempts[0]!.innerLimit);
+  });
+
+  test('#5824: eligible_pool is read next to the raw candidate_pool', () => {
+    expect(readVectorPool([{ page_id: 3, candidate_pool: 100, eligible_pool: 12 }])).toEqual({
+      rows: [{ page_id: 3, candidate_pool: 100, eligible_pool: 12 }], candidatePool: 100, eligiblePool: 12 });
+  });
+});
+
+describe('first attempts: index walk, then scope scan', () => {
+  const rows = (n: number) => Array.from({ length: n }, (_, page_id) => ({ page_id }));
+  async function run(stmt: { indexWalkSql?: string; scopeScanSql?: string }, batches: Partial<Record<'walk' | 'scan', VectorPoolBatch | Error>>, limit = 10) {
+    const kinds: Array<'walk' | 'scan'> = [];
+    const attempts: VectorPoolAttempt[] = [];
+    const result = await searchIndexWalk({ innerLimit: 100, indexWalkOverfetch: 50, ...stmt }, limit, async attempt => {
+      const kind = attempt.scopeScan ? 'scan' : 'walk';
+      kinds.push(kind);
+      attempts.push(attempt);
+      const batch = batches[kind]!;
+      if (batch instanceof Error) throw batch;
+      return batch;
+    });
+    return { result, kinds, attempts };
+  }
+  const timeout = () => Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+
+  test('no walk and no scan leaves the pool to the caller', async () => {
+    expect(await run({}, {})).toEqual({ result: null, kinds: [], attempts: [] });
+  });
+
+  test('a full walk window answers; its tuple budget covers the over-fetched window', async () => {
+    const { result, kinds, attempts } = await run({ indexWalkSql: 'w', scopeScanSql: 's' }, { walk: { rows: rows(10), candidatePool: 100 } });
+    expect(result).toHaveLength(10);
+    expect(kinds).toEqual(['walk']);
+    expect(attempts[0]).toMatchObject({ indexWalk: true, maxScanTuples: 5000, remainingMs: 2000, exact: false });
+  });
+
+  test('a short walk falls through to the scope scan, which answers when it fills the limit or the scope ran out', async () => {
+    const short = { rows: rows(4), candidatePool: 40 };
+    expect((await run({ indexWalkSql: 'w', scopeScanSql: 's' }, { walk: short, scan: { rows: rows(10), candidatePool: 100 } })).kinds).toEqual(['walk', 'scan']);
+    const exhausted = await run({ scopeScanSql: 's' }, { scan: { rows: rows(3), candidatePool: 6 } });
+    expect(exhausted.result).toHaveLength(3);
+    expect(exhausted.kinds).toEqual(['scan']);
+    expect(exhausted.attempts[0]).toMatchObject({ scopeScan: true, exact: false });
+  });
+
+  test('a full walk window whose fresh chunks crowd into too few pages widens the walk before any pool attempt', async () => {
+    const windows: number[] = [];
+    const result = await searchIndexWalk({ indexWalkSql: 'w', innerLimit: 250, indexWalkOverfetch: 2 }, 50, async attempt => {
+      windows.push(attempt.innerLimit);
+      expect(attempt).toMatchObject({ indexWalk: true, maxScanTuples: Math.max(2_000, attempt.innerLimit * 2), remainingMs: 2_000, exact: false });
+      return { rows: rows(attempt.innerLimit >= 1_000 ? 50 : 49), candidatePool: attempt.innerLimit, eligiblePool: attempt.innerLimit };
+    });
+    expect(result).toHaveLength(50);
+    expect(windows).toEqual([250, 1_000]);
+  });
+
+  test('the walk widens at most INDEX_WALK_ESCALATIONS times, and never for a stale-short or short window', async () => {
+    const widen = async (batch: (innerLimit: number) => VectorPoolBatch, scopeScanSql?: string) => {
+      const windows: number[] = [];
+      const result = await searchIndexWalk({ indexWalkSql: 'w', ...(scopeScanSql ? { scopeScanSql } : {}), innerLimit: 250, indexWalkOverfetch: 2 }, 50, async attempt => {
+        if (attempt.scopeScan) return { rows: rows(50), candidatePool: 250 };
+        windows.push(attempt.innerLimit);
+        return batch(attempt.innerLimit);
+      });
+      return { result, windows };
+    };
+    expect(INDEX_WALK_ESCALATIONS).toBe(2);
+    expect(await widen(n => ({ rows: rows(10), candidatePool: n, eligiblePool: n }))).toEqual({ result: null, windows: [250, 1_000, 4_000] });
+    expect(await widen(n => ({ rows: rows(10), candidatePool: n, eligiblePool: 40 }))).toEqual({ result: null, windows: [250] });
+    expect(await widen(() => ({ rows: rows(10), candidatePool: 200, eligiblePool: 200 }))).toEqual({ result: null, windows: [250] });
+    expect((await widen(n => ({ rows: rows(10), candidatePool: n, eligiblePool: n }), 's')).result).toHaveLength(50);
+  });
+
+  test('a full scan window that stale rows left short, or a timed-out attempt, falls back to the pool', async () => {
+    expect((await run({ scopeScanSql: 's' }, { scan: { rows: rows(8), candidatePool: 100, eligiblePool: 90 } })).result).toBeNull();
+    expect((await run({ indexWalkSql: 'w' }, { walk: { rows: rows(4), candidatePool: 40 } })).result).toBeNull();
+    const timedOut = await run({ indexWalkSql: 'w', scopeScanSql: 's' }, { walk: timeout(), scan: timeout() });
+    expect(timedOut).toMatchObject({ result: null, kinds: ['walk', 'scan'] });
+    await expect(run({ scopeScanSql: 's' }, { scan: new Error('boom') })).rejects.toThrow('boom');
   });
 });

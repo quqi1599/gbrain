@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { withGoogleAccount } from './helpers/connector-fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,6 +10,7 @@ import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
 import { beginConnectorSync } from '../src/core/persistence/connector-sync.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { withSourceRowDiagnostics } from './helpers/source-row-diagnostics.ts';
 import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, githubFetch, sourceCheckpoint } from './helpers/connector-fixture.ts';
 
 const { engines, env, boundSource, standaloneConnector, setup, teardown } = createConnectorFixture();
@@ -19,9 +21,9 @@ test('standalone connector restart recovers a real SIGKILL after file publicatio
   for (const engine of engines) for (const connector of ['google', 'github'] as const) {
     const config = connector === 'google' ? googleConfig : githubConfig;
     const f = await boundSource(engine, config);
-    if (connector === 'google') await runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), options, async url =>
+    if (connector === 'google') await runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), options, withGoogleAccount(async url =>
       json(url.includes('/settings/sendAs') ? { sendAs: [] } : { connections: [{ ...contact('first', 'First Example'),
-        organizations: [{ name: 'Initial organization' }] }], nextSyncToken: 'contacts-restart' }));
+        organizations: [{ name: 'Initial organization' }] }], nextSyncToken: 'contacts-restart' })));
     else await runGitHubSync(engine, f.id, parseGitHubSourceConfig(config, f.dir), options, githubFetch());
     const slug = connector === 'google' ? 'people/first-example' : 'gh/acme-example/app/1';
     const before = await engine.readPageSnapshot(slug, { sourceId: f.id });
@@ -96,7 +98,7 @@ test('an already authenticated connector session drains later retained recovery 
     const config = parseGitHubSourceConfig(githubConfig, f.dir);
     await runGitHubSync(engine, f.id, config, options, githubFetch());
     await disposePersistenceConsumer(engine);
-    const session = (await beginConnectorSync(engine, f.id, 'github', config, options))!;
+    const session = (await withSourceRowDiagnostics(engine, f.id, () => beginConnectorSync(engine, f.id, 'github', config, options)))!;
     const crash = await standaloneConnector(engine, f, githubConfig, true);
     expect(crash.stdout).toContain('CONNECTOR_AFTER_PUBLICATION_BEFORE_COMMIT');
     const [retained] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 AND recovery IS NOT NULL', [f.id]);
@@ -105,5 +107,28 @@ test('an already authenticated connector session drains later retained recovery 
     expect((await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [retained.id]))[0]).toMatchObject({ state: 'committed', recovery: null });
     expect(await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND state<>'committed'", [f.id])).toHaveLength(0);
     expect((await session.page('gh/acme-example/app/1'))?.compiled_truth).toContain('Updated organization after interruption');
+  }
+}), 120_000);
+
+test('a blocked retained recovery waits the configured write wait, not a fixed five seconds', async () => withEnv({ ...env, GBRAIN_WRITE_WAIT_MS: '250' }, async () => {
+  for (const engine of engines) {
+    const f = await boundSource(engine, githubConfig);
+    const config = parseGitHubSourceConfig(githubConfig, f.dir);
+    await runGitHubSync(engine, f.id, config, options, githubFetch());
+    await disposePersistenceConsumer(engine);
+    const crash = await standaloneConnector(engine, f, githubConfig, true);
+    expect(crash.stdout).toContain('CONNECTOR_AFTER_PUBLICATION_BEFORE_COMMIT');
+    const path = join(f.dir, 'gh/acme-example/app/1.md');
+    const published = readFileSync(path, 'utf8');
+    writeFileSync(path, `${published}\nOperator edit blocks the recovery.\n`);
+    try {
+      const started = performance.now();
+      const failure = await beginConnectorSync(engine, f.id, 'github', config, options).then(() => null, (e: { code?: string }) => e);
+      expect(failure?.code).toBe('recovery_required');
+      expect(performance.now() - started).toBeLessThan(4_000);
+    } finally {
+      await disposePersistenceConsumer(engine);
+      writeFileSync(path, published);
+    }
   }
 }), 120_000);

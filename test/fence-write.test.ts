@@ -288,6 +288,49 @@ describe('writeFactsToFence — happy path', () => {
   }, 60_000);
 });
 
+describe('writeFactsToFence — withdrawn claims (write-path audit B-10)', () => {
+  test('never appends a withdrawn claim, or a punctuation variant of it, as an active Markdown row', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','people/alice',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+      [baseInput(), baseInput({ fact: 'founded Acme, in 2017.' }), baseInput({ fact: 'Moved to Lisbon in 2020' })],
+    );
+    expect(result.withdrawnSkipped).toBe(2);
+    expect(result.inserted).toBe(1);
+    const body = readFileSync(join(brainDir, 'people/alice.md'), 'utf-8');
+    expect(body).not.toContain('Acme');
+    expect(body).toContain('Moved to Lisbon in 2020');
+    expect(await engine.executeRaw(`SELECT fact FROM facts WHERE entity_slug='people/alice' ORDER BY id`))
+      .toEqual([{ fact: 'Moved to Lisbon in 2020' }]);
+  });
+
+  test('a claim withdrawn for another entity is still written for this one', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','people/bob',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+    expect(result).toMatchObject({ inserted: 1 });
+    expect(result.withdrawnSkipped).toBeUndefined();
+  });
+
+  test('an entirely withdrawn batch leaves the filesystem untouched', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','*',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/carol', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+    expect(result).toEqual({ inserted: 0, ids: [], withdrawnSkipped: 1 });
+    expect(existsSync(join(brainDir, 'people/carol.md'))).toBe(false);
+  });
+});
+
 describe('writeFactsToFence — legacy fallback', () => {
   test('null localPath returns legacyFallback:true with no inserts', async () => {
     const result = await writeFactsToFence(
@@ -576,10 +619,11 @@ describe('writeFactsToFence — row_num survives a fence-less rewrite', () => {
     // fence writes impossible (pre-v51 brains, transient DB errors).
     const brokenEngine = Object.create(engine) as typeof engine;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (brokenEngine as any).executeRaw = async (sqlText: string, params: unknown[]) => {
+    // A transaction engine derived from brokenEngine keeps its own connection: delegate with `this`.
+    (brokenEngine as any).executeRaw = async function (this: typeof engine, sqlText: string, params: unknown[]) {
       if (sqlText.includes('MAX(row_num)')) throw new Error('simulated lookup failure');
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (engine as any).executeRaw(sqlText, params);
+      return (engine as any).executeRaw.call(this, sqlText, params);
     };
 
     const result = await writeFactsToFence(
@@ -646,14 +690,16 @@ describe('writeFactsToFence — sync.write_through opt-out', () => {
     });
 
     expect(r.status).toBe('inserted');
-    expect(r.entity_slug).toBe('people/frank-example');
+    // #5504: people/frank-example has no page, so the resolver fell back to
+    // slugification and the row carries no entity (the backstop convention).
+    expect(r.entity_slug).toBeNull();
     expect(existsSync(join(brainDir, 'people/frank-example.md'))).toBe(false);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query(
       'SELECT entity_slug, source_markdown_slug FROM facts WHERE id = $1',
       [r.id],
     );
-    expect(rows.rows[0].entity_slug).toBe('people/frank-example');
+    expect(rows.rows[0].entity_slug).toBeNull();
     // No .md backs the row — the fence-tracking column stays null.
     expect(rows.rows[0].source_markdown_slug).toBeNull();
   });
@@ -758,8 +804,8 @@ describe('writeFactsToFence — durability latch recovery', () => {
         installFakeDurabilityHook(brainDir);
         const filePath = join(brainDir, 'people/race.md');
 
-        // Gate writer A between its rename and its commit (insertFacts sits
-        // between the two), so writer B arrives while A's content is renamed
+        // Gate writer A after its publishing transaction and before its git commit,
+        // so writer B arrives while A's content is renamed
         // into place but not yet committed — the false preexisting_dirty
         // shape from the out-of-lock prewrite snapshot.
         let release: () => void = () => {};
@@ -767,10 +813,11 @@ describe('writeFactsToFence — durability latch recovery', () => {
         let gated = false;
         const gatedEngine = Object.create(engine) as typeof engine;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (gatedEngine as any).insertFacts = async (rows: unknown, opts: unknown) => {
-          if (!gated) { gated = true; await gate; }
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          return (engine as any).insertFacts(rows, opts);
+        // The transaction engine is derived from gatedEngine: delegate with `this`.
+        (gatedEngine as any).transaction = async function (this: typeof engine, fn: Parameters<typeof engine.transaction>[0]) {
+          const result = await engine.transaction.call(this, fn);
+          if (!gated && existsSync(filePath) && readFileSync(filePath, 'utf-8').includes('Writer A fact')) { gated = true; await gate; }
+          return result;
         };
 
         const a = writeFactsToFence(

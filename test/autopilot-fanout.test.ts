@@ -224,12 +224,15 @@ describe('resolveFanoutMax', () => {
 describe('dispatchPerSource — integration with stubbed engine + queue', () => {
   type AddedJob = { name: string; data: unknown; opts: Record<string, unknown> };
 
-  function makeStubs(sources: SourceRow[], opts?: { listThrows?: boolean }) {
+  function makeStubs(sources: SourceRow[], opts?: { listThrows?: boolean; listError?: unknown }) {
     const added: AddedJob[] = [];
     let nextId = 100;
     const engine = {
       kind: 'postgres' as const,
+      // An unmanaged brain with no worktree bindings: automatic pull follows remote_url (#5463).
+      executeRaw: async (sql: string) => (sql.includes('FROM persistence_brain') ? [{ enabled: false }] : []),
       listAllSources: async () => {
+        if (opts?.listError) throw opts.listError;
         if (opts?.listThrows) throw new Error('sources table missing');
         return sources;
       },
@@ -270,6 +273,24 @@ describe('dispatchPerSource — integration with stubbed engine + queue', () => 
     const result = await dispatchPerSource(engine, queue, fanoutOpts);
     expect(result.legacy_fallback).toBe(true);
     expect(added.length).toBe(1);
+  });
+
+  test('missing sources table (Postgres 42P01) falls back to legacy', async () => {
+    const err = Object.assign(new Error('relation "sources" does not exist'), { code: '42P01' });
+    const { engine, queue, added, fanoutOpts } = makeStubs([], { listError: err });
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.legacy_fallback).toBe(true);
+    expect(added.length).toBe(1);
+  });
+
+  test('transient connection error skips the tick instead of the legacy repo-root cycle', async () => {
+    const err = Object.assign(new Error('write CONNECT_TIMEOUT aws-0-us-west-1.pooler.supabase.com:5432'), { code: 'CONNECT_TIMEOUT' });
+    const { engine, queue, added, events, fanoutOpts } = makeStubs([], { listError: err });
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.legacy_fallback).toBe(false);
+    expect(result.dispatched).toEqual([]);
+    expect(added.length).toBe(0);
+    expect(events.some((e) => e.includes('"fanout_skipped"'))).toBe(true);
   });
 
   test('per-source fan-out: 2 stale sources, both dispatched with distinct keys', async () => {
@@ -417,6 +438,35 @@ describe('dispatchPerSource — integration with stubbed engine + queue', () => 
     const normalData = byId.get('normal')!.data as Record<string, unknown>;
     expect(normalData.phases).toEqual(SOURCE_FRESHNESS_PHASES);
     expect(normalData.pull).toBe(true);
+  });
+
+  test('#5198: a claimed source awaiting activation keeps its freshness cycle but is never pulled or synced', async () => {
+    // performSync refuses a claimed-but-not-activated source by contract, so
+    // the fan-out drops its sync phase (and pull) instead of dispatching a
+    // cycle that fails the same way every tick. The reason is reported once.
+    const claimed = src('claimed-5198', undefined, { remote_url: 'https://github.com/x/y' });
+    const normal = src('normal-5198', undefined, { remote_url: 'https://github.com/x/y' });
+    const { engine, queue, added, events, fanoutOpts } = makeStubs([claimed, normal]);
+    // Unmanaged brain; claimed-5198 is bound (activation pending), normal-5198 is not.
+    (engine as unknown as { executeRaw: (sql: string, params?: unknown[]) => Promise<unknown[]> }).executeRaw = async (sql, params) =>
+      sql.startsWith('SELECT enabled FROM persistence_brain') ? [{ enabled: false }]
+        : sql.includes('WHERE s.source_id=$1') && params?.[0] !== 'claimed-5198' ? [] : [{ source_id: 'claimed-5198' }];
+    await dispatchPerSource(engine, queue, fanoutOpts);
+    const byId = new Map<string, AddedJob>(
+      added.map(j => [(j.data as Record<string, unknown>).source_id as string, j]),
+    );
+    const claimedData = byId.get('claimed-5198')!.data as Record<string, unknown>;
+    expect(claimedData.phases).toEqual(SOURCE_FRESHNESS_PHASES.filter((p) => p !== 'sync'));
+    expect(claimedData.pull).toBe(false);
+    const normalData = byId.get('normal-5198')!.data as Record<string, unknown>;
+    expect(normalData.phases).toEqual(SOURCE_FRESHNESS_PHASES);
+    expect(normalData.pull).toBe(true);
+    const skipped = () => events.filter(e => e.includes('"fanout_sync_skipped"'));
+    expect(skipped().map(e => JSON.parse(e))).toEqual([
+      { event: 'fanout_sync_skipped', source_id: 'claimed-5198', reason: 'activation_pending' },
+    ]);
+    await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(skipped()).toHaveLength(1);
   });
 
   test('fanoutMax cap: 3 sources, fanoutMax=1, 1 dispatched + 2 in skippedCap', async () => {

@@ -262,7 +262,10 @@ describe('extractPageLinks', () => {
     expect(candidates.length).toBeGreaterThan(0);
     const aliceLink = candidates.find(c => c.targetSlug === 'people/alice');
     expect(aliceLink).toBeDefined();
-    expect(aliceLink!.linkType).toBe('works_at');
+    // #6191: a person is not an employer, so the role phrase no longer types this edge works_at.
+    expect(aliceLink!.linkType).toBe('mentions');
+    const { candidates: employer } = await extractPageLinks('docs/x', 'Alice is the CEO of [Acme](companies/acme).', {}, 'concept', allowAllResolver);
+    expect(employer.find(c => c.targetSlug === 'companies/acme')!.linkType).toBe('works_at');
   });
 
   test('#2011: excerpt window slicing a non-BMP char yields well-formed context', async () => {
@@ -925,6 +928,15 @@ describe('parseTimelineEntries', () => {
     expect(entries[0]).toEqual({ date: '2026-01-15', summary: 'Met with Alice', detail: '', source: 'markdown' });
   });
 
+  test('parses dates in years 0001-0099', () => {
+    expect(parseTimelineEntries('- **0099-01-01** | Event')).toEqual([{
+      date: '0099-01-01',
+      summary: 'Event',
+      detail: '',
+      source: 'markdown',
+    }]);
+  });
+
   test('parses dash variant: - **YYYY-MM-DD** -- summary', () => {
     const entries = parseTimelineEntries('- **2026-01-15** -- Met with Bob');
     expect(entries.length).toBe(1);
@@ -950,6 +962,44 @@ describe('parseTimelineEntries', () => {
     const entries = parseTimelineEntries(content);
     expect(entries.length).toBe(3);
     expect(entries.map(e => e.date)).toEqual(['2026-01-15', '2026-02-20', '2026-03-10']);
+  });
+
+  test('parses dated level-three headings used by compiled wiki pages', () => {
+    const entries = parseTimelineEntries(
+      '### 2026-08-07 — Example orchestration event',
+    );
+    expect(entries).toEqual([{
+      date: '2026-08-07',
+      summary: 'Example orchestration event',
+      detail: '',
+      source: 'markdown',
+    }]);
+  });
+
+  test('captures body text below a dated heading as timeline detail', () => {
+    const content = `## Evidence updates
+
+### 2026-08-07 — Example orchestration event
+- Evidence: [[sources/example-source|Example source]]
+- Interpretation: bounded implementation lanes.
+
+### 2026-08-08 — Follow-up review
+Review completed.`;
+    const entries = parseTimelineEntries(content);
+    expect(entries).toEqual([
+      {
+        date: '2026-08-07',
+        summary: 'Example orchestration event',
+        detail: '- Evidence: [[sources/example-source|Example source]] - Interpretation: bounded implementation lanes.',
+        source: 'markdown',
+      },
+      {
+        date: '2026-08-08',
+        summary: 'Follow-up review',
+        detail: 'Review completed.',
+        source: 'markdown',
+      },
+    ]);
   });
 
   test('skips invalid dates (2026-13-45)', () => {
@@ -1787,6 +1837,44 @@ describe('makeResolver — slug-path exact getPage (step 1 broadened)', () => {
   });
 });
 
+describe('makeResolver — exact path candidates for dotted and Obsidian-path values (#6701, #6623)', () => {
+  function countingEngine(slugs: string[]): BrainEngine & { fuzzyCalls: () => number } {
+    const lookup = new Set(slugs);
+    let fuzzy = 0;
+    return {
+      async getPage(slug: string) { return lookup.has(slug) ? { slug } as any : null; },
+      async findByTitleFuzzy() { fuzzy++; return null; },
+      async searchKeyword() { return []; },
+      fuzzyCalls: () => fuzzy,
+    } as unknown as BrainEngine & { fuzzyCalls: () => number };
+  }
+
+  test('an Obsidian path with spaces and capitals resolves to the slug sync minted, without fuzzy', async () => {
+    const engine = countingEngine(['sources/voice/2030-01-01-1200-call-with-mira']);
+    const r = makeResolver(engine);
+    expect(await r.resolve('sources/voice/2030-01-01 1200 Call with Mira')).toBe('sources/voice/2030-01-01-1200-call-with-mira');
+    expect(engine.fuzzyCalls()).toBe(0);
+  });
+
+  test('a path with a .md suffix resolves to its page', async () => {
+    const r = makeResolver(countingEngine(['people/mira-example']));
+    expect(await r.resolve('people/Mira Example.md')).toBe('people/mira-example');
+  });
+
+  test('a dotted slug resolves by exact lookup', async () => {
+    const engine = countingEngine(['companies/acme.io', 'notes/v1.0.0']);
+    const r = makeResolver(engine);
+    expect(await r.resolve('companies/acme.io')).toBe('companies/acme.io');
+    expect(await r.resolve('notes/v1.0.0')).toBe('notes/v1.0.0');
+    expect(engine.fuzzyCalls()).toBe(0);
+  });
+
+  test('a path with no page still falls through to null', async () => {
+    const r = makeResolver(countingEngine(['people/mira-example']));
+    expect(await r.resolve('people/Someone Else')).toBeNull();
+  });
+});
+
 describe('extractFrontmatterLinks — [[wikilink]] related: values (end-to-end)', () => {
   function fakeEngine(
     slugs: string[],
@@ -1918,6 +2006,22 @@ describe('normalizeBasename — CJK + accent folding (#2367)', () => {
     const idx = buildBasenameIndex(['people/duc-example', 'people/lukasz-example']);
     expect(queryBasenameIndex(idx, 'Đức Example')).toEqual(['people/duc-example']);
     expect(queryBasenameIndex(idx, 'Łukasz Example')).toEqual(['people/lukasz-example']);
+  });
+
+  // A spaced separator ("Backlog - vault") keeps its hyphen AND gains one per
+  // space, so the key read "backlog---vault" while sync mints the slug tail
+  // "backlog-vault" (slugifySegment collapses hyphen runs). Every such wikilink
+  // missed the index in silence.
+  test('hyphen runs collapse like slugifySegment', () => {
+    expect(normalizeBasename('Backlog - vault')).toBe('backlog-vault');
+    expect(normalizeBasename('Implications - The Linchpin')).toBe('implications-the-linchpin');
+    expect(normalizeBasename('Releases -- v2')).toBe('releases-v2');
+    expect(normalizeBasename('- Draft -')).toBe('draft');
+  });
+
+  test('basename index: a spaced-dash display name hits its slug tail', () => {
+    const idx = buildBasenameIndex(['50-backlog/backlog-vault']);
+    expect(queryBasenameIndex(idx, 'Backlog - vault')).toEqual(['50-backlog/backlog-vault']);
   });
 
   test('index side folds too, so a stroke-letter slug stays reachable', () => {

@@ -35,13 +35,14 @@ const check = (name: string, run: (engine: BrainEngine) => Promise<void>) => tes
   withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_SOURCE: undefined }, async () => {
     for (const { engine } of stores) await run(engine);
   }), 120_000);
-async function input(engine: BrainEngine, managed: boolean) {
+async function input(engine: BrainEngine, managed: boolean, extra: Record<string, string> = {}) {
   await disposePersistenceConsumer(engine);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
   const root = mkdtempSync(join(home, 'source-')), git = await makeGitFixture(root);
   for (const [path, content] of Object.entries({
     'people/operator.md': '---\ntype: person\ntitle: Example Operator\n---\n# Example Operator\nOwns the account.\n',
     'customers/account.md': '---\ntype: customer\ntitle: Example Account\nowner: "[[people/operator]]"\naudience: internal\n---\n# Example Account\nA synthetic account.\n',
+    ...extra,
   })) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), content); }
   git.commitAll('Add approved synthetic source');
   const plan = await inspectCompanyBrain({ path: root, profile: 'company-brain' });
@@ -103,6 +104,12 @@ check('legacy company consent retry preserves the approved manifest and original
     principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: intent, intent };
   await admitWrite(engine, admission);
   expect(await performSync(engine, { sourceId: f.sourceId })).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_request: { request_id: requestId } } });
+  // #5988: a company-profile source never holds or converts a content refusal; it keeps blocking.
+  const message = (await getWriteRequest(engine, admission.principal, requestId))!.error_message;
+  await engine.executeRaw('UPDATE persistence_requests SET error_message=$2 WHERE request_id=$1::uuid', [requestId, 'Invalid YAML frontmatter: bad indentation of a mapping entry (3:1)']);
+  expect(await performSync(engine, { sourceId: f.sourceId })).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_request: { request_id: requestId } } });
+  expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='sync-hold' AND fingerprint LIKE $1", [`${f.sourceId}:%`])).toEqual([]);
+  await engine.executeRaw('UPDATE persistence_requests SET error_message=$2 WHERE request_id=$1::uuid', [requestId, message]);
   const failed = (await getWriteRequest(engine, admission.principal, requestId))!;
   expect(failed.error_code).toBe('invalid_params');
   expect(await performSync(engine, { sourceId: f.sourceId, retryFailed: true })).toMatchObject({ status: 'synced' });
@@ -112,6 +119,19 @@ check('legacy company consent retry preserves the approved manifest and original
   const [after] = await engine.executeRaw<{ completed_keys: any[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1", [stored.fingerprint]);
   expect(after.completed_keys[0]).toMatchObject({ runId: cursor.runId, done: true, processingOptions: { noEmbed: true, noExtract: true, noSchemaPack: false } });
   expect(await engine.executeRaw("SELECT id FROM persistence_effects WHERE source_id=$1 AND kind='embedding'", [f.sourceId])).toEqual([]);
+});
+
+// #5493: the company inspection already lists an image as unsupported, so managed discovery neither refuses nor holds it.
+check('a company source with an image and multimodal embedding on syncs without an image hold', async engine => {
+  await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: 'true' }, async () => {
+    const f = await input(engine, true, { 'customers/logo.png': 'not decoded' });
+    expect(await connectCompanyBrain(engine, f)).toMatchObject({ ok: true, receipt: { outcome: 'complete' } });
+    const result = await performSync(engine, { sourceId: f.sourceId, full: true });
+    expect(result.status).not.toBe('blocked_by_failures');
+    expect(result.held).toBeUndefined();
+    expect(await engine.executeRaw('SELECT slug FROM pages WHERE source_id=$1 AND source_path=$2', [f.sourceId, 'customers/logo.png'])).toEqual([]);
+  });
+  await disposePersistenceConsumer(engine);
 });
 
 for (const phase of ['admitted', 'complete']) for (const caller of ['explicit', 'job']) {
@@ -157,3 +177,41 @@ for (const phase of ['admitted', 'complete']) for (const caller of ['explicit', 
     } finally { engine.executeRaw = execute; fetcher.mockRestore(); await disposePersistenceConsumer(engine); }
   });
 }
+
+// #6188 (UC3): a company-profile source never holds a malformed fence; it fails closed with the typed refusal and the commit-upstream fix.
+check('a company source with a malformed fence blocks with the typed fence refusal and holds nothing', async engine => {
+  const fence = '<!--- gbrain:takes:begin -->\n| # | claim | kind | who | weight | since | source |\n|---|---|---|---|---|---|---|\n'
+    + '| 1 | Synthetic take | take | Sentinelholderzq7 Example | 0.7 | 2026-01 | chat |\n<!--- gbrain:takes:end -->\n';
+  const f = await input(engine, true, { 'customers/fenced.md': `---\ntype: customer\ntitle: Fenced Account\n---\n# Fenced Account\nA synthetic account.\n\n${fence}` });
+  const connected = await connectCompanyBrain(engine, f);
+  expect(connected.ok).toBe(false);
+  const failed = await engine.executeRaw<{ error_code: string; error_message: string }>("SELECT error_code,error_message FROM persistence_requests WHERE source_id=$1 AND state IN ('failed','conflict')", [f.sourceId]);
+  expect(failed).toHaveLength(1);
+  expect(failed[0]!.error_code).toBe('invalid_params');
+  expect(failed[0]!.error_message).toMatch(/^Fence holder_unresolved: in the takes fence \(body\)/);
+  expect(failed[0]!.error_message).not.toContain('Sentinelholderzq7');
+  const blocked = await performSync(engine, { sourceId: f.sourceId });
+  expect(blocked).toMatchObject({ status: 'blocked_by_failures' });
+  expect(blocked.managedWrite?.reason).toBe('invalid_fence');
+  expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='sync-hold' AND fingerprint LIKE $1", [`${f.sourceId}:%`])).toEqual([]);
+  await disposePersistenceConsumer(engine);
+});
+
+// #6188 (UC3): a company-profile source never rewrites repository files, so a fence Tier 1 could fix refuses
+// source_writeback_required naming the fence location (never a value), and nothing is held or rewritten.
+check('a company source with a fixable fence refuses source_writeback_required naming the fence, and nothing is held or rewritten', async engine => {
+  const fence = '<!--- gbrain:facts:begin -->\n| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |\n|---|---|---|---|---|---|---|---|---|---|\n'
+    + '| 1 | Sentinelcompanyzq8 claim | partnership | 1.0 | private | medium | 2026-01-01 |  | chat |  |\n<!--- gbrain:facts:end -->\n';
+  const f = await input(engine, true, { 'customers/fixable.md': `---\ntype: customer\ntitle: Fixable Account\n---\n# Fixable Account\nA synthetic account.\n\n${fence}` });
+  const connected = await connectCompanyBrain(engine, f);
+  expect(connected.ok).toBe(false);
+  const failed = await engine.executeRaw<{ error_code: string; error_message: string }>("SELECT error_code,error_message FROM persistence_requests WHERE source_id=$1 AND state IN ('failed','conflict')", [f.sourceId]);
+  expect(failed.map(r => r.error_code)).toEqual(['source_writeback_required']);
+  expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='sync-hold' AND fingerprint LIKE $1", [`${f.sourceId}:%`])).toEqual([]);
+  const blocked = await performSync(engine, { sourceId: f.sourceId });
+  expect(blocked).toMatchObject({ status: 'blocked_by_failures' });
+  expect(failed[0]!.error_message).toBe('Canonical preparation would normalize a facts or takes fence (kind_map row 1 column kind (facts, body)); this profile never writes repository files.');
+  expect(blocked.managedWrite?.message ?? '').toContain('kind_map row 1 column kind (facts, body)');
+  for (const text of [JSON.stringify(failed), JSON.stringify(blocked)]) { expect(text).not.toContain('Sentinelcompanyzq8'); expect(text).not.toContain('partnership'); }
+  await disposePersistenceConsumer(engine);
+});

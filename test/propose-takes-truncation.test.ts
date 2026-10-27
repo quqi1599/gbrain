@@ -19,7 +19,7 @@
  * Uses the gateway chat-transport test seam — no API key, no network.
  */
 
-import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll, spyOn } from 'bun:test';
 import {
   configureGateway,
   resetGateway,
@@ -34,6 +34,7 @@ import {
   EXTRACTOR_FAILURE_HALT_STREAK,
   type ProposeTakesExtractor,
 } from '../src/core/cycle/propose-takes.ts';
+import { classifyGlobalLlmError } from '../src/core/ai/errors.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
@@ -129,6 +130,115 @@ describe('defaultExtractor truncation retry (#3763)', () => {
   });
 });
 
+// ─── per-call timeout scales with the output cap (#5771) ────────────
+
+describe('defaultExtractor per-call timeout scales with maxTokens (#5771)', () => {
+  const input = {
+    pagePath: 'companies/acme-example',
+    pageBody: 'I bet Acme doubles ARR by Q4. They ship weekly.',
+    existingTakes: [],
+  };
+
+  async function timeoutsFor(extra: { maxTokens?: number; retryMaxTokens?: number }): Promise<number[]> {
+    const timeouts: number[] = [];
+    const realTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = ((ms: number) => {
+      timeouts.push(ms);
+      return realTimeout.call(AbortSignal, ms);
+    }) as typeof AbortSignal.timeout;
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return calls === 1 ? chatResult('[{"claim_text":"Acme dou', 'length') : chatResult(GOOD_JSON, 'end');
+    });
+    try {
+      await defaultExtractor({ ...input, ...extra });
+    } finally {
+      AbortSignal.timeout = realTimeout;
+    }
+    return timeouts;
+  }
+
+  test('base call keeps 90s; the default 4096 retry gets 180s', async () => {
+    expect(await timeoutsFor({})).toEqual([90_000, 180_000]);
+  });
+
+  test('a large configured retry cap is bounded at the 300s gateway ceiling, not 90s', async () => {
+    expect(await timeoutsFor({ retryMaxTokens: 12_000 })).toEqual([90_000, 300_000]);
+  });
+
+  test('small caps never drop below the 90s floor', async () => {
+    expect(await timeoutsFor({ maxTokens: 256, retryMaxTokens: 256 })).toEqual([90_000, 90_000]);
+  });
+});
+
+// ─── operator per-call bound (#5958) ────────────────────────────────
+
+describe('defaultExtractor honours an operator per-call bound (#5958)', () => {
+  const page = {
+    pagePath: 'companies/widget-co',
+    pageBody: 'I bet Widget Co triples headcount next year.',
+    existingTakes: [],
+  };
+
+  /** Every bound the extractor arms, in call order, without changing timer behaviour. */
+  async function boundsArmed(run: () => Promise<unknown>): Promise<number[]> {
+    const spy = spyOn(AbortSignal, 'timeout');
+    try {
+      await run();
+      return spy.mock.calls.map(([ms]) => ms);
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  function truncateThenAnswer(): void {
+    let n = 0;
+    __setChatTransportForTests(async () => (++n === 1
+      ? chatResult('[{"claim_text":"Widget', 'length')
+      : chatResult(GOOD_JSON, 'end')));
+  }
+
+  test('the bound replaces the scaled one on the base call and on the retry', async () => {
+    truncateThenAnswer();
+    expect(await boundsArmed(() => defaultExtractor({ ...page, callBoundMs: 210_000 }))).toEqual([210_000, 210_000]);
+  });
+
+  test('a bound under 90s holds even when a large retry cap would scale to 300s', async () => {
+    truncateThenAnswer();
+    expect(await boundsArmed(() => defaultExtractor({ ...page, callBoundMs: 4_000, retryMaxTokens: 12_000 })))
+      .toEqual([4_000, 4_000]);
+  });
+
+  test('control: without a bound the same truncating page keeps the scaled 90s then 180s', async () => {
+    truncateThenAnswer();
+    expect(await boundsArmed(() => defaultExtractor(page))).toEqual([90_000, 180_000]);
+  });
+
+  test('a call stopped by the bound names the page, the bound, the key and its range', async () => {
+    const providerAbort = new Error('claude-cli adapter aborted');
+    __setChatTransportForTests((opts) => new Promise((_ok, fail) => {
+      opts.abortSignal?.addEventListener('abort', () => fail(providerAbort), { once: true });
+    }));
+    const err = await defaultExtractor({ ...page, callBoundMs: 30 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    const message = (err as Error).message;
+    expect(message).toContain('companies/widget-co timed out after 30 ms');
+    expect(message).toContain('claude-cli adapter aborted');
+    expect(message).toContain('dream.propose_takes.call_timeout_ms to whole ms from 1000 to 300000');
+    expect(message).toContain('No tombstone was written');
+    expect((err as Error).cause).toBe(providerAbort);
+    expect(classifyGlobalLlmError(err)).toBeNull();
+  });
+
+  test('control: a failure the bound did not cause is rethrown as the same error', async () => {
+    const quota = new Error('upstream refused the request');
+    __setChatTransportForTests(async () => { throw quota; });
+    const err = await defaultExtractor({ ...page, callBoundMs: 60_000 }).catch((e: unknown) => e);
+    expect(err).toBe(quota);
+  });
+});
+
 // ─── phase-level dead-lane halt ─────────────────────────────────────
 
 interface CapturedSql { sql: string; params: unknown[] }
@@ -139,6 +249,7 @@ function buildMockEngine(pageCount: number): { engine: BrainEngine; captured: Ca
     kind: 'pglite',
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      if (sql.includes('FROM persistence_brain')) return [{ enabled: false } as unknown as T]; // #6482: the strict mode reader needs one well-formed unmanaged row.
       if (sql.includes('SELECT slug, source_id, compiled_truth')) {
         return Array.from({ length: pageCount }, (_, i) => ({
           slug: `wiki/page-${i}`,

@@ -240,6 +240,15 @@ export interface PatternEntry {
    * real transcript stays ~1.0.
    */
   score_full_body?: boolean;
+  /**
+   * Conversational-structure gate for broad label-shaped patterns
+   * (gbrain-evals N12-1). When the parsed body has at least this many
+   * turns and no speaker ever speaks twice, the page is a list of one-off
+   * labels (`**Status:** … **Owner:** … **Next step:** …`), not an
+   * exchange, and the orchestrator returns no_match. Density scoring
+   * cannot see this: a short status block clears the 0.05 floor.
+   */
+  repeat_speaker_min_turns?: number;
   /** D7: module-load validation — known-positive sample lines. */
   test_positive: string[];
   /** D7: module-load validation — known-negative sample lines. */
@@ -279,8 +288,10 @@ export interface ParseConversationOpts {
 export interface DateContext {
   /** ISO YYYY-MM-DD string. */
   fallbackDate: string;
-  /** IANA timezone (e.g. 'America/Los_Angeles') or undefined. */
+  /** Valid IANA timezone (e.g. 'America/Los_Angeles') or undefined. */
   timezone?: string;
+  /** #5430: a declared `frontmatter.timezone` that is not a valid IANA zone; timestamps stay UTC and the warning names it. */
+  invalid_timezone?: string;
   /** Which step of the derivation chain won (for debug). */
   source: 'frontmatter_date' | 'effective_date' | 'explicit' | 'epoch_default';
 }

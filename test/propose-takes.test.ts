@@ -23,7 +23,7 @@ import {
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
-  isWellFormedEmptyExtraction,
+  extractorOutcome,
   PROPOSE_TAKES_PROMPT_VERSION,
   EMPTY_EXTRACTION_TOMBSTONE_TEXT,
   resolveProposeTakesDeadlineMs,
@@ -60,6 +60,7 @@ function buildMockEngine(opts: {
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      if (sql.includes('FROM persistence_brain')) return [{ enabled: false } as unknown as T]; // #6482: the strict mode reader needs one well-formed unmanaged row.
       // Narrow candidate-page projection (replaces listPages in the phase).
       if (sql.includes('SELECT slug, source_id, compiled_truth')) {
         return opts.pages.map((p) => ({
@@ -250,51 +251,75 @@ describe('parseExtractorOutput', () => {
     expect(out).toHaveLength(1);
     expect(out[0]!.claim_text).toBe('Z');
   });
+
+  // #5209: recovery must stop at the value's own closing bracket; the last
+  // `]`/`}` in the reply can belong to prose after it.
+  const take = (claim: string, kind = 'take') => JSON.stringify({ claim_text: claim, kind, holder: 'brain', weight: 0.7 });
+
+  test('an array followed by a numbered citation keeps its takes', () => {
+    const out = parseExtractorOutput(`[${take('Pricing beats features')},${take('Hiring lags plan', 'bet')}]\n[1] board memo`);
+    expect(out.map(t => [t.claim_text, t.kind])).toEqual([['Pricing beats features', 'take'], ['Hiring lags plan', 'bet']]);
+  });
+
+  test('a lone object followed by a stray `]` is recovered', () => {
+    const out = parseExtractorOutput(`${take('Churn is seasonal', 'hunch')}\n]`);
+    expect(out.map(t => t.claim_text)).toEqual(['Churn is seasonal']);
+  });
+
+  test('brackets, braces and an escaped quote inside claim_text', () => {
+    const claim = 'Ratio {a]/[b} is "stable"';
+    const out = parseExtractorOutput(`[${take(claim)}] per [[companies/acme-example]]`);
+    expect(out.map(t => t.claim_text)).toEqual([claim]);
+  });
+
+  test('control: a cut-off array followed by a citation still yields nothing', () => {
+    expect(parseExtractorOutput(`[${take('A')},{"claim_text":"B"\nSee [Source: memo]`)).toEqual([]);
+  });
 });
 
-// ─── isWellFormedEmptyExtraction ────────────────────────────────────
+// ─── extractorOutcome: the empty-extraction decision ───────────────
 // Guards the tombstone against permanently memoizing a transient parse
 // failure as "no claims". Only a cleanly-parsed empty array counts as a
 // genuine empty extraction; malformed/prose/truncated output must not.
 
-describe('isWellFormedEmptyExtraction', () => {
+describe('extractorOutcome valid_empty (the tombstone decision)', () => {
   test('true for a clean empty array (the well-behaved "no claims" response)', () => {
-    expect(isWellFormedEmptyExtraction('[]')).toBe(true);
-    expect(isWellFormedEmptyExtraction('  []  ')).toBe(true);
-    expect(isWellFormedEmptyExtraction('[   ]')).toBe(true);
+    expect(extractorOutcome('[]').kind).toBe('valid_empty');
+    expect(extractorOutcome('  []  ').kind).toBe('valid_empty');
+    expect(extractorOutcome('[   ]').kind).toBe('valid_empty');
   });
 
   test('true for a fenced empty array', () => {
-    expect(isWellFormedEmptyExtraction('```json\n[]\n```')).toBe(true);
+    expect(extractorOutcome('```json\n[]\n```').kind).toBe('valid_empty');
   });
 
   test('true for leading prose then an empty array', () => {
-    expect(isWellFormedEmptyExtraction('No gradeable claims.\n\n[]')).toBe(true);
+    expect(extractorOutcome('No gradeable claims.\n\n[]').kind).toBe('valid_empty');
   });
 
   test('false for empty / whitespace output (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('')).toBe(false);
-    expect(isWellFormedEmptyExtraction('   \n  ')).toBe(false);
+    expect(extractorOutcome('').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('   \n  ').kind).not.toBe('valid_empty');
   });
 
   test('false for prose-only / non-JSON output (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('There are no gradeable claims here.')).toBe(false);
-    expect(isWellFormedEmptyExtraction('null')).toBe(false);
+    expect(extractorOutcome('There are no gradeable claims here.').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('null').kind).not.toBe('valid_empty');
   });
 
   test('false for malformed / truncated JSON (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('[')).toBe(false);
-    expect(isWellFormedEmptyExtraction('[{"claim_text":"x"')).toBe(false);
+    expect(extractorOutcome('[').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('[{"claim_text":"x"').kind).not.toBe('valid_empty');
   });
 
   test('false for a NON-empty array (has content — not an empty extraction)', () => {
-    expect(isWellFormedEmptyExtraction('[{"claim_text":"x","kind":"take","holder":"brain","weight":0.5}]')).toBe(false);
+    expect(extractorOutcome('[{"claim_text":"x","kind":"take","holder":"brain","weight":0.5}]').kind).not.toBe('valid_empty');
     // Parseable but claim-less array is ambiguous garbage → not a genuine empty.
-    expect(isWellFormedEmptyExtraction('[{"foo":"bar"}]')).toBe(false);
+    expect(extractorOutcome('[{"foo":"bar"}]').kind).not.toBe('valid_empty');
   });
 
   test('false for an empty object (model ignored the array-format instruction)', () => {
-    expect(isWellFormedEmptyExtraction('{}')).toBe(false);
+    expect(extractorOutcome('{}').kind).not.toBe('valid_empty');
   });
 });
 
@@ -626,7 +651,9 @@ New prose appended here.`;
 
       const result = await runPhaseProposeTakes(buildCtx(engine), {
         extractor,
-        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes' }),
+        // The OpenRouter alias is not in the canonical pricing table; the
+        // opt-in bypass keeps this test about model-id preservation (C-16).
+        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes', allowUnpriced: true }),
       });
 
       expect(result.status).toBe('ok');
@@ -653,6 +680,25 @@ New prose appended here.`;
         expect(result.status).toBe('skipped');
         expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
         // Skips BEFORE touching the engine — no page scan, no cache probes.
+        expect(captured).toHaveLength(0);
+      } finally {
+        resetGateway();
+      }
+    });
+  });
+
+  test('default extractor skips cleanly when a non-Anthropic chat model has no key (#6705)', async () => {
+    await withEnv({ GBRAIN_HOME: emptyHome(), OPENAI_API_KEY: undefined }, async () => {
+      configureGateway({ chat_model: 'openai:gpt-5.6', env: {} });
+      try {
+        const { engine, captured } = buildMockEngine({
+          pages: [buildPage({ slug: 'wiki/c', body: 'claim-ish prose' })],
+        });
+        const result = await runPhaseProposeTakes(buildCtx(engine));
+
+        expect(result.status).toBe('skipped');
+        expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
+        expect(result.summary).toContain('OPENAI_API_KEY');
         expect(captured).toHaveLength(0);
       } finally {
         resetGateway();
@@ -1023,6 +1069,37 @@ describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
     expect(details.aborted_global_error).toBeUndefined();
     expect(result.status).toBe('warn'); // still surfaced as a warning
     expect(result.summary).not.toContain('aborted on');
+  });
+});
+
+// ─── #4312: pricing.overrides reach the base-phase budget gate ─────
+
+describe('pricing.overrides reach the base-phase meter (#4312)', () => {
+  test('a $0 operator override lets a capped phase run instead of exhausting at list price', async () => {
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'test-key' } });
+    try {
+      const run = async (overrides: string | null) => {
+        const pages = [buildPage({ slug: 'wiki/override', body: 'an operator rate should price the gate' })];
+        const { engine, captured } = buildMockEngine({ pages });
+        (engine as unknown as { getConfig: (k: string) => Promise<string | null> }).getConfig =
+          async (k: string) => (k === 'pricing.overrides' ? overrides : null);
+        const extractor: ProposeTakesExtractor = async () => [
+          { claim_text: 'an operator rate should price the gate', kind: 'take', holder: 'brain', weight: 0.5 },
+        ];
+        const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, budgetUsd: 0.000001 });
+        return { result, inserted: captured.some(c => c.sql.includes('INSERT INTO take_proposals')) };
+      };
+      // Control: at list price the cap is binding.
+      const listed = await run(null);
+      expect(listed.result.details.budget_exhausted).toBe(true);
+      expect(listed.inserted).toBe(false);
+      // With the operator's $0 rate the same cap admits the call.
+      const priced = await run('{"anthropic:claude-sonnet-4-6": 0}');
+      expect(priced.result.details.budget_exhausted).toBe(false);
+      expect(priced.inserted).toBe(true);
+    } finally {
+      resetGateway();
+    }
   });
 });
 

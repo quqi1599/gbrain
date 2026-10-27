@@ -20,7 +20,9 @@
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
 import { privatePagesFilterFragment } from './private-visibility.ts';
-import { currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
+import { chunkVisibleFilter, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
+import { pageEligibleSql } from '../eligibility/sql.ts';
+import type { TrustTier } from '../trust/tier.ts';
 
 /**
  * Escape `%`, `_`, and `\` so a string can be used as a LIKE prefix literal.
@@ -177,7 +179,8 @@ export function buildVisibilityClause(
   opts?: {
     /**
      * #4352 — untrusted-caller predicate: hide pages whose frontmatter
-     * carries `visibility: private` (absent visibility defaults to 'world').
+     * carries `visibility: private` (absent visibility defaults to 'world',
+     * or to 'private' on derived atoms and synthesized concepts).
      * Set from SearchOpts.excludePrivate by both engines; callers resolve
      * trust + the config gate via resolveExcludePrivatePages
      * (search/private-visibility.ts). Off by default — trusted local reads
@@ -185,6 +188,15 @@ export function buildVisibilityClause(
      */
     excludePrivate?: boolean;
     requireSafeChunks?: boolean;
+    /** #5575: the read floor and proactive activation control (eligibility/sql.ts), applied before LIMIT. */
+    minTrust?: TrustTier;
+    suppressFlagged?: boolean;
+    /**
+     * Wave B: the chunk table alias when the statement reads `content_chunks`
+     * rows joined to the page; adds the live body generation predicate
+     * (`chunkVisibleFilter`) in place of the page-only projection filter.
+     */
+    chunkAlias?: string;
   },
 ): string {
   // Single source of truth for the quarantine SQL lives in quarantine.ts so
@@ -196,7 +208,13 @@ export function buildVisibilityClause(
     ? ` AND ${privatePagesFilterFragment(pageAlias)}`
     : '';
   const chunksClause = requiresSafeChunks(opts) ? ` AND ${safeChunksFilter(pageAlias)}` : '';
-  return `AND ${pageAlias}.deleted_at IS NULL AND ${currentTextProjectionFilter(pageAlias)} AND NOT ${sourceAlias}.archived AND ${quarantine}${privateClause}${chunksClause}`;
+  // C4: a pinned question's page holds only the question and owner notes; it is
+  // read through questions_* and never ranks in retrieval (questions/pages.ts).
+  const pinnedQuestion = ` AND NOT (COALESCE(${pageAlias}.frontmatter, '{}'::jsonb) ? 'pinned_question')`;
+  const trustClause = opts?.minTrust || opts?.suppressFlagged
+    ? ` AND ${pageEligibleSql(pageAlias, { floor: opts.minTrust, suppressFlagged: opts.suppressFlagged })}` : '';
+  const projection = opts?.chunkAlias ? chunkVisibleFilter(pageAlias, opts.chunkAlias) : currentTextProjectionFilter(pageAlias);
+  return `AND ${pageAlias}.deleted_at IS NULL AND ${projection} AND NOT ${sourceAlias}.archived AND ${quarantine}${pinnedQuestion}${privateClause}${chunksClause}${trustClause}`;
 }
 
 // ============================================================
@@ -257,6 +275,23 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
 export const MAX_WEBSEARCH_QUERY_CHARS = 64_000;
 export const MAX_WEBSEARCH_QUERY_TERMS = 256;
 
+/** Longest run of dash negations `websearch_to_tsquery` parses: its operator stack holds 32 entries. */
+export const MAX_WEBSEARCH_DASH_RUN = 31;
+
+/**
+ * Collapse runs of more than MAX_WEBSEARCH_DASH_RUN dash negations to their
+ * parity. websearch_to_tsquery reads every `-` before a term as one more NOT
+ * (`x ---- y` is `'x' & !!!!'y'`), so a markdown rule or setext underline of
+ * 32+ dashes (`-----...` or `- - - ...`) overflows its operator stack and
+ * raises `tsquery stack too small`, failing the keyword and title arms for
+ * the whole query. An even run becomes a space and an odd run a single `-`:
+ * the tsquery a deeper stack would build. Shorter runs, and so every query
+ * that parses today, pass through unchanged.
+ */
+export function collapseWebsearchDashRuns(query: string): string {
+  return query.replace(/-(?:\s*-){31,}/g, run => ((run.match(/-/g)!.length % 2) === 1 ? ' -' : ' '));
+}
+
 /**
  * Bound caller text before feeding it to `websearch_to_tsquery`.
  *
@@ -264,7 +299,8 @@ export const MAX_WEBSEARCH_QUERY_TERMS = 256;
  * large, high-term-count strings. Keep ordinary exact-title/body searches
  * untouched, but cap pasted grounding blobs before they reach SQL.
  */
-export function boundWebsearchQuery(query: string): string {
+export function boundWebsearchQuery(raw: string): string {
+  const query = collapseWebsearchDashRuns(raw);
   if (query.length <= MAX_WEBSEARCH_QUERY_CHARS) {
     let terms = 0;
     for (const _ of query.matchAll(/[\p{L}\p{N}]+/gu)) {
@@ -328,13 +364,25 @@ export function buildOrFallbackWebsearchQuery(query: string): string | null {
   // F3 operator guard: any double quote, or a dash LEADING a token
   // (whitespace/start boundary — interior hyphens like "foo-bar" are fine).
   if (query.includes('"') || /(^|\s)-\S/.test(query)) return null;
-  const tokens = query
+  const tokens = orFallbackTokens(query);
+  return tokens.length < 2 ? null : tokens.join(' OR ');
+}
+
+/**
+ * The OR fallback's terms: word tokens without the literal OR/AND words, each
+ * once (case-insensitive, first spelling kept). A repeated word adds no match
+ * and only makes ts_rank evaluate the lexeme again on every matching row:
+ * 4.5 s against 0.55 s over a 16,840-page match set, with identical scores
+ * (#7135, diagnosed by @veltri-23 in #7136). Callers apply the operator guard.
+ */
+export function orFallbackTokens(query: string): string[] {
+  const seen = new Set<string>();
+  return query
     .normalize('NFKC')
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
-    .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; });
-  if (tokens.length < 2) return null;
-  return tokens.join(' OR ');
+    .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; })
+    .filter(t => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
 // ============================================================

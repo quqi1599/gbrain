@@ -8,6 +8,7 @@ import { readHarnessReceiptState, writeHarnessReceipt, type HarnessReceipt } fro
 import { installSharedSkillsConnection } from '../src/core/harness/shared-skills.ts';
 import type { SharedSkillsToolCaller } from '../src/core/shared-skills/adapter.ts';
 import { operations } from '../src/core/operations.ts';
+import { HARNESS_CLEANUP_PENDING_EXIT_CODE } from '../src/core/exit-codes.ts';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -175,7 +176,8 @@ test('follow failure stays pending without breaking memory or revoking the prior
   const f = fixture();
   expect(await applyHarness(flags(), f.deps)).toBe(0);
   f.failJoin();
-  expect(await applyHarness(flags(), f.deps)).toBe(0);
+  // #6743: the retained prior enrollment is pending cleanup, so the run no longer reports plain success.
+  expect(await applyHarness(flags(), f.deps)).toBe(HARNESS_CLEANUP_PENDING_EXIT_CODE);
   expect(f.receipt().shared_skills?.at(-1)?.status).toBe('pending');
   expect(f.memberships.get(f.mints[0].token)?.active).toBe(true);
   expect(f.revoked).toEqual([]);
@@ -280,6 +282,25 @@ test('status verifies each independent credential, not just the first healthy ha
   expect(missing.harness_tokens).toContainEqual({ host: 'claude-code', verified: false });
   expect(missing.harness_tokens).toContainEqual({ host: 'codex', verified: true });
   expect(missing.token_verified).toBe(false);
+});
+
+test('#6798: --status prints the stale-epoch hint only for a superseded enrollment, and as a condition without the brain', async () => {
+  const f = fixture();
+  expect(await applyHarness(flags('--source', 'workspace'), f.deps)).toBe(0);
+  const entry = f.receipt().shared_skills![0];
+  const installationId = JSON.parse(readFileSync(join(entry.root, 'shared-skills', 'receipt.json'), 'utf8')).installation_id;
+  const statusText = async (lookup: HarnessDeps['supersededEnrollments']) => {
+    f.output.length = 0;
+    await statusHarness(flags(), { ...f.deps, supersededEnrollments: lookup });
+    return f.output.find(line => line.includes(`shared skills (${entry.host})`))!;
+  };
+  const current = await statusText(async () => []);
+  expect(current).toContain('native activation unverified.');
+  expect(current).not.toContain('--refresh-skills');
+  expect(await statusText(async () => { throw new Error('brain unavailable'); }))
+    .toContain('(if the brain reports a newer enrollment epoch: gbrain bootstrap harness --refresh-skills)');
+  expect(await statusText(async () => [{ host: entry.host, installation_id: installationId, local_epoch: 1, server_epoch: 2, active: false }]))
+    .toContain('enrollment superseded (server epoch 2, inactive): gbrain bootstrap harness --refresh-skills');
 });
 
 test('implicit source binding preserves the existing federated source ceiling for each principal', async () => {

@@ -1,4 +1,4 @@
-import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
+import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from './spawn.ts';
 import { readFileSync } from 'node:fs';
 
 export type AutopilotLockHolder =
@@ -82,8 +82,7 @@ export function looksLikeGbrainAutopilotCommand(command: string): boolean {
   if (!/(^|\s)autopilot(\s|$)/i.test(normalized)) return false;
   // Win32_Process.CommandLine quotes executables under paths with spaces: `"C:/Program Files/gbrain/gbrain.exe" autopilot`.
   if (/(^|[\/\s])"?gbrain(?:\.exe)?"?(\s|$)/i.test(normalized)) return true;
-  return /(^|\s)(?:\S+\/)?(?:\.{1,2}\/)?(?:src\/)?cli\.(?:ts|js|mjs)(\s|$)/i.test(normalized)
-    || /(^|\s)\S*\/src\/cli\.(?:ts|js|mjs)(\s|$)/i.test(normalized);
+  return /(^|[\/\s])["']?cli\.(?:ts|js|mjs)["']?(\s|$)/i.test(normalized);
 }
 
 export function classifyAutopilotLockHolder(

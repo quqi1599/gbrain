@@ -37,7 +37,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { configureGateway } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 const DIM = 1536;
 
@@ -50,20 +50,22 @@ const INTERFACE_METHODS: readonly string[] = [
   // Lifecycle
   'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'transactionDirect', 'registerBeforeDisconnect', 'withReservedConnection',
   // Pages CRUD
-  'getPage', 'readPageSnapshot', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
+  'getPage', 'readPageSnapshot', 'readPageSnapshotsBatch', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'findDuplicatePages', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
   'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
   'listAllPageRefs', 'listAllSources', 'updateSourceConfig', 'listPrefixSampledPages', 'listCorpusSample',
   // Search
-  'searchKeyword', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
+  'searchKeyword', 'countKeywordPages', 'searchKeywordPages', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
   // Chunks
-  'upsertChunks', 'getChunks', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
+  'upsertChunks', 'getChunks', 'getChunkPage', 'getChunkWindows', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
   'invalidateStaleSignatureEmbeddings', 'invalidateContentDriftEmbeddings', 'listStaleChunks',
-  'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'deleteChunks',
+  'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'readEmbeddingStateCounts', 'listEmbeddingStateRows', 'deleteChunks',
   // Extraction watermark
-  'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch',
+  'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
+  // #6454 stale reserved frontmatter keys
+  'countStaleFrontmatterKeyPages', 'listStaleFrontmatterKeyPages', 'stripStaleFrontmatterKeys',
   // Links + graph
-  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
-  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
+  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'replaceDerivedLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
+  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'relationalChainHop', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
   // Tags
@@ -87,7 +89,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'getContradictionCacheEntry', 'putContradictionCacheEntry', 'sweepContradictionCache',
   // Facts (hot memory)
   'insertFact', 'insertFacts', 'deleteFactsForPage', 'expireFact', 'listFactsByEntity',
-  'listFactsSince', 'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts',
+  'listFactsSince', 'listFactsKeyset', 'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts',
   'findCandidateDuplicates', 'consolidateFact', 'findTrajectory', 'getFactsHealth',
   // Versions
   'createVersion', 'getVersions', 'revertToVersion',
@@ -98,7 +100,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'refreshPageBody', 'updatePageContextualRetrievalState', 'migrateFactsToCanonical',
   // Config + migration + raw SQL
   'getConfig', 'setConfig', 'unsetConfig', 'listConfigKeys', 'runMigration',
-  'getChunksWithEmbeddings', 'executeRaw', 'executeRawDirect',
+  'getChunksWithEmbeddings', 'executeRaw', 'executeRawDirect', 'keywordBoundedRead',
   // v0.46.28-34 master waves (classified at the test-gap-wave merge):
   // #3980 bulk config read, #3776 takes-embedding update, #3674 scoped
   // link removal.
@@ -112,6 +114,11 @@ const INTERFACE_METHODS: readonly string[] = [
   // Salience + anomaly + enrich
   'batchLoadEmotionalInputs', 'setEmotionalWeightBatch', 'getRecentSalience', 'listEnrichCandidates',
   'findAnomalies',
+  // Wave B segmented page bodies (src/core/engine-sql/page-body.ts; covered by test/large-pages/ and test/engine-sql-page-body.test.ts)
+  'allocateBodyOccurrenceIds', 'stageSegmentTexts', 'readSegmentTexts', 'stageManifestRows', 'readManifest', 'stageSegmentChunks',
+  'createSegmentedPageShell', 'flipBodyGeneration', 'openBodyStaging', 'setBodyStagingState', 'sweepSegments',
+  // Wave B PR 4 per-segment derivation rows (same SQL module; covered by test/engine-sql-segment-derivations.test.ts and its Postgres arm)
+  'readSegmentDerivations', 'upsertSegmentDerivations', 'retireSegmentDerivations',
 ];
 
 /**
@@ -127,15 +134,13 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'applyForwardReferenceBootstrap',
   'getBulkRetryOpts',
   'batchRetry',
-  'buildStaleChunkWhere',
   'activeEmbeddingColId',
-  'buildChunklessPagesWhere',
-  'buildStalePagesWhere',
-  'pushChronicleSource',
-  'factsDeps',
-  'takesDeps',
   'codeEdgesDeps',
-  'salienceDeps',
+  // refactor wave 1 C9: per-call engine-sql executor getter (EO1).
+  'engineSql',
+  // Engine graduation: PGLite close/open that keeps the kernel lock across the custody window.
+  'closeRetainingLock',
+  'connectWithHeldLock',
 ];
 
 /**
@@ -152,11 +157,12 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
  *   - getTakeEmbeddings left the list at the master merge: wave-k's #3776
  *     semantic takes retrieval gave it real callers + coverage (the ratchet
  *     shrank, as designed — its smoke below stays as a shape pin).
+ *   - listPrefixSampledPages, listCorpusSample and getPageTimestamps left the
+ *     list in refactor wave 1 W0: the Postgres SQL-text goldens
+ *     (test/helpers/postgres-engine-sql-cases.ts) call them. Their PGLite
+ *     smokes stay below, unchanged, as ex-UNCALLED shape pins.
  */
 const UNCALLED: readonly string[] = [
-  'listPrefixSampledPages', // called by src/core/brainstorm/domain-bank.ts; brainstorm tests stub above the engine
-  'listCorpusSample',       // called by src/core/brainstorm/domain-bank.ts (fallback arm)
-  'getPageTimestamps',      // DELETION CANDIDATE: deprecated, zero src callers
   'rewriteLinks',           // documented no-op stub; callers exist (migrate.ts, cycle/phantom-redirect.ts)
 ];
 
@@ -242,7 +248,9 @@ function unitEmbedding(): Float32Array {
   return e;
 }
 
-const SMOKES: Record<string, () => Promise<void>> = {
+// Ex-UNCALLED shape pins: methods that gained references elsewhere (the
+// ratchet shrank, as designed); each keeps its original seeded-PGLite smoke.
+const EX_UNCALLED_SHAPE_PINS: Record<string, () => Promise<void>> = {
   listPrefixSampledPages: async () => {
     // One row per two-segment prefix, ordered by prefix; inbound-link count
     // is the tiebreaker inside a prefix; representative_chunk_id resolves to
@@ -293,8 +301,9 @@ const SMOKES: Record<string, () => Promise<void>> = {
     // Empty input short-circuits to an empty map.
     expect((await engine.getPageTimestamps([])).size).toBe(0);
   },
+};
 
-
+const SMOKES: Record<string, () => Promise<void>> = {
   rewriteLinks: async () => {
     // Documented no-op stub on PGLite: links key on integer page_id FKs, so
     // they are already correct after updateSlug. Pin the no-op contract —
@@ -354,6 +363,7 @@ describe('uncovered-method smokes (seeded PGLite)', () => {
 
   afterAll(async () => {
     await engine.disconnect();
+    resetGateway(); // R5: restore the preload baseline for later files in this shard
   });
 
   test('kind discriminator (readonly instance property, not on the prototype)', () => {
@@ -366,6 +376,10 @@ describe('uncovered-method smokes (seeded PGLite)', () => {
 
   for (const name of Object.keys(SMOKES)) {
     test(`smoke: ${name}`, () => SMOKES[name]());
+  }
+
+  for (const name of Object.keys(EX_UNCALLED_SHAPE_PINS)) {
+    test(`shape pin (ex-UNCALLED): ${name}`, () => EX_UNCALLED_SHAPE_PINS[name]());
   }
 
   // getTakeEmbeddings left UNCALLED at the master merge (#3776 gave it real

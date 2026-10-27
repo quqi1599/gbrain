@@ -9,6 +9,7 @@ import { OperationError } from '../../src/core/ops/contract.ts';
 import { managedAtomSession } from '../../src/core/persistence/atom-maintenance.ts';
 import { retryManagedAtomBatch } from '../../src/core/persistence/atom-retry.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { sha256 } from '../../src/core/persistence/digest.ts';
 import { refreshManagedFilesystemRoots } from '../../src/core/persistence/filesystem-guard.ts';
 import { registerLocalWriter } from '../../src/core/persistence/identity.ts';
@@ -38,7 +39,7 @@ export async function exerciseAtomRetrySourceIsolation(engine: BrainEngine): Pro
           }
           if (phase === 'drain') {
             const pending = await current.executeRaw("SELECT id FROM persistence_requests WHERE id=$1::uuid AND state IN ('queued','running')", [pendingRetryId]);
-            if (pending.length) return current.executeRaw(sql.replace("WHERE r.state='queued'", "WHERE r.source_id=$3 AND r.state='queued'"), [...args!, priorSource]);
+            if (pending.length) return current.executeRaw(sql.replace("WHERE r.state='queued'", `WHERE r.source_id=$${args!.length + 1} AND r.state='queued'`), [...args!, priorSource]);
             phase = 'done';
           }
         }
@@ -86,7 +87,7 @@ export async function exerciseAtomRetryFence(engine: BrainEngine, state: typeof 
           await tx.lockPageKeys([{ sourceId, slug: slugs[0] }]);
           const atom = (await tx.getPage(slugs[0], { sourceId }))!;
           await tx.putPage(slugs[0], { ...atom, compiled_truth: 'Independent correction that must survive retry.' }, { sourceId });
-        }));
+        }, TEST_WRITE_ATTRIBUTION));
       };
       const observe = (target: BrainEngine, inTransaction = false): BrainEngine => new Proxy(target, {
         get(current, key) {
@@ -129,12 +130,13 @@ export async function exerciseAtomRetryFence(engine: BrainEngine, state: typeof 
       expect(first.status).toBe('warn');
       expect(failureInjected).toBe(true);
       expect(calls).toBe(1);
-      const accepted = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId]);
+      const accepted = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND intent->>'kind' IS DISTINCT FROM 'managed_generation_activate' ORDER BY sequence", [sourceId]);
       expect(accepted).toHaveLength(slugs.length + 1);
+      expect(await engine.executeRaw("SELECT state FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_generation_activate'", [sourceId])).toHaveLength(1);
       const completion = await waitForWrite(observedEngine, accepted.at(-1)!, { engine: engine.kind });
       expect(completion.state).toBe('conflict');
       await disposePersistenceConsumer(observedEngine);
-      const originals = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId]);
+      const originals = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND intent->>'kind' IS DISTINCT FROM 'managed_generation_activate' ORDER BY sequence", [sourceId]);
       expect(originals[0].state).toBe(state);
       expect(originals[0].page_id).toBe(originalTarget?.page.id ?? null);
       expect(originals[0].intent?.expected_revision).toBe(originalTarget?.revision);
@@ -228,8 +230,9 @@ export async function exerciseAtomWriteThroughPolicy(engine: BrainEngine, value:
       expect((await run()).status).toBe('ok');
       await disposePersistenceConsumer(engine);
       expect(calls).toBe(1);
-      const rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId]);
+      const rows = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND intent->>'kind' IS DISTINCT FROM 'managed_generation_activate' ORDER BY sequence", [sourceId]);
       expect(rows).toHaveLength(2);
+      expect(await engine.executeRaw("SELECT state FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_generation_activate'", [sourceId])).toEqual([{ state: 'committed' }]);
       expect(rows.every(row => row.state === 'committed')).toBe(true);
       const atom = (await engine.getPage(rows[0].slug, { sourceId }))!;
       expect(atom.frontmatter.visibility).toBe('private');

@@ -27,6 +27,7 @@ mutating: true
 # exempt: this skill changes host networking/service state and never answers
 # a knowledge question, so there is nothing to look up in the brain first.
 brain_first: exempt
+when_to_use: "Use when the user asks: \"use my brain over mcp\", \"serve my brain over mcp\", \"expose my brain over mcp\", \"gbrain mcp server\", \"remote mcp access to my brain\"."
 ---
 
 # Remote MCP — use your brain from anywhere
@@ -82,7 +83,7 @@ This skill guarantees:
 | --- | --- | --- |
 | Your own devices: Claude Desktop, Claude Code / Codex / opencode on another laptop, phone apps joined to the tailnet | tailnet-only HTTPS (default) | `gbrain mcp expose --dry-run` (preview; the run itself is Phase 2, after consent) |
 | Cloud agents running in a vendor's cloud: Grok Bot, Muse, ChatGPT connector, Claude.ai / Cowork, Perplexity Computer | public HTTPS on the same `*.ts.net` name | `gbrain mcp expose --funnel --dry-run` (preview; Phase 2 after consent) |
-| Cloud agent whose runtime you can join to your tailnet (userspace `tailscaled`, ephemeral auth key) | tailnet-only | Advanced, unverified, not automated — see the [remote MCP guide](../../docs/guides/remote-mcp.md) |
+| Cloud agent whose runtime you can join to your tailnet (userspace `tailscaled`, ephemeral auth key) | tailnet-only | Advanced, unverified, not automated — see the [remote MCP guide](https://github.com/garrytan/gbrain/blob/master/docs/guides/remote-mcp.md) |
 | Local agents on the same machine (Claude Code, Codex, opencode) | loopback — no Tailscale needed | Postgres: `gbrain bootstrap harness --yes --port 3131`. PGLite: mint the token BEFORE the service runs (`gbrain auth create local-agents --scopes read,write` — before `gbrain mcp expose`, or while the service is briefly stopped) and pass `gbrain bootstrap harness --yes --port 3131 --token <value>`; OR use the scoped path `gbrain mcp grant <name> --harness <id> --profile memory-writer --source default --url http://127.0.0.1:3131/mcp --admin-token-file ~/.gbrain/serve/admin-token --credentials-out /private/<name>.json` then `gbrain connect http://127.0.0.1:3131/mcp --harness <id> --credentials-file /private/<name>.json --install` (MCP wiring only, no per-turn hooks) |
 | Thin client only (this machine has no brain) | — | Stop: run this skill on the brain host |
 
@@ -178,7 +179,7 @@ Relay every prompt the command surfaces:
 | `service: manual` (no supervisor: cloud sandbox, container) | Relay the printed foreground and `nohup … &` commands; this is a documented outcome, not a failure |
 | `verify.local: warn` (exit 2, `local_health_timeout`) | The handler is published, the service installed and the receipt written — this exit 2 is NOT "nothing published"; `--status` / `--remove` find them. `/health` did not answer within the wait: check `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status` |
 | `verify.tailnet: pending` (exit 2, `tailnet_health_pending`; `--status` reports it with exit 1) | Same: handler, service and receipt are already in place. First certificate issuance can take a minute; `gbrain mcp expose --status` later |
-| `confirmation_required` (exit 2) | Non-TTY run without `--yes`. Nothing changed; show the printed plan, get the operator's yes, then re-run with `--yes` |
+| `confirmation_required` (exit 2) | Non-TTY run without `--yes`. Nothing changed; show the printed plan, relay the payload's `user_message`, and run its `fix.command` (it adds `--yes`) only after the operator agrees |
 | `tailscale_no_dns_name` (exit 1) — the node has no MagicDNS name | Enable MagicDNS + HTTPS Certificates at `https://login.tailscale.com/admin/dns`, then re-run; nothing was published |
 | `tailscale_missing` (exit 1, `--no-install`) / `tailscale_unsupported_platform` / `tailscale_install_failed` (exit 1) | Tailscale is not installed and was not (or could not be) installed. Relay the printed install command or `https://tailscale.com/download`, have the user sign in, then re-run |
 | `tailscale_publish_unconfirmed` (exit 1) — `serve --bg` exited 0 but the re-read shows no handler (or could not be read) | Run `tailscale serve status`; `gbrain mcp expose --remove --yes` clears a handler for the port without a receipt (`--force` when no wrapper or service of gbrain's exists yet), then re-run |
@@ -197,7 +198,7 @@ customized. Run owner commands on the host or in a separately authorized admin
 harness with that server's protected credential. An ordinary connecting client
 hands these steps to that administrator; its OAuth scopes cannot grant owner
 authority. Follow [mcp-access](../mcp-access/SKILL.md) and
-[MCP administration](../../docs/mcp/ADMIN.md) for owner actions and recovery.
+[MCP administration](https://github.com/garrytan/gbrain/blob/master/docs/mcp/ADMIN.md) for owner actions and recovery.
 
 To open the dashboard:
 
@@ -262,7 +263,7 @@ gbrain mcp grant agent-example --harness grok-bot --profile memory-writer \
 - Review the preview, then repeat without `--dry-run` to create the client.
 - Profiles (`memory-reader`, `memory-writer`, `coding-agent`, `operator`,
   `delegating-agent`, `full`) and delegation limits are defined in
-  [hosted harness access](../../docs/guides/hosted-harness-access.md);
+  [hosted harness access](https://github.com/garrytan/gbrain/blob/master/docs/guides/hosted-harness-access.md);
   default to `memory-writer`, or `memory-reader` when only reading is requested.
 - The receipt is redacted; the credentials file is 0600. Move it to the
   client through a private channel, never through the chat.
@@ -328,7 +329,7 @@ command. Declining the prompt exits 2 with "Nothing changed."; a
 `--no-service` re-run keeps an existing service.
 
 Removing exposure does not revoke client registrations or erase brain data.
-Use the owner lifecycle commands in [MCP administration](../../docs/mcp/ADMIN.md)
+Use the owner lifecycle commands in [MCP administration](https://github.com/garrytan/gbrain/blob/master/docs/mcp/ADMIN.md)
 to invalidate tokens, revoke, or delete a selected client after reviewing its
 consequences and revision.
 
@@ -343,6 +344,14 @@ instead. `gbrain sync` and `gbrain sweep --once` are the exceptions: they
 delegate into the live serve automatically. Always provision through
 `--admin-token-file`; if the user needs concurrent local commands, route to
 [postgres-adopt](../postgres-adopt/SKILL.md) rather than stopping the server.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain mcp expose --status` reports `not_exposed` (exit 2) or `pending`: wait for the certificate or service as the status says; `leftovers_without_receipt` (exit 1) means an interrupted run, so follow its `fix`.
+- Installing Tailscale or a service needs the user's agreement before `--yes`; `gbrain mcp expose` still exits 2 when it needs confirmation (documented legacy), so read the block, not just the exit code.
+- A client gets `invalid_token` / `insufficient_scope`: issue a scoped grant for that client; never hand out an admin credential to make it connect.
 
 ## Anti-Patterns
 

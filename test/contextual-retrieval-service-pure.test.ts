@@ -24,6 +24,8 @@ import {
   type ChatOpts,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
+import { APICallError, RetryError } from 'ai';
+import { normalizeAIError } from '../src/core/ai/errors.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
 import { mockEmbedProjectionEngine } from './helpers/embed-projection-mock.ts';
@@ -123,19 +125,27 @@ describe('computeCorpusGeneration', () => {
 
 describe('inline import contextual synopsis containment', () => {
   test('uses the shared default without starting paid synopsis generation', () => {
+    // The inline import's mode resolution lives in import-contextual-mode.ts (#5621 peel, shared with repair).
     const importSource = readFileSync(
       new URL('../src/core/import-file.ts', import.meta.url),
       'utf8',
     );
+    // test-reads-source-ok[structural]: the #5621 peel moved the inline mode resolution here; pins the paid-synopsis containment.
+    const resolverSource = readFileSync(
+      new URL('../src/core/import-contextual-mode.ts', import.meta.url),
+      'utf8',
+    );
 
-    expect(importSource).toContain(
+    expect(importSource).toContain('await resolveImportContextualMode(');
+    expect(resolverSource).toContain(
       "import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';",
     );
-    expect(importSource).toContain('synopsisModel: DEFAULT_SYNOPSIS_MODEL');
-    expect(importSource).toContain(
+    expect(resolverSource).toContain('synopsisModel: DEFAULT_SYNOPSIS_MODEL');
+    expect(resolverSource).toContain(
       "effectiveCRMode = resolution.mode === 'per_chunk_synopsis' ? 'title' : resolution.mode;",
     );
     expect(importSource).not.toContain('generatePerChunkSynopsis');
+    expect(resolverSource).not.toContain('generatePerChunkSynopsis');
   });
 });
 
@@ -339,6 +349,40 @@ describe('per-chunk synopsis concurrency', () => {
     expect(started).toBeLessThanOrEqual(3);
   });
 
+  // #5964: chat() hands the service a normalized error with the provider's
+  // status on a wrapped layer. A provider outage must leave the page's mode
+  // alone (transient, retried by the job), while a request-shaped 400 still
+  // takes the page-level fall-back.
+  const exhaustedRetries = (statusCode: number) => normalizeAIError(new RetryError({
+    message: `Failed after 2 attempts (${statusCode})`,
+    reason: 'maxRetriesExceeded',
+    errors: [1, 2].map(() => new APICallError({
+      message: `upstream said ${statusCode}`, url: 'https://llm.example.invalid/v1', requestBodyValues: {},
+      statusCode, isRetryable: statusCode >= 500,
+    })),
+  }), 'chat(anthropic:claude-haiku-4-5)');
+
+  test('a provider 503 behind RetryError stays transient and embeds nothing (#5964)', async () => {
+    const out = await runWithChatStub({
+      chunks: makeChunks(['chunk-a', 'chunk-b', 'chunk-c']),
+      concurrency: 1,
+      chat: async () => { throw exhaustedRetries(503); },
+    });
+
+    expect(out.result).toMatchObject({ kind: 'transient_error', cause: 'provider_5xx' });
+    expect(out.embeddedChunks).toEqual([]);
+  });
+
+  test('control: a request-shaped 400 behind RetryError still falls back at page level', async () => {
+    const out = await runWithChatStub({
+      chunks: makeChunks(['chunk-a', 'chunk-b']),
+      concurrency: 1,
+      chat: async () => { throw exhaustedRetries(400); },
+    });
+
+    expect(out.result.kind).toBe('page_fallback');
+  });
+
   test('fenced code chunks bypass synopsis calls and leases', async () => {
     let chatCalls = 0;
     let leaseCalls = 0;
@@ -490,14 +534,16 @@ function makeServiceEngine(chunks: ChunkInput[]) {
         return [{ chunker_version: MARKDOWN_CHUNKER_VERSION, corpus_generation: null }];
       }
       if (sql.startsWith('UPDATE content_chunks SET')) {
-        const original = storedChunks.find(chunk => chunk.id === params[0]);
-        if (!original || params[4] !== original.page_id || params[5] !== original.chunk_text) {
-          throw new Error('Embedding update must address the existing chunk row and text');
+        for (const row of JSON.parse(String(params[1])) as Array<{ id: number; chunk_text: string; embedding: string | null; model: string | null }>) {
+          const original = storedChunks.find(chunk => chunk.id === row.id);
+          if (!original || params[0] !== original.page_id || row.chunk_text !== original.chunk_text) {
+            throw new Error('Embedding update must address the existing chunk row and text');
+          }
+          embeddedChunks.push({ ...original,
+            embedding: row.embedding == null ? undefined : new Float32Array(JSON.parse(row.embedding)),
+            model: typeof row.model === 'string' ? row.model : undefined,
+          });
         }
-        embeddedChunks.push({ ...original,
-          embedding: params[1] == null ? undefined : new Float32Array(JSON.parse(String(params[1]))),
-          model: typeof params[3] === 'string' ? params[3] : undefined,
-        });
         return [];
       }
       if (!sql.includes('FROM sources')) throw new Error(`Unexpected fixture SQL: ${sql}`);
@@ -525,7 +571,10 @@ function makeServiceEngine(chunks: ChunkInput[]) {
 }
 
 function extractChunk(opts: ChatOpts): string {
-  const content = String(opts.messages[0]?.content ?? '');
+  // The synopsis prompt is two text blocks (page, chunk) since PR #6341;
+  // joined with '\n' they render as the former single string.
+  const raw = opts.messages[0]?.content ?? '';
+  const content = typeof raw === 'string' ? raw : raw.map(b => (b.type === 'text' ? b.text : '')).join('\n');
   return content.match(/<chunk>\n([\s\S]*?)\n<\/chunk>/)?.[1] ?? '';
 }
 

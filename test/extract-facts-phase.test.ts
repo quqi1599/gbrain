@@ -3,7 +3,7 @@
  *
  * Covers the reconciliation contract: parse fence → deleteFactsForPage
  * → insertFacts. Plus the empty-fence guard (Codex R2-#7) that refuses
- * to run when legacy v0.31 rows are pending the v0_32_2 backfill.
+ * to reconcile while unfenced rows the phase could not fence remain.
  *
  * Uses a real PGLite engine. Pages seeded via engine.putPage so
  * compiled_truth + frontmatter are realistic.
@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { emptyFenceBlock } from '../src/core/generations/fence.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { acquirePageLock } from '../src/core/page-lock.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
@@ -84,6 +85,32 @@ Body.
 ${rows}
 <!--- gbrain:facts:end -->
 `;
+
+
+/**
+ * GBRA-161 PR 2 (D4): a page whose facts fence is absent keeps its rows (the fact generation holds `fence_absent` and the
+ * owner decides); writing the empty fence is the deletion, and it retires every row (`fenceParsedEmpty`).
+ */
+async function expectAbsentHoldsThenEmptyFenceRetires(slug: string, write: (body: string) => Promise<void>, body: string): Promise<void> {
+  await write(body);
+  const held = await runExtractFacts(engine, { slugs: [slug] });
+  expect(held.factsDeleted).toBe(0);
+  expect(held.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(false);
+  expect(held.warnings.filter(w => w.includes('FACTS_FENCE_HELD: fence_absent'))).toHaveLength(1);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const kept = await (engine as any).db.query(`SELECT COUNT(*) AS n FROM facts WHERE source_markdown_slug = $1 AND expired_at IS NULL AND row_num IS NOT NULL`, [slug]);
+  expect(Number(kept.rows[0].n)).toBe(1);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const holds = await (engine as any).db.query(`SELECT held_reason FROM derived_generations WHERE kind = 'fact_fence' AND owner_key = $1 AND state = 'held'`, ['page:' + slug]);
+  expect(holds.rows.map((row: { held_reason: string }) => row.held_reason)).toEqual(['fence_absent']);
+  await write(body + '\n' + emptyFenceBlock('facts'));
+  const retired = await runExtractFacts(engine, { slugs: [slug] });
+  expect(retired.factsDeleted).toBe(1);
+  expect(retired.warnings).toEqual([]);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rows = await (engine as any).db.query(`SELECT COUNT(*) AS n FROM facts WHERE source_markdown_slug = $1 AND (expired_at IS NULL OR row_num IS NOT NULL)`, [slug]);
+  expect(Number(rows.rows[0].n)).toBe(0);
+}
 
 describe('runExtractFacts — happy path', () => {
   test('reconciles fence facts into DB for a single page', async () => {
@@ -396,9 +423,15 @@ describe('runExtractFacts — happy path', () => {
       expect(r.factsInserted).toBe(1);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const rows = await (engine as any).db.query(
-        `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice-fresh' ORDER BY row_num`,
+        `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice-fresh' AND expired_at IS NULL ORDER BY row_num`,
       );
       expect(rows.rows.map((row: { fact: string }) => row.fact)).toEqual(['Existing']);
+      // B-5: the stale row is expired and detached from the fence, never deleted.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stale = await (engine as any).db.query(
+        `SELECT row_num, expired_at IS NOT NULL AS expired FROM facts WHERE source_markdown_slug = 'people/alice-fresh' AND fact = 'Stale indexed row'`,
+      );
+      expect(stale.rows).toEqual([{ row_num: null, expired: true }]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -432,9 +465,15 @@ describe('runExtractFacts — happy path', () => {
       expect(r.factsDeleted).toBeGreaterThan(0);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const rows = await (engine as any).db.query(
-        `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice-wt-off' ORDER BY row_num`,
+        `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice-wt-off' AND expired_at IS NULL ORDER BY row_num`,
       );
       expect(rows.rows.map((row: { fact: string }) => row.fact)).toEqual(['Existing']);
+      // B-5: the stale row is expired and detached from the fence, never deleted.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stale = await (engine as any).db.query(
+        `SELECT row_num, expired_at IS NOT NULL AS expired FROM facts WHERE source_markdown_slug = 'people/alice-wt-off' AND fact = 'Stale indexed row'`,
+      );
+      expect(stale.rows).toEqual([{ row_num: null, expired: true }]);
     } finally {
       await engine.unsetConfig('sync.write_through');
       _resetWriteThroughCacheForTest();
@@ -510,27 +549,38 @@ describe('runExtractFacts — happy path', () => {
       .toEqual(['Fence fact', 'conversation fact']);
   });
 
-  test('removed-from-fence row is deleted from DB (wipe-and-reinsert pattern)', async () => {
+  test('removed-from-fence row is expired and detached, the kept row keeps its id (B-5)', async () => {
     // Seed: 2 facts.
     await putPage('people/alice', FACT_FENCE(
       `| 1 | A | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |
 | 2 | B | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const before = await (engine as any).db.query(
+      `SELECT id, fact FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY row_num`,
+    );
 
     // Edit the page to remove row 2.
     await putPage('people/alice', FACT_FENCE(
       `| 1 | A | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
     ));
 
-    await runExtractFacts(engine, { slugs: ['people/alice'] });
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+    expect(r.factsDeleted).toBe(1);
+    expect(r.factsInserted).toBe(0);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query(
-      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice'`,
+      `SELECT id, fact, row_num, expired_at IS NOT NULL AS expired FROM facts
+        WHERE source_markdown_slug = 'people/alice' ORDER BY id`,
     );
-    expect(rows.rows).toHaveLength(1);
-    expect(rows.rows[0].fact).toBe('A');
+    expect(rows.rows).toEqual([
+      { id: before.rows[0].id, fact: 'A', row_num: 1, expired: false },
+      { id: before.rows[1].id, fact: 'B', row_num: null, expired: true },
+    ]);
+    const active = await engine.listFactsByEntity('default', 'people/alice', { activeOnly: true });
+    expect(active.map(f => f.fact)).toEqual(['A']);
   });
 
   // #4870 — visibility / notability are fence cells (parsed + validated as
@@ -550,19 +600,24 @@ describe('runExtractFacts — happy path', () => {
     );
     expect(rows.rows).toEqual([{ visibility: 'world', notability: 'medium' }]);
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const [{ id }] = (await (engine as any).db.query(`SELECT id FROM facts WHERE source_markdown_slug = 'people/alice'`)).rows;
     await putPage('people/alice', FACT_FENCE(
       `| 1 | Alice likes tea | preference | 0.9 | private | medium |  |  | fence |  |`,
     ));
     const second = await runExtractFacts(engine, { slugs: ['people/alice'] });
-    expect(second.factsInserted).toBe(1);
+    // B-5: updated in place, the fact id survives.
+    expect(second.factsUpdated).toBe(1);
+    expect(second.factsInserted).toBe(0);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rows = await (engine as any).db.query(
-      `SELECT visibility, notability FROM facts WHERE source_markdown_slug = 'people/alice'`,
+      `SELECT id, visibility, notability FROM facts WHERE source_markdown_slug = 'people/alice'`,
     );
-    expect(rows.rows).toEqual([{ visibility: 'private', notability: 'medium' }]);
+    expect(rows.rows).toEqual([{ id, visibility: 'private', notability: 'medium' }]);
 
     const third = await runExtractFacts(engine, { slugs: ['people/alice'] });
     expect(third.factsInserted).toBe(0);
+    expect(third.factsUpdated).toBe(0);
     expect(third.factsDeleted).toBe(0);
   });
 
@@ -572,16 +627,20 @@ describe('runExtractFacts — happy path', () => {
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const [{ id }] = (await (engine as any).db.query(`SELECT id FROM facts WHERE source_markdown_slug = 'people/alice'`)).rows;
     await putPage('people/alice', FACT_FENCE(
       `| 1 | Alice likes tea | preference | 0.9 | world | high |  |  | fence |  |`,
     ));
     const second = await runExtractFacts(engine, { slugs: ['people/alice'] });
-    expect(second.factsInserted).toBe(1);
+    // B-5: updated in place, the fact id survives.
+    expect(second.factsUpdated).toBe(1);
+    expect(second.factsInserted).toBe(0);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query(
-      `SELECT visibility, notability FROM facts WHERE source_markdown_slug = 'people/alice'`,
+      `SELECT id, visibility, notability FROM facts WHERE source_markdown_slug = 'people/alice'`,
     );
-    expect(rows.rows).toEqual([{ visibility: 'world', notability: 'high' }]);
+    expect(rows.rows).toEqual([{ id, visibility: 'world', notability: 'high' }]);
 
     const third = await runExtractFacts(engine, { slugs: ['people/alice'] });
     expect(third.factsInserted).toBe(0);
@@ -626,7 +685,7 @@ describe('runExtractFacts — happy path', () => {
     expect(cleanRows.rows.map((row: { fact: string }) => row.fact)).toEqual(['Clean']);
   });
 
-  test('#3625: a Facts fence below the timeline sentinel is loud-skipped, never treated as absence', async () => {
+  test('#3625 / #6686: a lone Facts fence below the timeline sentinel is read as the page fence, never treated as absence', async () => {
     await putPage('people/carol', FACT_FENCE(
       `| 1 | Seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
     ));
@@ -648,7 +707,8 @@ describe('runExtractFacts — happy path', () => {
 
     const r = await runExtractFacts(engine, { slugs: ['people/carol'] });
 
-    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(true);
+    // #6686 (D8): the managed writers keep and edit a lone timeline fence in place, so reconcile reads it there.
+    expect(r.warnings).toEqual([]);
     expect(r.factsDeleted).toBe(0);
     expect(r.factsInserted).toBe(0);
 
@@ -659,28 +719,17 @@ describe('runExtractFacts — happy path', () => {
     expect(rows.rows.map((row: { fact: string }) => row.fact)).toEqual(['Seeded']);
   });
 
-  test('page with no facts fence → DB facts for that page wiped (empty fence reconciles to empty index)', async () => {
+  test('page with no facts fence → its fence rows are kept (held fence_absent); an empty fence reconciles to an empty active index', async () => {
     await putPage('people/alice', FACT_FENCE(
       `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
-    // Now write a fact-less version of the page.
-    await putPage('people/alice', '# Just a page\n\nNo fence.\n');
-    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
-
-    expect(r.pagesWithFacts).toBe(0);
-    expect(r.factsInserted).toBe(0);
-    expect(r.factsDeleted).toBe(1);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rows = await (engine as any).db.query(
-      `SELECT COUNT(*) AS n FROM facts WHERE source_markdown_slug = 'people/alice'`,
-    );
-    expect(Number(rows.rows[0].n)).toBe(0);
+    // Now write a fact-less version of the page: GBRA-161 PR 2 holds it; the empty fence is the deletion.
+    await expectAbsentHoldsThenEmptyFenceRetires('people/alice', body => putPage('people/alice', body), '# Just a page\n\nNo fence.\n');
   });
 
-  test('#3625: a Facts fence below the timeline sentinel is preserved, not deleted, and warns loudly', async () => {
+  test('#3625 / #6686: a lone Facts fence below the timeline sentinel reconciles from where it lives, not as a deleted fence', async () => {
     // Seed the page with the fence in its normal place (above the sentinel)
     // and let it index normally.
     await putPage('people/alice', FACT_FENCE(
@@ -710,16 +759,17 @@ describe('runExtractFacts — happy path', () => {
 
     const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
 
-    // The fix: this must NOT read as "fence removed" and must NOT delete
-    // the previously-indexed rows.
+    // This must NOT read as "fence removed": #6686 (D8) reads the lone timeline fence as the page's fence, so the
+    // two rows the page write already projected from it stay indexed and the reconcile finds them in sync.
+    expect(r.warnings).toEqual([]);
     expect(r.factsDeleted).toBe(0);
-    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(true);
+    expect(r.factsInserted).toBe(0);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query(
-      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY row_num`,
+      `SELECT fact, row_num FROM facts WHERE source_markdown_slug = 'people/alice' AND expired_at IS NULL ORDER BY row_num`,
     );
-    expect(rows.rows.map((row: { fact: string }) => row.fact)).toEqual(['Founded Acme', 'Prefers async']);
+    expect(rows.rows.map((row: { fact: string; row_num: number }) => [row.fact, Number(row.row_num)])).toEqual([['Founded Acme', 1], ['Prefers async', 2]]);
   });
 
   test('#3625 control: a genuinely fence-less page (no fence anywhere in the body) still wipes as before', async () => {
@@ -732,17 +782,9 @@ describe('runExtractFacts — happy path', () => {
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
-    await putPageWithTimeline('people/alice', '# Just a page\n\nNo fence.\n', 'Some unrelated timeline prose.\n');
-    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
-
-    expect(r.factsDeleted).toBe(1);
-    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(false);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rows = await (engine as any).db.query(
-      `SELECT COUNT(*) AS n FROM facts WHERE source_markdown_slug = 'people/alice'`,
-    );
-    expect(Number(rows.rows[0].n)).toBe(0);
+    // GBRA-161 PR 2: a truly absent fence now holds (fence_absent) instead of wiping; the empty fence is the deletion.
+    await expectAbsentHoldsThenEmptyFenceRetires('people/alice',
+      body => putPageWithTimeline('people/alice', body, 'Some unrelated timeline prose.\n'), '# Just a page\n\nNo fence.\n');
   });
 
   test('#3625 adversarial review finding: the marker merely mentioned inside a ```code block``` does not block a genuine deletion', async () => {
@@ -754,15 +796,10 @@ describe('runExtractFacts — happy path', () => {
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
-    await putPageWithTimeline(
-      'people/alice',
-      '# Alice\n\nThe real Facts fence was removed.\n',
-      '## Docs\n\n```markdown\n<!--- gbrain:facts:begin -->\nexample only\n```\n',
-    );
-    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
-
-    expect(r.factsDeleted).toBe(1);
-    expect(r.warnings).toEqual([]);
+    // GBRA-161 PR 2: the mention is still not a fence (no FACTS_FENCE_BELOW_SENTINEL), so the page's fence is absent and
+    // holds; the empty fence, written beside the same mention, is the genuine deletion and is not blocked by it.
+    await expectAbsentHoldsThenEmptyFenceRetires('people/alice',
+      body => putPageWithTimeline('people/alice', body, '## Docs\n\n```markdown\n<!--- gbrain:facts:begin -->\nexample only\n```\n'), '# Alice\n\nThe real Facts fence was removed.\n');
   });
 
   test('#3625 adversarial review finding: the marker merely quoted in prose does not block a genuine deletion', async () => {
@@ -771,15 +808,10 @@ describe('runExtractFacts — happy path', () => {
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
-    await putPageWithTimeline(
-      'people/alice',
-      '# Alice\n\nThe real Facts fence was removed.\n',
-      '> Historical docs mention the token <!--- gbrain:facts:begin -->, but this is not a fence.\n',
-    );
-    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
-
-    expect(r.factsDeleted).toBe(1);
-    expect(r.warnings).toEqual([]);
+    // GBRA-161 PR 2: the mention is still not a fence (no FACTS_FENCE_BELOW_SENTINEL), so the page's fence is absent and
+    // holds; the empty fence, written beside the same mention, is the genuine deletion and is not blocked by it.
+    await expectAbsentHoldsThenEmptyFenceRetires('people/alice',
+      body => putPageWithTimeline('people/alice', body, '> Historical docs mention the token <!--- gbrain:facts:begin -->, but this is not a fence.\n'), '# Alice\n\nThe real Facts fence was removed.\n');
   });
 
   test('#3625 control: a genuine unbalanced marker (own line, not inside a code block) still blocks deletion', async () => {
@@ -813,15 +845,10 @@ describe('runExtractFacts — happy path', () => {
     ));
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
-    await putPageWithTimeline(
-      'people/alice',
-      '# Alice\n\nThe real Facts fence was removed.\n',
-      '## Docs\r\n\r\n```markdown\r\n<!--- gbrain:facts:begin -->\r\nexample only\r\n```\r\n',
-    );
-    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
-
-    expect(r.factsDeleted).toBe(1);
-    expect(r.warnings).toEqual([]);
+    // GBRA-161 PR 2: the mention is still not a fence (no FACTS_FENCE_BELOW_SENTINEL), so the page's fence is absent and
+    // holds; the empty fence, written beside the same mention, is the genuine deletion and is not blocked by it.
+    await expectAbsentHoldsThenEmptyFenceRetires('people/alice',
+      body => putPageWithTimeline('people/alice', body, '## Docs\r\n\r\n```markdown\r\n<!--- gbrain:facts:begin -->\r\nexample only\r\n```\r\n'), '# Alice\n\nThe real Facts fence was removed.\n');
   });
 
   test('#3625 adversarial review round 2: two identical code-block mentions of the marker do not false-positive', async () => {
@@ -831,15 +858,10 @@ describe('runExtractFacts — happy path', () => {
     await runExtractFacts(engine, { slugs: ['people/alice'] });
 
     const codeBlock = '```markdown\n<!--- gbrain:facts:begin -->\nexample only\n```\n';
-    await putPageWithTimeline(
-      'people/alice',
-      '# Alice\n\nThe real Facts fence was removed.\n',
-      `${codeBlock}\n${codeBlock}`,
-    );
-    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
-
-    expect(r.factsDeleted).toBe(1);
-    expect(r.warnings).toEqual([]);
+    // GBRA-161 PR 2: the mention is still not a fence (no FACTS_FENCE_BELOW_SENTINEL), so the page's fence is absent and
+    // holds; the empty fence, written beside the same mention, is the genuine deletion and is not blocked by it.
+    await expectAbsentHoldsThenEmptyFenceRetires('people/alice',
+      body => putPageWithTimeline('people/alice', body, `${codeBlock}\n${codeBlock}`), '# Alice\n\nThe real Facts fence was removed.\n');
   });
 
   test('#3625 via the real MCP write path: a stray fence below the sentinel is preserved even when import-file.ts is in play', async () => {
@@ -987,7 +1009,10 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(r.legacyRowsPending).toBe(1);
     expect(r.factsInserted).toBe(0);
     expect(r.factsDeleted).toBe(0);
-    expect(r.warnings.some(w => w.includes('apply-migrations'))).toBe(true);
+    // The page's canonical file is not on this host, so the phase's own fence
+    // step could not fence the row; the warning names the page and why.
+    expect(r.warnings.some(w => w.startsWith('FACTS_FENCE_FAILED: people/alice ('))).toBe(true);
+    expect(r.warnings.some(w => w.includes('unfenced fact row(s)') && !w.includes('v0.31'))).toBe(true);
 
     // Legacy row was NOT touched.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1118,12 +1143,16 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(r.factsDeleted).toBe(1); // only the stale fence-owned row
     expect(r.factsInserted).toBe(1);
 
+    // B-5: the stale fence row is expired and detached; the hybrid row is untouched.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query(
-      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY id`,
+      `SELECT fact, row_num, expired_at IS NOT NULL AS expired FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY id`,
     );
-    expect(rows.rows.map((row: { fact: string }) => row.fact))
-      .toEqual(['forgotten hybrid claim', 'replacement fact']);
+    expect(rows.rows).toEqual([
+      { fact: 'forgotten hybrid claim', row_num: null, expired: true },
+      { fact: 'old fact', row_num: null, expired: true },
+      { fact: 'replacement fact', row_num: 1, expired: false },
+    ]);
   });
 
   test('fence claim matching an expired legacy row is inserted active — fence is canonical (#2646)', async () => {
@@ -1282,7 +1311,7 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(r.legacyRowsPending).toBe(1);
     expect(r.factsInserted).toBe(0);
     expect(r.factsDeleted).toBe(0);
-    expect(r.warnings.some(w => w.includes('apply-migrations'))).toBe(true);
+    expect(r.warnings.some(w => w.startsWith('FACTS_FENCE_FAILED: people/bob ('))).toBe(true);
   });
 
   test('#2484: a soft-deleted backing page makes its legacy row unfenceable (does NOT gate)', async () => {
@@ -1404,9 +1433,8 @@ describe('runExtractFacts — multi-source isolation', () => {
     expect(rWork.guardTriggered).toBe(true);
     expect(rWork.legacyRowsPending).toBe(1);
     expect(rWork.factsInserted).toBe(0);
-    // The drain advice must be one that actually re-runs Phase B — a bare
-    // `apply-migrations --yes` no-ops once the ledger says complete.
-    expect(rWork.warnings.some(w => w.includes('--force-retry 0.32.2'))).toBe(true);
+    // The advice names the page the phase's own fence step could not fence.
+    expect(rWork.warnings.some(w => w.startsWith('FACTS_FENCE_FAILED: people/alice ('))).toBe(true);
     expect(rWork.warnings.some(w => w.includes('forget_fact'))).toBe(true);
     expect(rWork.warnings.some(w => w.includes('source "work"'))).toBe(true);
   });
@@ -1550,9 +1578,11 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
     expect(drifted.superseded_by).toBeNull();
     expect(drifted.expired_at).toBeNull();
 
+    const idsBefore = await readIds();
     const healRun = await runExtractFacts(engine, { slugs: ['people/deal'] });
-    // Drift detected → wipe+reinsert re-transports the columns.
-    expect(healRun.factsInserted).toBeGreaterThan(0);
+    // Drift detected → the row is healed in place (B-5: ids kept).
+    expect(healRun.factsUpdated).toBeGreaterThan(0);
+    expect(await readIds()).toEqual(idsBefore);
 
     const healed = (await readSupersessionCols()).find(x => x.row_num === 1)!;
     expect(healed.superseded_by).not.toBeNull();
@@ -1606,15 +1636,17 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
     expect(await readIds()).toEqual(idsAfterFirst);
   });
 
-  test('idempotent: a chain (struck → struck) does not churn — second reconcile is a no-op', async () => {
+  test('a chain (struck → struck) links every hop and does not churn — second reconcile is a no-op (B-13)', async () => {
     await putPage('people/deal', FACT_FENCE(
       `| 1 | ~~Link a~~ | commitment | 0.6 | world | medium | 2026-01-01 |  | call | superseded by #2 |
 | 2 | ~~Link b~~ | commitment | 0.6 | world | medium | 2026-02-01 |  | call | superseded by #3 |
 | 3 | Live tail | fact | 1.0 | world | high | 2026-03-01 |  | call |  |`,
     ));
     const first = await runExtractFacts(engine, { slugs: ['people/deal'] });
-    expect(first.warnings.some(w => w.includes('struck'))).toBe(true);
+    expect(first.warnings.filter(w => w.includes('superseded'))).toEqual([]);
     const idsAfterFirst = await readIds();
+    const links = (await readSupersessionCols()).map(x => (x.superseded_by == null ? null : Number(x.superseded_by)));
+    expect(links).toEqual([idsAfterFirst[1], idsAfterFirst[2], null]);
 
     const second = await runExtractFacts(engine, { slugs: ['people/deal'] });
     expect(second.factsInserted).toBe(0);
@@ -1641,7 +1673,7 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
 | 2 | New claim | fact | 1.0 | world | high | 2026-07-01 |  | call |  |`,
     ));
     const r = await runExtractFacts(engine, { slugs: ['people/deal'] });
-    expect(r.factsInserted).toBeGreaterThan(0);
+    expect(r.factsUpdated).toBeGreaterThan(0);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ids = await (engine as any).db.query(
@@ -1661,7 +1693,7 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
   // BEFORE the separate insertFacts transaction; an insert throw left the
   // page permanently emptied. The caller now defers the wipe into
   // insertFacts' own transaction, so a failing insert can never empty it.
-  test('a failing insert during the wipe+reinsert path leaves the page intact', async () => {
+  test('a failing write during reconcile rolls back and leaves the page intact', async () => {
     await putPage('people/deal', SUPERSEDE_FENCE);
     await runExtractFacts(engine, { slugs: ['people/deal'] });
     const before = await readIds();
@@ -1673,21 +1705,28 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
       `UPDATE facts SET superseded_by = NULL, expired_at = NULL WHERE source_markdown_slug = 'people/deal' AND row_num = 1`,
     );
 
-    // Make the insert throw. Pre-fix, the separate-commit delete had already
-    // emptied the page by the time this threw; now no delete runs outside
-    // insertFacts, so the rows survive.
-    const original = engine.insertFacts;
+    // Make the reconcile's final write throw. Every write of one page's
+    // reconcile runs in a single transaction, so the heal above it rolls back.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (engine as any).insertFacts = async () => { throw new Error('simulated insert failure'); };
+    await (engine as any).db.query(`CREATE OR REPLACE FUNCTION test_reject_link() RETURNS trigger LANGUAGE plpgsql AS $fn$
+      BEGIN RAISE EXCEPTION 'simulated write failure'; END $fn$`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query('CREATE TRIGGER test_reject_link BEFORE UPDATE OF superseded_by ON facts FOR EACH ROW EXECUTE FUNCTION test_reject_link()');
     try {
-      await expect(runExtractFacts(engine, { slugs: ['people/deal'] })).rejects.toThrow('simulated insert failure');
+      // The failure is isolated to this page and reported, not thrown out of
+      // the phase (a thrown error aborted every later page).
+      const result = await runExtractFacts(engine, { slugs: ['people/deal'] });
+      expect(result.pagesFailed).toBe(1);
+      expect(result.warnings.some(w => w.startsWith('people/deal: FACTS_RECONCILE_FAILED') && w.includes('simulated write failure'))).toBe(true);
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (engine as any).insertFacts = original;
+      await (engine as any).db.query('DROP TRIGGER IF EXISTS test_reject_link ON facts');
     }
 
-    // The page keeps its rows — not silently emptied.
+    // The page keeps its rows, and the in-place heal rolled back with the failure.
     expect(await readIds()).toEqual(before);
+    const row1 = (await readSupersessionCols()).find(x => x.row_num === 1)!;
+    expect(row1.expired_at).toBeNull();
   });
 
   // An int4-overflowing #N in the fence must be treated as a dangling

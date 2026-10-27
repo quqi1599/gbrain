@@ -31,7 +31,8 @@
  * a completed result.
  */
 
-import { retainToolWriteRequestId, assertToolWriteCommitted, isPendingToolWrite } from '../tool-write-identity.ts';
+import { retainToolWriteRequestId, awaitCommittedToolWrite, assertToolWriteCommitted, isPendingToolWrite } from '../tool-write-identity.ts';
+import { pageBatchChildRequestId } from '../../persistence/page-batch-id.ts';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext, SubagentHandlerData, SubagentResult, ToolDef, ContentBlock, OneshotFallbackReason } from '../types.ts';
@@ -83,6 +84,19 @@ const ONESHOT_CALL_BUDGET_MS = 300_000;
  * per-write id template, and subagent.ts's accounting scope prefix.
  */
 export const ONESHOT_TOOL_USE_ID_PREFIX = 'oneshot-';
+/** #5590: ledger id suffix of a banked oneshot skip (`oneshot-<inv8>-skip`); write rows end `-p<i>`. */
+const ONESHOT_SKIP_SUFFIX = '-skip';
+
+function oneshotSkipText(reason: string | null): string {
+  return `oneshot: nothing met the bar — ${reason ?? 'no reason given'}`;
+}
+
+function oneshotSkipResult(reason: string | null, tokens: SubagentResult['tokens']): SubagentResult {
+  return {
+    result: oneshotSkipText(reason), turns_count: 1, stop_reason: 'end_turn', tokens,
+    synth_mode_used: 'oneshot', oneshot_skipped: true, written_refs: [],
+  };
+}
 
 /**
  * Static system contract — deliberately free of per-job content so the
@@ -192,14 +206,25 @@ export interface OneshotArgs {
   data: SubagentHandlerData;
   model: string;
   maxOutputTokens: number;
+  /**
+   * `ai.chat.per_turn_timeout_ms` (#4921): with a job deadline the call's
+   * sub-budget is min(this, a quarter of the time left); without one it
+   * stays 5 min. Unset keeps the 5-min ceiling.
+   */
+  turnTimeoutMs?: number;
   /** The deferEmbeds-enabled brain_put_page ToolDef (same executor as the loop). */
   putPageTool: ToolDef | undefined;
+  /**
+   * GBRA-60: a trusted dream child's put_pages ToolDef; when set the pages are written as one batch (a Postgres
+   * consumer publishes them as one group), each still settled on its own ledger row under its batch child request id.
+   */
+  putPagesTool?: ToolDef;
   leaseKey: string;
   maxConcurrent: number;
   leaseTtlMs: number;
   /** Test seam (extract-atoms pattern). */
   _chat?: typeof gatewayChat;
-  /** Test seam: override the OV-9 sub-budget (default min(5min, deadline/4)). */
+  /** Test seam: override the OV-9 sub-budget (default min(turnTimeoutMs, deadline/4)). */
   _budgetMs?: number;
 }
 
@@ -224,11 +249,68 @@ function isAbortShaped(e: unknown): boolean {
   return isAbortError(e) || (e instanceof Error && /\babort|\btimed?[ _-]?out/i.test(e.message));
 }
 
-interface LedgerRow { tool_use_id: string; ordinal: number | null; status: string; slug: string | null; content: string | null; request_id: string | null }
+interface LedgerRow { tool_use_id: string; ordinal: number | null; status: string; slug: string | null; content: string | null; request_id: string | null; skip_reason: string | null;
+  batch_id: string | null }
+
+/**
+ * The oneshot writes, each with the ledger row banked before it executes. Each page is ALWAYS serialized with the
+ * pinned type + parsed title: model-supplied frontmatter was stripped at parse time (R3-1), so no body can smuggle its
+ * own keys past normalization. GBRA-60: a trusted dream child (`dreamOutput`; a delegated job never reads a transcript
+ * path from its data) writes each page verified and stamped, so it is committed once, and its row records the
+ * verification for postprocessing; with a batch each page's request id is its batch child id, so its row reads like a
+ * put_page's.
+ */
+async function planOneshotWrites(engine: BrainEngine, jobId: number, dreamOutput: SubagentHandlerData['dream_output'], sourceId: string,
+  pages: OneshotPage[], batchId: string | null) {
+  const inv8 = randomUUID().replace(/-/g, '').slice(0, 8);
+  const drafts = pages.map(page => ({ slug: page.slug, content: serializeMarkdown({}, page.body, '', { type: page.type as PageType, title: page.title, tags: [] }) }));
+  const verified = dreamOutput ? await (await import('../../cycle/synthesize-child-verify.ts')).verifyChildPages(engine, dreamOutput, sourceId, drafts) : null;
+  return drafts.map((draft, i) => {
+    const toolUseId = `${ONESHOT_TOOL_USE_ID_PREFIX}${inv8}-p${i}`;
+    const input = { slug: draft.slug, content: verified?.[i]!.content ?? draft.content, ...(batchId ? { request_id: pageBatchChildRequestId(batchId, i) } : {}) };
+    retainToolWriteRequestId(input, jobId, 1, i, toolUseId, 'brain_put_page');
+    return { toolUseId, input, ledger: { ...input, ...(batchId ? { batch_id: batchId } : {}), ...(verified ? { dream_verify: verified[i]!.verification } : {}) } };
+  });
+}
+
+/**
+ * GBRA-60: the pages of one oneshot invocation written as one put_pages batch. The first page's write sends the whole
+ * batch (resent under the same request id while any page is still pending, which admits nothing new); each page then
+ * settles from its own entry, so a refused page fails alone and a committed one carries its state and revision.
+ */
+function batchPageWriter(ctx: MinionJobContext, engine: BrainEngine, tool: ToolDef, batchId: string, pages: Array<{ slug: string; content: string }>) {
+  let sent: Promise<Array<Record<string, unknown>>> | undefined;
+  return async (index: number): Promise<unknown> => {
+    const all = sent ??= awaitCommittedToolWrite(ctx, 'brain_put_page', async (): Promise<Array<Record<string, unknown>>> => {
+      const receipt = await tool.execute({ request_id: batchId, pages: pages.map(({ slug, content }) => ({ slug, content })) },
+        { engine, jobId: ctx.id, remote: true, signal: ctx.signal }) as { pages?: Array<Record<string, unknown>> };
+      const entries = receipt.pages ?? [];
+      for (const entry of entries) {
+        if (['queued', 'running', 'recovering'].includes(String(entry.state))) assertToolWriteCommitted({ request_id: entry.request_id, state: entry.state, retry_after_ms: 1000 }, 'brain_put_page');
+      }
+      return entries;
+    }) as Promise<Array<Record<string, unknown>>>;
+    const entry = (await all)[index];
+    if (entry?.state === 'committed') return entry;
+    const message = (entry?.error as { message?: unknown } | undefined)?.message;
+    throw new Error(`brain_put_pages: page ${index} ${typeof message === 'string' ? message : `ended ${String(entry?.state ?? 'not_admitted')}`}`);
+  };
+}
+
+/**
+ * GBRA-60: recovery's writer for each batch among a ledger's pending rows: the whole batch replayed under its request
+ * id (nothing is written twice), its pages taken from every row of the batch in page order.
+ */
+function ledgerBatchWriters(ctx: MinionJobContext, engine: BrainEngine, tool: ToolDef | undefined, ledger: LedgerRow[]) {
+  const writers = new Map<string, ReturnType<typeof batchPageWriter>>();
+  return (id: string) => writers.get(id) ?? writers.set(id, batchPageWriter(ctx, engine, tool!, id, ledger.filter(row => row.batch_id === id)
+    .sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0)).map(row => ({ slug: row.slug ?? '', content: row.content ?? '' })))).get(id)!;
+}
 
 async function loadOneshotLedger(engine: BrainEngine, jobId: number): Promise<LedgerRow[]> {
   return engine.executeRaw<LedgerRow>(
-    `SELECT tool_use_id, ordinal, status, input->>'slug' AS slug, input->>'content' AS content, input->>'request_id' AS request_id
+    `SELECT tool_use_id, ordinal, status, input->>'slug' AS slug, input->>'content' AS content, input->>'request_id' AS request_id,
+            input->>'skip_reason' AS skip_reason, input->>'batch_id' AS batch_id
        FROM subagent_tool_executions
       WHERE job_id = $1 AND tool_use_id LIKE $2
       ORDER BY id`,
@@ -237,7 +319,7 @@ async function loadOneshotLedger(engine: BrainEngine, jobId: number): Promise<Le
 }
 
 export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutcome> {
-  const { engine, ctx, data, model } = args;
+  const { engine, ctx, data, model, putPageTool } = args;
   const chat = args._chat ?? gatewayChat;
   const submitted = snapshotFromJob(ctx.data);
   const checkCurrentWrite = async (slug?: string): Promise<void> => {
@@ -254,6 +336,10 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
   // re-call the model (nondeterministic output would double-write different
   // pages); the completed rows ARE the writes.
   const priorLedger = await loadOneshotLedger(engine, ctx.id);
+  const bankedSkip = priorLedger.find(r => r.tool_use_id.endsWith(ONESHOT_SKIP_SUFFIX) && r.status === 'complete');
+  if (bankedSkip) {
+    return { kind: 'done', result: oneshotSkipResult(bankedSkip.skip_reason, { in: 0, out: 0, cache_read: 0, cache_create: 0 }) };
+  }
   if (priorLedger.length > 0) {
     // Settle any PENDING rows first (crash between the pending bank and
     // the settle write). The ledger stores the exact input and request UUID;
@@ -261,19 +347,20 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
     // ledger would finalize 'completed' with zero pages — the exact
     // completed-means-zero-pages class #4217 exists to kill (flagged
     // independently by two ship reviewers).
+    const batchOf = ledgerBatchWriters(ctx, engine, args.putPagesTool, priorLedger);
     for (const row of priorLedger) {
       if (row.status !== 'pending') continue;
       const input = { slug: row.slug ?? '', content: row.content ?? '', ...(row.request_id ? { request_id: row.request_id } : {}) };
       retainToolWriteRequestId(input, ctx.id, 1, row.ordinal ?? 0, row.tool_use_id, 'brain_put_page');
-      if (!args.putPageTool || !input.slug || !input.content) {
+      if ((row.batch_id ? !args.putPagesTool : !putPageTool) || !input.slug || !input.content) {
         await persistToolExecFailed(engine, ctx.id, 1, row.ordinal ?? 0, row.tool_use_id, 'brain_put_page', input,
           'oneshot recovery: pending write could not be re-executed (missing tool or ledger input)');
         row.status = 'failed';
         continue;
       }
       try {
-        const output = await args.putPageTool.execute(input, { engine, jobId: ctx.id, remote: true, signal: ctx.signal });
-        assertToolWriteCommitted(output, 'brain_put_page');
+        const output = row.batch_id ? await batchOf(row.batch_id)(row.ordinal ?? 0) : await awaitCommittedToolWrite(ctx, 'brain_put_page',
+          () => putPageTool!.execute(input, { engine, jobId: ctx.id, remote: true, signal: ctx.signal }));
         await persistToolExecComplete(engine, ctx.id, 1, row.ordinal ?? 0, row.tool_use_id, output);
         row.status = 'complete';
       } catch (e) {
@@ -319,7 +406,7 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
     };
   }
 
-  if (!args.putPageTool) {
+  if (!putPageTool) {
     // No put_page in the registry (misconfigured allow-list) — a config
     // error, not a model failure; distinct reason so telemetry separates it.
     return { kind: 'fallback', reason: 'no_put_page_tool' };
@@ -327,7 +414,7 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
 
   // ── Single provider call under a rate lease + sub-budget (OV-9) ─────────
   const budgetMs = args._budgetMs ?? (ctx.deadlineAtMs
-    ? Math.min(ONESHOT_CALL_BUDGET_MS, Math.max(30_000, Math.floor((ctx.deadlineAtMs - Date.now()) / 4)))
+    ? Math.min(args.turnTimeoutMs ?? ONESHOT_CALL_BUDGET_MS, Math.max(30_000, Math.floor((ctx.deadlineAtMs - Date.now()) / 4)))
     : ONESHOT_CALL_BUDGET_MS);
   // Lease TTL must OUTLIVE the call it guards: the sub-budget hard-bounds
   // the call (AbortSignal.timeout below), so ttl = budget + slack. With the
@@ -356,6 +443,7 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
       messages: [{ role: 'user', content: data.prompt }],
       maxTokens: args.maxOutputTokens,
       abortSignal: callSignal,
+      timeoutMs: budgetMs,
       // cacheSystem marks the system block as a cache breakpoint. Note:
       // ONESHOT_SYSTEM alone is under Anthropic's ~1024-token cache minimum,
       // so cross-job prefix hits only materialize on providers/models with a
@@ -424,28 +512,30 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
   }
   if (parsed.pages.length === 0) {
     if (!parsed.skipped) return fb('empty_no_skip');
-    // Task-D skip: a legitimate zero-write completion.
-    const skipText = `oneshot: nothing met the bar — ${parsed.skip_reason ?? 'no reason given'}`;
-    await persistOneshotTranscript(engine, ctx.id, data.prompt, chatResult.text ?? skipText, model, tokens);
-    return {
-      kind: 'done',
-      result: {
-        result: skipText,
-        turns_count: 1,
-        stop_reason: 'end_turn',
-        tokens,
-        synth_mode_used: 'oneshot',
-        written_refs: [],
-      },
-    };
+    // Task-D skip: a legitimate zero-write completion. #5590: the skip is
+    // banked as a oneshot ledger row BEFORE the transcript, so a retry of this
+    // job (accounting failure, crash, lost outcome write) takes ledger-first
+    // recovery and completes as the same skip instead of replaying a
+    // marker-less transcript that require_writes would dead-letter.
+    await engine.executeRaw(
+      `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status, ordinal)
+       VALUES ($1, 1, $2, 'oneshot_skip', $3::text::jsonb, 'complete', 0)
+       ON CONFLICT (job_id, message_idx, ordinal) DO NOTHING`,
+      [ctx.id, `${ONESHOT_TOOL_USE_ID_PREFIX}${randomUUID().replace(/-/g, '').slice(0, 8)}${ONESHOT_SKIP_SUFFIX}`,
+        JSON.stringify({ skip_reason: parsed.skip_reason })],
+    );
+    await persistOneshotTranscript(engine, ctx.id, data.prompt, chatResult.text ?? oneshotSkipText(parsed.skip_reason), model, tokens);
+    return { kind: 'done', result: oneshotSkipResult(parsed.skip_reason, tokens) };
   }
   if (parsed.pages.length > MAX_PAGES_PER_RESPONSE) return fb('too_many_pages');
 
   // ── Validate ALL pages before ANY write ─────────────────────────────────
   const prefixes = data.allowed_slug_prefixes ?? [];
-  // CDX-9 task shapes: reflections/originals sub-trees of the allow-list.
-  const taskShapePrefixes = prefixes
-    .filter(p => p.includes('/personal/reflections/') || p.includes('/originals/'))
+  // CDX-9 task shapes: the reflections/originals namespaces. #6160: the cycle
+  // passes its resolved namespaces; jobs queued by older builds derive them
+  // from the allow-list, root-level namespaces included.
+  const taskShapePrefixes = (data.oneshot_task_prefixes ?? prefixes
+    .filter(p => /(?:^|\/)(?:personal\/reflections|originals)\//.test(p)))
     .map(p => (p.endsWith('/*') ? p.slice(0, -1) : p.endsWith('/') ? p : `${p}/`));
   const inBatch = new Set(parsed.pages.map(p => p.slug));
   // Duplicate slugs inside one batch would make the second write silently
@@ -507,17 +597,9 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
   }
 
   // ── Programmatic writes through the shared put_page executor ────────────
-  const inv8 = randomUUID().replace(/-/g, '').slice(0, 8);
-  const plannedWrites = parsed.pages.map((page, i) => {
-    // ALWAYS serialize with the pinned type + parsed title — model-supplied
-    // frontmatter was stripped at parse time (R3-1), so no body can smuggle
-    // its own keys past normalization.
-    const content = serializeMarkdown({}, page.body, '', { type: page.type as PageType, title: page.title, tags: [] });
-    const toolUseId = `${ONESHOT_TOOL_USE_ID_PREFIX}${inv8}-p${i}`;
-    const input = { slug: page.slug, content };
-    retainToolWriteRequestId(input, ctx.id, 1, i, toolUseId, 'brain_put_page');
-    return { toolUseId, input };
-  });
+  const batchId = args.putPagesTool ? randomUUID() : null;
+  const plannedWrites = await planOneshotWrites(engine, ctx.id, submitted ? undefined : data.dream_output, writeSourceId, parsed.pages, batchId);
+  const writeBatch = batchId ? batchPageWriter(ctx, engine, args.putPagesTool!, batchId, plannedWrites.map(w => w.input)) : null;
   // Bank the WHOLE batch as pending in ONE transaction BEFORE the first
   // write executes. Interleaved pending/execute would let a crash mid-batch
   // leave a truncated ledger, and recovery would then finalize 'completed'
@@ -535,7 +617,7 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
         `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status, ordinal)
          VALUES ($1, 1, $2, 'brain_put_page', $3::text::jsonb, 'pending', $4)
          ON CONFLICT (job_id, message_idx, ordinal) DO NOTHING`,
-        [ctx.id, w.toolUseId, JSON.stringify(w.input), i],
+        [ctx.id, w.toolUseId, JSON.stringify(w.ledger), i],
       );
     }
   });
@@ -550,13 +632,8 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
     if (ctx.signal?.aborted) throw new DOMException('oneshot write loop aborted by job signal', 'AbortError');
     let output: unknown;
     try {
-      output = await args.putPageTool.execute(input, {
-        engine,
-        jobId: ctx.id,
-        remote: true,
-        signal: ctx.signal,
-      });
-      assertToolWriteCommitted(output, 'brain_put_page');
+      output = writeBatch ? await writeBatch(i) : await awaitCommittedToolWrite(ctx, 'brain_put_page',
+        () => putPageTool.execute(input, { engine, jobId: ctx.id, remote: true, signal: ctx.signal }));
     } catch (e) {
       // Abort/transient-conn errors are not write verdicts (same rule as
       // recovery): rethrow, row stays pending, retry re-executes.

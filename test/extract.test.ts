@@ -3,7 +3,6 @@ import {
   extractMarkdownLinks,
   extractLinksFromFile,
   extractTimelineFromContent,
-  walkMarkdownFiles,
 } from '../src/commands/extract.ts';
 
 describe('extractMarkdownLinks', () => {
@@ -139,6 +138,14 @@ describe('extractLinksFromFile', () => {
     const related = links.filter(l => l.link_type === 'related_to');
     expect(related).toHaveLength(1);
     expect(related[0].to_slug).toBe('90-people/nicolai');
+  });
+
+  it('frontmatter related: to an Obsidian path or a dotted slug resolves on the fs resolver (#6701, #6623)', async () => {
+    const content = '---\nrelated: ["[[sources/voice/2030-01-01 1200 Call with Mira]]", companies/acme.io]\ntype: concept\n---\nContent.';
+    const allSlugs = new Set(['wiki/note', 'sources/voice/2030-01-01-1200-call-with-mira', 'companies/acme.io']);
+    const links = await extractLinksFromFile(content, 'wiki/note.md', allSlugs, { includeFrontmatter: true });
+    expect(links.filter(l => l.link_type === 'related_to').map(l => l.to_slug).sort())
+      .toEqual(['companies/acme.io', 'sources/voice/2030-01-01-1200-call-with-mira']);
   });
 
   it('frontmatter extraction is default OFF (back-compat)', async () => {
@@ -345,12 +352,6 @@ Real claim. [Source: memo, 2025-01-02]`;
     const entries = extractTimelineFromContent(content, 'companies/acme-example');
     expect(entries).toHaveLength(1);
     expect(entries[0].summary).toBe('Landed the enterprise pilot with acme-example.');
-  });
-});
-
-describe('walkMarkdownFiles', () => {
-  it('is a function', () => {
-    expect(typeof walkMarkdownFiles).toBe('function');
   });
 });
 

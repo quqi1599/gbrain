@@ -18,7 +18,8 @@ import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
-import { parseFactsFence, upsertFactRow } from '../src/core/facts-fence.ts';
+import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
+import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, upsertFactRow, type ParsedFact } from '../src/core/facts-fence.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -183,6 +184,8 @@ describe('phaseBFenceFacts — happy path backfill', () => {
       '---\ntype: person\ntitle: Alice\nslug: people/alice\n---\n\n# Alice\n\nNotes about Alice.\n',
       'utf-8',
     );
+    // #6982: the page's database body is the file's, as an import leaves it; a differing body is held, not overwritten.
+    await engine.putPage('people/alice', { type: 'person', title: 'Alice', compiled_truth: '# Alice\n\nNotes about Alice.', frontmatter: {} });
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });
 
     await __testing.phaseBFenceFacts(engine, OPTS);
@@ -532,6 +535,91 @@ describe('phaseCVerify', () => {
     const r = await __testing.phaseCVerify(engine, OPTS);
     expect(r.status).toBe('complete');
     expect(r.detail).toContain('pages_checked=1');
+  });
+
+  // #6685: rows that stay fenced in the index after their page was deleted.
+  // Every row expired: nothing is left to compare, so the page is skipped (like
+  // the backfill's skipped_no_page), not drift. A live row is still drift.
+  async function seedFencedRowOfDeletedPage(slug: string, rowNum: number, expired: boolean): Promise<void> {
+    await engine.executeRaw(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence, row_num, source_markdown_slug, expired_at)
+       VALUES ('default', $1, $2, 'fact', 'private', 'medium', now(), 'manual', 1.0, $3, $1,
+               CASE WHEN $4::boolean THEN now() ELSE NULL END)`,
+      [slug, `Claim ${rowNum}`, rowNum, expired],
+    );
+  }
+
+  test('skips a deleted page whose fenced rows are all expired (#6685)', async () => {
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1' });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+    await seedFencedRowOfDeletedPage('projects/gone-example', 1, true);
+    await seedFencedRowOfDeletedPage('projects/gone-example', 2, true);
+
+    expect(await __testing.phaseCVerify(engine, OPTS))
+      .toMatchObject({ status: 'complete', detail: 'pages_checked=1 skipped_expired_no_page=1' });
+  });
+
+  test('still reports a deleted page that keeps a live fenced row (#6685)', async () => {
+    await seedFencedRowOfDeletedPage('projects/gone-example', 1, true);
+    await seedFencedRowOfDeletedPage('projects/gone-example', 2, false);
+
+    const r = await __testing.phaseCVerify(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toBe('1 pages drifted: projects/gone-example (file missing)');
+  });
+
+  // #5814: extract_facts indexes a duplicate ACTIVE fence row (same claim and
+  // source) once (#1781), so the fence legitimately holds one row more than
+  // the index. Verify must read that page as in sync, and still catch a fence
+  // row or an indexed row the other side lacks.
+  const SLUG = 'people/alice-example';
+  const fenceRow = (rowNum: number, claim: string): ParsedFact => ({
+    rowNum, claim, kind: 'fact', confidence: 1, visibility: 'private', notability: 'medium',
+    validFrom: '2026-01-01', source: 'manual', active: true,
+  });
+  const DUPLICATE_FENCE = [fenceRow(1, 'Lives in Paris'), fenceRow(2, 'Lives in Paris'), fenceRow(3, 'Works at Acme example')];
+
+  async function writeFencedPage(rows: ParsedFact[]): Promise<void> {
+    const body = replaceOrInsertFactsFence('# Alice Example\n', renderFactsTable(rows));
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    writeFileSync(join(brainDir, `${SLUG}.md`), `---\ntype: person\ntitle: Alice Example\n---\n\n${body}`);
+    await engine.putPage(SLUG, { type: 'person', title: 'Alice Example', compiled_truth: body, frontmatter: {} });
+  }
+
+  async function indexedRowNums(): Promise<number[]> {
+    const rows = await engine.executeRaw<{ row_num: number }>(
+      'SELECT row_num FROM facts WHERE source_markdown_slug = $1 AND row_num IS NOT NULL ORDER BY row_num', [SLUG]);
+    return rows.map(r => Number(r.row_num));
+  }
+
+  test('a duplicate active row that extract_facts indexes once is in sync (#5814)', async () => {
+    await writeFencedPage(DUPLICATE_FENCE);
+    await runExtractFacts(engine, { slugs: [SLUG] });
+    expect(await indexedRowNums()).toEqual([1, 3]);
+
+    expect(await __testing.phaseCVerify(engine, OPTS)).toMatchObject({ status: 'complete', detail: 'pages_checked=1' });
+  });
+
+  test.each([
+    ['a non-duplicate fence row is not indexed', [1, 2], 'not indexed: 3'],
+    ['an indexed row number is not in the fence', [1, 3, 4], 'not in fence: 4'],
+    ['each side holds a row number the other lacks', [1, 4], 'not indexed: 3; not in fence: 4'],
+    ['more row numbers are missing than the detail lists', [1, 3, 4, 5, 6, 7, 8, 9, 10], 'not in fence: 4, 5, 6, 7, 8, +2 more'],
+  ])('reports drift on a page with a duplicate active row when %s (#5814)', async (_case, indexed, missing) => {
+    await writeFencedPage(DUPLICATE_FENCE);
+    for (const rowNum of indexed) {
+      await engine.executeRaw(
+        `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                            valid_from, source, confidence, row_num, source_markdown_slug)
+         VALUES ('default', $1, $2, 'fact', 'private', 'medium', now(), 'manual', 1.0, $3, $1)`,
+        [SLUG, DUPLICATE_FENCE[rowNum - 1]?.claim ?? `Visited city ${rowNum}`, rowNum],
+      );
+    }
+
+    const r = await __testing.phaseCVerify(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toBe(`1 pages drifted: ${SLUG} (fence=3, db=${indexed.length}; ${missing})`);
   });
 });
 

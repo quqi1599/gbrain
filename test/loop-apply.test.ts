@@ -80,6 +80,25 @@ function inboundThread(from: string, threadId = '18c2f4a9b3d21e07'): GmailThread
 }
 
 describe('applyThreadLoopVerdict', () => {
+  test('N7-6: opened_at is the request time, so a backfill ranks a 30-day wait older than a 30-hour one', async () => {
+    for (const [tid, age] of [['18c2f4a9b3d21e01', 720], ['18c2f4a9b3d21e02', 30]] as const) {
+      await applyThreadLoopVerdict(engine, 'g1', thread([msg({ from: `${tid}@example.com`, to: ['me@example.com'], ageHours: age, threadId: tid })], tid), MY, null, NOW);
+    }
+    const rows = await listOpenLoops(engine, { sourceIds: ['g1'], status: 'open' });
+    const opened = new Map(rows.map((r) => [r.thread_id, Date.parse(r.opened_at)]));
+    expect(opened.get('18c2f4a9b3d21e01')).toBe(NOW.getTime() - 720 * 3_600_000);
+    expect(opened.get('18c2f4a9b3d21e02')).toBe(NOW.getTime() - 30 * 3_600_000);
+  });
+
+  test('N7-6: a re-apply keeps the earlier opened_at and repairs a detection-time one', async () => {
+    const t = thread([msg({ from: 'carol@example.com', to: ['me@example.com'], ageHours: 300 })]);
+    await applyThreadLoopVerdict(engine, 'g1', t, MY, null, NOW);
+    await engine.executeRaw(`UPDATE open_loops SET opened_at = now()`);
+    await applyThreadLoopVerdict(engine, 'g1', t, MY, null, NOW);
+    const [row] = await listOpenLoops(engine, { sourceIds: ['g1'], status: 'open' });
+    expect(Date.parse(row.opened_at)).toBe(NOW.getTime() - 300 * 3_600_000);
+  });
+
   test('creates the loop row with dedup thread:<tid>:unanswered_inbound and merges page_slug into evidence', async () => {
     await applyThreadLoopVerdict(
       engine,
@@ -206,7 +225,10 @@ describe('applyThreadLoopVerdict', () => {
     expect(rows[0].counterparty_email).toBe('dave@example.com');
   });
 
-  test('alias in a DIFFERENT source does not resolve (source isolation)', async () => {
+  // #5504 (wave 14 PR4, T8): an exact-email alias is an identity signal, so a page carrying it in exactly
+  // one other source resolves and the loop records that source; the loop row itself stays in the
+  // connector source. Name matches never cross sources (test/loops-counterparty-null-entity.test.ts).
+  test('exact-email alias in a DIFFERENT source resolves and records its source (#5504)', async () => {
     await engine.executeRaw(
       `INSERT INTO sources (id, name) VALUES ('g2', 'g2') ON CONFLICT (id) DO NOTHING`,
     );
@@ -222,7 +244,9 @@ describe('applyThreadLoopVerdict', () => {
     await applyThreadLoopVerdict(engine, 'g1', inboundThread('carol@example.com'), MY, null, NOW);
     const rows = await listOpenLoops(engine, { sourceIds: ['g1'], status: 'open' });
     expect(rows).toHaveLength(1);
-    expect(rows[0].counterparty_slug).toBeNull();
+    expect(rows[0].source_id).toBe('g1');
+    expect(rows[0].counterparty_slug).toBe('people/carol-example');
+    expect(rows[0].counterparty_source_id).toBe('g2');
   });
 
   test('suppressed sender never opens a NEW loop (with the cache seam cleared)', async () => {

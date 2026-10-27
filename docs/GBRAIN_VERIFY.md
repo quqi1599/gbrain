@@ -8,8 +8,18 @@
 > and you need to isolate which layer broke, or when you want to understand
 > what "healthy" looks like check by check.
 
+> **Something feels off, or a gbrain call failed?** Start with the
+> [agent operator protocol](protocol/AGENT_OPERATOR_v1.md): the error's `code`
+> and `fix.next` say what happened, who acts and how to verify; `gbrain errors
+> <code>` explains a code offline, and the
+> [troubleshooting symptom table](guides/troubleshooting.md#symptom-table)
+> covers symptoms that are not a single error. Then use the checks below.
+
 Run these checks after install to confirm every part of GBrain is working.
 Each check includes the command, expected output, and what to do if it fails.
+When `gbrain doctor` reports `timeline_history`, `derived_visibility` or
+unsealed pages, use [`gbrain repair`](guides/repair.md); when a write is
+refused with a named reason, see [write refusal reasons](guides/write-refusals.md).
 
 The most important check is #4 (live sync). "Sync ran" is not the same as
 "sync worked." A sync that silently skips pages because of a pooler bug is
@@ -32,6 +42,11 @@ gbrain doctor --json
   skip this check; the embedded engine has no remote surface)
 - `schema_version`: current
 - `embeddings`: coverage percentage
+
+A check that carries `skipped_segmented: N` (message ending in
+`skipped (segmented): N`) did not read N pages stored in segments, so its
+`ok` covers only the pages it read; see
+[segmented page storage](guides/memory-boundaries.md#segmented-doctor-skips).
 
 **If it fails:** The doctor output includes specific fix instructions for each
 check. See `skills/setup/SKILL.md` Error Recovery table.
@@ -160,8 +175,10 @@ gbrain stats
 gbrain embed --stale
 ```
 
-If `OPENAI_API_KEY` is not set, embeddings can't be generated. Keyword search
-still works without embeddings, but hybrid/semantic search won't.
+Without a key for the configured embedding provider (`VOYAGE_API_KEY` for the
+default `voyage:voyage-4`, `OPENAI_API_KEY` for OpenAI models), embeddings can't
+be generated. Keyword search still works without embeddings, but
+hybrid/semantic search won't.
 
 ### 4c. End-to-End Test
 
@@ -172,9 +189,13 @@ This is the real test. Edit a brain page, push, wait, search.
 ```bash
 # Example: fix a line in alice-example's page
 cd /data/brain
-# Make a small edit to any .md file
-git add -A && git commit -m "test: verify live sync" && git push
+# Make a small edit to one .md file, then commit and push only that file
+gbrain git commit-push -m "test: verify live sync" -- people/alice-example.md
 ```
+
+It must exit 0 and print `pushed <sha> to origin/<branch>`. On any other
+result, stop the test and follow [outcomes](guides/shared-checkout-git.md#outcomes)
+(retry once on `commit_lock_busy`; ask the user on `integrate_conflict`).
 
 2. Wait for the next sync cycle (cron interval or `--watch` poll).
 
@@ -206,10 +227,12 @@ gbrain stats
 
 **Expected:** Embedded chunk count matches (or is close to) total chunk count.
 
-**If zero or very low:** `OPENAI_API_KEY` may be missing or invalid. Check:
+**If zero or very low:** the embedding provider key (`VOYAGE_API_KEY` for the
+default model, `OPENAI_API_KEY` for OpenAI models) may be missing or invalid.
+Check:
 
 ```bash
-echo $OPENAI_API_KEY | head -c 10
+echo $VOYAGE_API_KEY | head -c 10   # or $OPENAI_API_KEY
 ```
 
 If blank, set the key. Then:
@@ -217,6 +240,44 @@ If blank, set the key. Then:
 ```bash
 gbrain embed --stale
 ```
+
+### 5a. Fact and take vectors
+
+Chunk coverage says nothing about facts and takes, which are searched by vector
+too (fact dedup and consolidation, `think`, `takes search --semantic`).
+
+**Command:**
+
+```bash
+gbrain doctor --json
+```
+
+**Expected:** the `fact_take_vectors` check is `ok`. On a keyless brain
+(embeddings disabled) it reports "not applicable" and stays `ok`.
+`details.facts.partially_embedded` counts facts longer than the 8000-character
+embedding input: their vector covers only the start of the fact. They count as
+current, so nothing re-embeds them or spends on them again (#6975).
+
+**If it warns** (code `stale_vectors`): its `details` count, per source, facts
+and takes with no vector for their current text under the brain's embedding
+model, and `details.fix` lists the exact commands. Takes are repaired by the
+ordinary stale pass:
+
+```bash
+gbrain embed --stale
+```
+
+Facts are repaired per source, after a preview (paid provider calls need
+explicit authorization):
+
+```bash
+gbrain embed --facts --stale --source <source-id> --dry-run --json
+gbrain embed --facts --stale --source <source-id> --yes --max-cost-usd 1
+```
+
+If the check says the vectors were not verified (code `vectors_not_verified`),
+run `gbrain migrate embeddings --status` to see which model and width the brain
+records.
 
 ---
 

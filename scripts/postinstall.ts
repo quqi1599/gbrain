@@ -21,10 +21,39 @@
 
 import { which } from 'bun';
 
+// Repo modules load dynamically inside try/catch: a static import of a file
+// that is not on disk (a Docker dependency layer, a partial checkout) would
+// exit 1 before any line here runs and fail the whole install.
+async function runtimeRefusalMessage(): Promise<string | null> {
+  try {
+    const { unsupportedBunMessage } = await import('../src/core/runtime-version.ts');
+    return unsupportedBunMessage();
+  } catch {
+    return null;
+  }
+}
+
+// The install itself runs on the user's Bun, so this is the first place an
+// upgrade onto a newer Bun floor can say so. Nothing else here would work:
+// every gbrain command refuses until Bun is upgraded.
+const runtimeRefusal = await runtimeRefusalMessage();
+if (runtimeRefusal) {
+  console.error(`[gbrain] Installed, but gbrain will not start on this Bun.\n${runtimeRefusal}`);
+  process.exit(0);
+}
+
 const HINT =
   '[gbrain] postinstall skipped. If installed via bun install -g github:...: ' +
   'run `gbrain doctor` and `gbrain apply-migrations --yes` manually. ' +
   'See https://github.com/garrytan/gbrain/issues/218';
+
+// #5693: under `gbrain upgrade`, post-upgrade owns migrations. Running them
+// here too would run them twice, and a slow run here outlives the install
+// timeout that `gbrain upgrade` reads as a failed upgrade.
+if (process.env.GBRAIN_UPGRADE_OWNS_MIGRATIONS === '1') {
+  console.error('[gbrain] postinstall: migrations deferred to `gbrain post-upgrade`.');
+  process.exit(0);
+}
 
 // Windows-aware PATH resolution — finds gbrain, gbrain.exe or gbrain.cmd.
 const bin = which('gbrain');

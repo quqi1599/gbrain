@@ -165,7 +165,9 @@ export function deepResearchContract(getEngine: () => BrainEngine): void {
     test('source-bound aliases retain identity and canonical citations after rename', async () => {
       const id = encodeDeepResearchId('beta', slug);
       await getEngine().updateSlug(slug, 'notes/renamed-example', { sourceId: 'beta' });
-      await getEngine().executeRaw(`INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug) VALUES ('beta', $1, 'notes/renamed-example')`, [slug]);
+      // The rename records its own alias; no hand-written row is needed.
+      expect(await getEngine().executeRaw(`SELECT canonical_slug FROM slug_aliases WHERE source_id = 'beta' AND alias_slug = $1`, [slug]))
+        .toEqual([{ canonical_slug: 'notes/renamed-example' }]);
       const page = await fetch(id);
       expect(page.id).toBe(id);
       expect(page.metadata.source_id).toBe('beta');
@@ -213,7 +215,7 @@ export function deepResearchContract(getEngine: () => BrainEngine): void {
 
     for (const transport of ['stdio', 'http'] as const) {
       test(`${transport} MCP dispatch round-trips search/fetch and rechecks changed grants`, async () => {
-        const opts = { sourceId: 'default', remote: true, transport, auth: { allowedSources: ['default', 'beta'] } as any };
+        const opts = { sourceId: 'default', remote: true, transport, auth: { scopes: ['read'], allowedSources: ['default', 'beta'] } as any };
         const searched = await dispatchToolCall(getEngine(), 'search', { query: 'Zirconiumneedle' }, opts);
         expect(searched.isError).not.toBe(true);
         const hits = JSON.parse(searched.content[0].text);
@@ -222,7 +224,7 @@ export function deepResearchContract(getEngine: () => BrainEngine): void {
         const page = JSON.parse(result.content[0].text);
         expect(page.id).toBe(hits[0].id);
         expect(page.metadata.source_id).toBe('beta');
-        const refused = await dispatchToolCall(getEngine(), 'fetch', { id: hits[0].id }, { ...opts, auth: { allowedSources: ['default'] } as any });
+        const refused = await dispatchToolCall(getEngine(), 'fetch', { id: hits[0].id }, { ...opts, auth: { scopes: ['read'], allowedSources: ['default'] } as any });
         expect(refused.isError).toBe(true);
         expect(refused.content[0].text).not.toContain('beta');
         expect(refused.content[0].text).not.toContain('Zirconiumneedle');

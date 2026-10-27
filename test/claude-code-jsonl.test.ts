@@ -90,6 +90,53 @@ describe('parseTranscript on the fixture [G3, A6]', () => {
     expect(r.parsedLines).toBe(3);
   });
 
+  test('a session with only scaffolding and slash commands is recognizedOnly, not drift', () => {
+    const dir = tdir();
+    const p = join(dir, 'empty.jsonl');
+    const rows = [
+      { type: 'permission-mode', permissionMode: 'default', sessionId: 's' },
+      { type: 'queue-operation', operation: 'enqueue', sessionId: 's' },
+      { type: 'user', isMeta: true, message: { role: 'user', content: '<system-reminder>session renamed</system-reminder>' } },
+      { type: 'system', subtype: 'local_command', content: '<command-name>/rename</command-name>' },
+      { type: 'cost-state', sessionId: 's' },
+      { type: 'some-future-bookkeeping', sessionId: 's' },
+    ];
+    writeFileSync(p, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const r = parseTranscript(p);
+    expect(r.turns).toHaveLength(0);
+    expect(r.recognizedOnly).toBe(true);
+  });
+
+  test('a message record that yields no turn keeps the drift path open', () => {
+    const dir = tdir();
+    const p = join(dir, 'renamed.jsonl');
+    const rows = [
+      { type: 'permission-mode', permissionMode: 'default', sessionId: 's' },
+      { type: 'human', message: { role: 'user', content: 'a renamed user record' } },
+    ];
+    writeFileSync(p, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const r = parseTranscript(p);
+    expect(r.turns).toHaveLength(0);
+    expect(r.recognizedOnly).toBeUndefined();
+  });
+
+  test('a tail read is never recognizedOnly, even when the tail holds only scaffolding', () => {
+    const dir = tdir();
+    const p = join(dir, 'tail.jsonl');
+    const scaffold = JSON.stringify({ type: 'permission-mode', permissionMode: 'default', sessionId: 's' });
+    writeFileSync(p, JSON.stringify({ type: 'user', message: { role: 'user', content: 'x'.repeat(200) } }) + '\n' + (scaffold + '\n').repeat(4));
+    const r = parseTranscript(p, { maxBytes: (scaffold.length + 1) * 4 });
+    expect(r.skippedLines).toBe(0);
+    expect(r.recognizedOnly).toBeUndefined();
+  });
+
+  test('only unknown records (no scaffolding) keeps the drift path open', () => {
+    const dir = tdir();
+    const p = join(dir, 'unknown.jsonl');
+    writeFileSync(p, '{"type":"summary","summary":"only summaries here"}\n'.repeat(3));
+    expect(parseTranscript(p).recognizedOnly).toBeUndefined();
+  });
+
   test('maxBytes tail read keeps the newest turn and drops the partial head line', () => {
     const dir = tdir();
     const p = join(dir, 'big.jsonl');
@@ -267,14 +314,125 @@ describe('confineTranscriptPath [S3#8]', () => {
     expect(confineTranscriptPath(link, { root })).toEqual({ ok: false, reason: 'symlink' });
   });
 
-  test('rejects: missing file / non-string / byte cap', () => {
+  test('rejects: non-string / byte cap', () => {
     const root = tdir();
-    expect(confineTranscriptPath(join(root, 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'unreadable' });
     expect(confineTranscriptPath(undefined, { root })).toEqual({ ok: false, reason: 'missing_path' });
     expect(confineTranscriptPath(42 as unknown as string, { root })).toEqual({ ok: false, reason: 'missing_path' });
     const big = join(root, 'big.jsonl');
     writeFileSync(big, 'x'.repeat(64));
     expect(confineTranscriptPath(big, { root, maxBytes: 16 })).toEqual({ ok: false, reason: 'too_large' });
+  });
+
+  // #5701: a hook lane tail-reads a bounded window, so the whole-file size
+  // gate must not fire before the read it is about to bound.
+  test('allowOversize skips ONLY the size gate — confinement still applies', () => {
+    const root = tdir();
+    const big = join(root, 'big.jsonl');
+    writeFileSync(big, 'x'.repeat(64));
+    // Gate still fires without the opt-in.
+    expect(confineTranscriptPath(big, { root, maxBytes: 16 })).toEqual({ ok: false, reason: 'too_large' });
+    // Opt-in lets the file through, with its size reported.
+    const r = confineTranscriptPath(big, { root, maxBytes: 16, allowOversize: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.size).toBe(64);
+    // Path confinement is NOT relaxed by the opt-in.
+    const outside = join(root, '..', `gb-outside-${process.pid}.jsonl`);
+    writeFileSync(outside, '{}\n');
+    try {
+      expect(confineTranscriptPath(outside, {
+        root, maxBytes: 16, allowOversize: true,
+      })).toEqual({ ok: false, reason: 'outside_projects_dir' });
+    } finally {
+      rmSync(outside, { force: true });
+    }
+    // Nor is the symlink ladder.
+    const link = join(root, 'link.jsonl');
+    symlinkSync(big, link);
+    expect(confineTranscriptPath(link, { root, allowOversize: true })).toEqual({ ok: false, reason: 'symlink' });
+  });
+
+  test('a >TRANSCRIPT_HARD_CAP_BYTES session reaches the bounded tail read', () => {
+    const root = tdir();
+    const p = join(root, 'long.jsonl');
+    // A real Claude-shaped line, then padding past the 50MiB hard cap. The
+    // padding is NOT valid JSON, so a whole-file parse would count it as
+    // skipped lines while the bounded tail read never sees it.
+    const line = JSON.stringify({
+      type: 'user', sessionId: 'sess-5701', cwd: '/w', timestamp: '2026-09-29T00:00:00Z',
+      message: { role: 'user', content: 'remember the deploy window' },
+    });
+    const pad = 'x'.repeat(TRANSCRIPT_HARD_CAP_BYTES + 1024);
+    writeFileSync(p, `${line}\n${pad}\n`);
+
+    // Pre-fix the confinement refused the file outright.
+    expect(confineTranscriptPath(p, { root })).toEqual({ ok: false, reason: 'too_large' });
+
+    const conf = confineTranscriptPath(p, { root, allowOversize: true });
+    expect(conf.ok).toBe(true);
+    if (!conf.ok) return;
+    const parsed = parseTranscript(conf.path, { maxBytes: 64 * 1024 });
+    // The newest line (the padding) is what the tail holds; the read stayed
+    // bounded instead of pulling 50MiB into the hook lane.
+    expect(parsed.bytesRead).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  // #5465: Claude Code writes transcripts asynchronously, so the path can be
+  // absent on turn 1 of a fresh session. A CONFINED absent leaf validates ok
+  // with absent:true (nothing to read — the same trust as no path at all),
+  // which lets the user-prompt hook build its prompt-only context block
+  // instead of aborting the event. Every escape class stays rejected.
+  test('an absent leaf inside the tree validates absent; escapes still reject', () => {
+    const root = tdir();
+    const proj = join(root, 'proj-slug');
+    mkdirSync(proj, { recursive: true });
+    const absent = join(proj, '18c0ffee-1234-4321-9999-abcdefabcdef.jsonl');
+    expect(confineTranscriptPath(absent, { root })).toEqual({ ok: true, path: absent, size: 0, absent: true });
+    // Absent OUTSIDE the tree: still an escape, not a missing file.
+    const outside = tdir();
+    expect(confineTranscriptPath(join(outside, 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'outside_projects_dir' });
+    // #6739: an absent project folder that is a direct child of the root is
+    // the first prompt in a new working folder, so it validates absent too.
+    const freshProject = join(root, 'no-such-dir', 'nope.jsonl');
+    expect(confineTranscriptPath(freshProject, { root })).toEqual({ ok: true, path: freshProject, size: 0, absent: true });
+    // A symlinked parent that escapes the tree is still seen (the parent
+    // resolves outside → not contained).
+    const escape = join(root, 'escape');
+    symlinkSync(outside, escape);
+    expect(confineTranscriptPath(join(escape, 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'outside_projects_dir' });
+  });
+
+  // #6739: Claude Code creates projects/<project>/ only after the first
+  // prompt in a new working folder, so the transcript's PARENT can be absent.
+  // It validates absent only when the missing folder is a direct child of an
+  // existing ancestor contained in the root and no segment is "..".
+  test('#6739: an absent project folder directly under the root validates absent', () => {
+    const root = tdir();
+    const p = join(root, '-home-alice-example-new-project', '18c0ffee-1234-4321-9999-abcdefabcdef.jsonl');
+    expect(confineTranscriptPath(p, { root })).toEqual({ ok: true, path: p, size: 0, absent: true });
+    const existingProject = join(root, 'proj-a');
+    mkdirSync(existingProject);
+    const nested = join(existingProject, 'new-sub', 'sess.jsonl');
+    expect(confineTranscriptPath(nested, { root })).toEqual({ ok: true, path: nested, size: 0, absent: true });
+  });
+
+  test('#6739: an absent parent fails closed outside the root, across "..", two levels deep, or through a symlinked ancestor', () => {
+    const base = tdir();
+    const root = join(base, 'projects');
+    mkdirSync(root);
+    const outside = join(base, 'outside');
+    mkdirSync(outside);
+    expect(confineTranscriptPath(join(outside, 'new', 'sess.jsonl'), { root }))
+      .toEqual({ ok: false, reason: 'outside_projects_dir' });
+    expect(confineTranscriptPath(`${root}/new/../../outside/new/sess.jsonl`, { root }))
+      .toEqual({ ok: false, reason: 'unreadable' });
+    expect(confineTranscriptPath(`${root}/new/../sess-dir/sess.jsonl`, { root }))
+      .toEqual({ ok: false, reason: 'unreadable' });
+    expect(confineTranscriptPath(join(root, 'a', 'b', 'sess.jsonl'), { root }))
+      .toEqual({ ok: false, reason: 'unreadable' });
+    const escape = join(root, 'escape');
+    symlinkSync(outside, escape);
+    expect(confineTranscriptPath(join(escape, 'new', 'sess.jsonl'), { root }))
+      .toEqual({ ok: false, reason: 'outside_projects_dir' });
   });
 
   test('rejects: directory named like a transcript', () => {

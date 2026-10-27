@@ -30,6 +30,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { dropOriginIndex } from './helpers/origin-index.ts';
+import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
 let engine: PGLiteEngine;
 const repos: string[] = [];
@@ -44,6 +46,9 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  // These tests recreate legacy bookkeeping (several live rows naming one source_path), which only a brain whose
+  // pages_live_origin_key index is pending can hold (#6948).
+  await dropOriginIndex(engine);
 });
 
 afterAll(async () => {
@@ -152,12 +157,12 @@ describe('#3056: rename fallback reconciles the stale old row', () => {
     expect(staleRows[0].deleted_at).not.toBeNull();
   });
 
-  test('dedup-skip against the old row must NOT reconcile: the only copy survives', async () => {
+  test('identity match against the old row never loses the only copy', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
-    // frontmatter.id gives identity dedup a handle: the import at the new
-    // path can skip as "identical to <old row>" — in which case NOTHING
-    // landed at the destination and deleting the old row would destroy the
-    // only copy of the content.
+    // frontmatter.id gives identity dedup a handle on the old row. The old
+    // file is gone, so the import at the new path is a move, never a
+    // "duplicate" skip: the renamed content lands at the destination and the
+    // old row may then be reconciled. Exactly one live copy must remain.
     const md = ['---', 'type: person', 'title: Carol', 'id: ext-3056', '---', '', 'Carol is a person.'].join('\n');
     const repo = mkRepo({ 'people/carol.md': md });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -173,14 +178,13 @@ describe('#3056: rename fallback reconciles the stale old row', () => {
 
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
 
-    // The import skipped against the OLD row (identity dedup), so the
-    // destination never materialized with the renamed content — the
-    // reconcile must not have deleted the old row, which still holds the
-    // only copy.
-    const carol = await engine.getPage('people/carol');
-    expect(carol).not.toBeNull();
-    expect(carol!.compiled_truth).toContain('Carol is a person.');
-    expect((await engine.getPage('people/dana'))!.compiled_truth).toBe('occupies the destination slug');
+    const copies = await engine.executeRaw<{ slug: string; compiled_truth: string }>(
+      `SELECT slug, compiled_truth FROM pages
+        WHERE source_id = 'default' AND deleted_at IS NULL AND frontmatter->>'id' = 'ext-3056'`,
+    );
+    expect(copies).toHaveLength(1);
+    expect(copies[0].slug).toBe('people/dana');
+    expect(copies[0].compiled_truth).toContain('Carol is a person.');
   });
 
   test('reconcile never deletes by slug guess: unrelated manual row survives', async () => {
@@ -253,7 +257,7 @@ describe('#3056: rename fallback reconciles the stale old row', () => {
 
     // Inject a transient failure into the reconcile delete (#4587: the
     // reconcile soft-deletes via softDeletePages now).
-    const origDelete = engine.softDeletePages.bind(engine);
+    const origDelete = engine.softDeletePages;
     engine.softDeletePages = async () => { throw new Error('injected transient delete failure'); };
     let blocked;
     try {
@@ -318,9 +322,12 @@ describe('#3056: rename fallback reconciles the stale old row', () => {
 
     // The stale old row reconciled away even though the skip wrote nothing...
     expect(await engine.getPage('people/carol')).toBeNull();
-    // ...and the destination row is genuinely untouched (the skip was real).
-    const after = await engine.readPageSnapshot('people/dana', { sourceId: 'default' });
-    expect(after).toEqual(before);
+    // ...and the destination row is genuinely untouched (the skip was real):
+    // the only change is the file origin every file import records (#5675),
+    // bookkeeping that leaves the revision alone.
+    const after = (await engine.readPageSnapshot('people/dana', { sourceId: 'default' }))!;
+    expect(after.page.source_uri).toMatch(/^file:\/\/.*\/people\/dana\.md$/);
+    expect(after).toEqual({ ...before, page: { ...before.page, source_uri: after.page.source_uri } });
     expect(await countPages()).toBe(1);
   });
 });
@@ -341,7 +348,7 @@ describe('#3479 blocker 1: a permanent reconcile failure has a documented operat
     // environment where UPDATE still works but this DELETE never will):
     // every retry fails the same way. Capture stderr to pin that the
     // blocked message documents the operator exit, not just the retry.
-    const origDelete = engine.softDeletePages.bind(engine);
+    const origDelete = engine.softDeletePages;
     engine.softDeletePages = async () => { throw new Error('permission denied for table pages (injected permanent failure)'); };
     const stderrChunks: string[] = [];
     const origWrite = process.stderr.write.bind(process.stderr);
@@ -413,7 +420,7 @@ describe('#3479 blocker 2: an orphaned rename sentinel self-clears; a real dupli
     }, { sourceId: 'default' });
     execSync('git mv people/carol.md people/dana.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "rename carol to dana"', { cwd: repo, stdio: 'pipe' });
-    const origDelete = engine.softDeletePages.bind(engine);
+    const origDelete = engine.softDeletePages;
     engine.softDeletePages = async () => { throw new Error('injected transient delete failure'); };
     try {
       const blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -559,7 +566,7 @@ describe('#3479: non-unique source_path — a soft-deleted row must not mask a l
     }, { sourceId: 'default' });
     execSync('git mv people/carol.md people/dana.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "rename carol to dana"', { cwd: repo, stdio: 'pipe' });
-    const origDelete = engine.softDeletePages.bind(engine);
+    const origDelete = engine.softDeletePages;
     engine.softDeletePages = async () => { throw new Error('injected transient delete failure'); };
     try {
       const blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -602,6 +609,15 @@ describe('#3583 review: a live page sharing the stale source_path survives the r
     execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "cheap rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    // An unrelated NEW file appears at the old path, and the live beta row
+    // names that path again (the legacy bookkeeping): two active rows now
+    // share source_path=people/alpha.md. No writer records a held origin on
+    // a second page any more (#6948), so the legacy row is set last, as a
+    // brain written before that guard holds it.
+    writeFileSync(join(repo, 'people/alpha.md'), personMd('Alpha II', 'A fresh, unrelated alpha.'));
+    execSync('git add -A && git commit -m "new unrelated alpha"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     await engine.executeRaw(
       `UPDATE pages SET source_path = 'people/alpha.md'
        WHERE source_id = 'default' AND slug = 'people/beta'`,
@@ -612,12 +628,6 @@ describe('#3583 review: a live page sharing the stale source_path survives the r
     );
     expect(betaRows).toHaveLength(1);
     expect(betaRows[0].source_path).toBe('people/alpha.md');
-
-    // An unrelated NEW file appears at the old path — two active rows now
-    // share source_path=people/alpha.md.
-    writeFileSync(join(repo, 'people/alpha.md'), personMd('Alpha II', 'A fresh, unrelated alpha.'));
-    execSync('git add -A && git commit -m "new unrelated alpha"', { cwd: repo, stdio: 'pipe' });
-    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(await engine.getPage('people/alpha')).not.toBeNull();
     expect(await engine.getPage('people/beta')).not.toBeNull();
 
@@ -1024,7 +1034,7 @@ describe('#3583 review: an over-size-gate fallback-regime file suspends deletes 
     // noise), but the liveness index reads the WORKING TREE — where the
     // file now sits over the gate. Concluding "no row possible" from the
     // current size would delete the row imported before the growth.
-    const bigBody = 'x'.repeat(5_100_000);
+    const bigBody = 'x'.repeat(PAGE_MAX_BYTES + 100_000);
     writeFileSync(join(repo, '\u{1F389}.md'), [
       '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
       '', bigBody,
@@ -1084,7 +1094,7 @@ describe('#3583 review: an over-size-gate fallback-regime file suspends deletes 
     // Now make the tracked-slug index incomplete, exactly as above.
     writeFileSync(join(repo, '\u{1F389}.md'), [
       '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
-      '', 'x'.repeat(5_100_000),
+      '', 'x'.repeat(PAGE_MAX_BYTES + 100_000),
     ].join('\n'));
     await engine.putPage('people/ghost', {
       type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
@@ -2271,7 +2281,7 @@ describe('#3583 review: GATE13 — chunker_version is acknowledged only by a com
   });
 
   test('a BLOCKED forced re-chunk keeps the version stale, so the retry actually re-runs', async () => {
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
     const { performSync } = await import('../src/commands/sync.ts');
     const goodAlpha = personMd('Alpha', 'Alpha is a person.');
     const repo = mkRepo({ 'people/alpha.md': goodAlpha });
@@ -2283,6 +2293,8 @@ describe('#3583 review: GATE13 — chunker_version is acknowledged only by a com
     // Invalid YAML frontmatter, NOT a NUL byte: #3998 NUL-sanitizes page
     // bodies at write time, so a NUL now ingests cleanly instead of failing.
     writeFileSync(join(repo, 'people/alpha.md'), '---\ntitle: [unclosed\n---\ngarbage\n');
+    // #5988: content refusals are held by default; sync.holds=fail keeps the fail-closed gate this test exercises.
+    await engine.setConfig('sync.holds', 'fail');
     const blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(blocked.status).toBe('blocked_by_failures');
     const staleVersion = await engine.executeRaw<{ chunker_version: string | null }>(
@@ -2299,8 +2311,9 @@ describe('#3583 review: GATE13 — chunker_version is acknowledged only by a com
     const ackedVersion = await engine.executeRaw<{ chunker_version: string | null }>(
       `SELECT chunker_version FROM sources WHERE id = 'default'`,
     );
-    expect(ackedVersion[0]?.chunker_version).toBe(String(CHUNKER_VERSION));
+    expect(ackedVersion[0]?.chunker_version).toBe(chunkerStamp());
     expect(await engine.getPage('people/alpha')).not.toBeNull();
+    await engine.setConfig('sync.holds', 'hold');
   });
 });
 
@@ -2525,6 +2538,8 @@ describe('rename destination import: an errored skip must not checkpoint the ren
     expect(execSync('git diff --name-status -M HEAD~1 HEAD', { cwd: repo }).toString())
       .toMatch(/^R\d+\tpeople\/alpha\.md\tpeople\/beta\.md\n$/);
 
+    // #5988: content refusals are held by default; sync.holds=fail keeps the fail-closed gate this test exercises.
+    await engine.setConfig('sync.holds', 'fail');
     const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(first.status).toBe('blocked_by_failures');
     // The cheap DB-level rename (updateSlug) runs unconditionally before
@@ -2552,6 +2567,7 @@ describe('rename destination import: an errored skip must not checkpoint the ren
     const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(third.status).toBe('synced');
     expect((await engine.getPage('people/beta'))?.compiled_truth).toBe('Alpha is a person, fixed.');
+    await engine.setConfig('sync.holds', 'hold');
   });
 });
 

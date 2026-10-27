@@ -24,6 +24,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
+import { buildSide, loadReceiptDir } from '../../scripts/ci-executed-counts.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const PARALLEL_SH_SRC = resolve(REPO_ROOT, 'scripts/run-unit-parallel.sh');
@@ -73,14 +74,14 @@ afterAll(() => {
   if (TMPROOT) rmSync(TMPROOT, { recursive: true, force: true });
 });
 
-function runWrapper(extraArgs: string[] = []): { code: number; stdout: string; stderr: string } {
+function runWrapper(extraArgs: string[] = [], env: Record<string, string> = {}): { code: number; stdout: string; stderr: string } {
   const result = spawnSync(
     'bash',
     [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2', ...extraArgs],
     // Shard-mechanics tests pin explicit --shards behavior with tiny
     // synthetic files; disable mem-adaptation so a RAM-limited runner (CI's
     // ~7GB) can't collapse 2 shards -> 1 and break the shard 1/2 expectations.
-    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env, GBRAIN_TEST_NO_MEM_ADAPT: '1' } },
+    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env, GBRAIN_TEST_NO_MEM_ADAPT: '1', ...env } },
   );
   return {
     code: result.status ?? -1,
@@ -100,6 +101,12 @@ describe('run-unit-parallel.sh exit-code propagation (a)', () => {
     try {
       const r = runWrapper();
       expect(r.code).toBe(0);
+      // #7448: an AI agent's environment switches Bun to failure-only output; the census still counts every passing file.
+      for (const agent of [{ CLAUDECODE: '1' }, { REPL_ID: 'repl-example' }, { AGENT: '1' }] as Record<string, string>[]) {
+        const quiet = runWrapper([], agent);
+        expect(quiet.stdout + quiet.stderr).not.toContain('incomplete');
+        expect(quiet.code).toBe(0);
+      }
     } finally {
       // Restore the failing fixture for any downstream tests in the same
       // describe block (afterAll cleans the whole tempdir; this is belt-
@@ -367,9 +374,10 @@ describe('passing', () => {
 });`;
     const oomOnce = `import { describe, it, expect } from 'bun:test';
 import { existsSync, writeFileSync } from 'fs';
+import { fileURLToPath } from 'node:url';
 describe('oom-once', () => {
   it('fails with the WASM OOM signature on first run, passes on retry', () => {
-    const sentinel = new URL('./oom-sentinel.txt', import.meta.url).pathname;
+    const sentinel = fileURLToPath(new URL('./oom-sentinel.txt', import.meta.url));
     if (!existsSync(sentinel)) {
       writeFileSync(sentinel, 'ran-once');
       console.error('Original error: Out of memory');
@@ -401,6 +409,18 @@ describe('oom-once', () => {
     expect(r.stdout + r.stderr).toContain('OOM rescue pass');
     expect(r.stderr).toContain('oom_rescued=');
     expect(r.code).toBe(0);
+  }, 120_000);
+
+  it('writes a receipt per bun invocation; the rescue receipt supersedes the phantom failure (X2)', () => {
+    const r = runOom();
+    expect(r.code).toBe(0);
+    const dir = join(OROOT, '.context', 'test-receipts');
+    const receipts = loadReceiptDir(dir);
+    expect(receipts.filter(x => x.kind === 'rescue').map(x => [x.lane, x.files])).toEqual([['unit', ['test/b-oom-once.test.ts']]]);
+    expect(receipts.filter(x => x.kind === 'primary' && x.lane === 'unit').map(x => x.files[0]).sort()).toEqual(['test/a-pass.test.ts', 'test/b-oom-once.test.ts']);
+    const side = buildSide('local', receipts);
+    expect(side.issues).toEqual([]);
+    expect(side.lanes.get('unit')).toMatchObject({ executed: 2, failed: 0, superseded: 1 });
   }, 120_000);
 
   it('GBRAIN_TEST_NO_OOM_FALLBACK=1 disables the rescue lane (stays red)', () => {

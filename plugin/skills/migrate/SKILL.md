@@ -15,6 +15,7 @@ tools:
   - add_tag
   - sync_brain
 mutating: true
+when_to_use: "Use when the user asks: \"migrate from\", \"import from obsidian\", \"import from notion\", \"connect our company brain\", \"connect our existing company brain\"."
 ---
 
 # Migrate Skill
@@ -132,6 +133,14 @@ After any migration:
 3. Export pages from gbrain for round-trip verification
 4. Spot-check 5-10 pages by reading them from gbrain
 5. Test search: search gbrain for "someone you know is in the data"
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain sources inspect` reports blockers or the import exits 3 asking for confirmation: show the preview, and rerun with `--yes` only after the operator approves it.
+- A collision or recovery refusal: do not remove the source or activate a global schema to bypass it; report it.
+- Missing embeddings after the import are expected and backfill may be blocked by the source profile (`source_profile_no_backfill`); tell the user search runs keyword-only until embeddings exist.
 
 ## Anti-Patterns
 

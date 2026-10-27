@@ -23,11 +23,12 @@
 
 import { describe, test, expect } from 'bun:test';
 import { execSync } from 'child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { isSyncable, unsyncableReason, isPathPruned } from '../src/core/sync.ts';
 import { collectSyncableFiles } from '../src/commands/import.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
 
 function gitInit(dir: string): void {
   execSync('git init', { cwd: dir, stdio: 'pipe' });
@@ -119,8 +120,9 @@ describe('sync.ts delta path threads includeHidden (#4027 merge guard)', () => {
   // does nothing. Pin the threading structurally (the classifier tests above
   // cover behavior; this covers the wiring the classifier can't see).
   test('the hoisted syncOpts literal carries includeHidden', () => {
-    const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'sync.ts'), 'utf8');
-    expect(src).toMatch(/const syncOpts = \{ strategy: opts\.strategy, includeHidden: opts\.includeHidden \}/);
+    const src = surfaceSource('sync');
+    // GBRA-150: the literal also carries the sync.metafile_pages predicate.
+    expect(src).toMatch(/const syncOpts = \{ strategy: opts\.strategy, includeHidden: opts\.includeHidden, metafilePage \}/);
     // The strategy-only form is the regression shape (pre-#4027 master): its
     // reappearance means a merge resolved the hoist without the threading.
     expect(src).not.toMatch(/const syncOpts = opts\.strategy \? \{ strategy: opts\.strategy \} : undefined/);
