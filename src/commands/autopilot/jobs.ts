@@ -42,9 +42,26 @@ export function plistWrapperPath(plist: string): string | null {
   return m[1].replace(/&quot;/g, '"').replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
 }
 
+/**
+ * Program path of an ExecStart value. Trailing flag words are daemon argv,
+ * not part of the path (`ExecStart=/path/autopilot-run.sh --no-worker` is
+ * still that wrapper). A fully quoted program is unwrapped. A value with
+ * no trailing flags is returned unchanged, including paths that contain spaces.
+ */
+export function execStartProgram(execStart: string): string {
+  const stripped = execStart.trim().replace(/(?:\s+--[A-Za-z0-9][\w.-]*(?:=[^\s]+)?|\s+--[A-Za-z0-9][\w.-]*\s+[^-][^\s]*)+$/, '');
+  const value = stripped.trim() || execStart.trim();
+  if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
 /** The wrapper a systemd unit runs. */
 export function unitWrapperPath(unit: string): string | null {
-  return /^ExecStart=(.+)$/m.exec(unit)?.[1].trim() || null;
+  const raw = /^ExecStart=(.+)$/m.exec(unit)?.[1]?.trim();
+  if (!raw) return null;
+  return execStartProgram(raw) || null;
 }
 
 /** The autopilot wrapper a crontab line or start script names, if any. */
