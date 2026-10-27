@@ -248,9 +248,15 @@ process this brain runs on the host, or refuses before it installs anything:
    serve service points at, pinned to a commit) has that copy replaced first
    (`bun remove -g` then `bun add -g` the release tag under its `BUN_INSTALL`),
    and one that starts from another kind of install refuses with its commands;
-   the supervisor with `gbrain jobs supervisor stop` then `start --detach` with
-   the queue, concurrency and PID file it was launched with (its worker, under
-   tini or not, restarts with it). A serve or worker started by hand, an
+   a jobs supervisor or `gbrain jobs work` that an installed worker service
+   already runs (a launchd agent such as `com.gbrain.worker`, or a systemd unit
+   such as `gbrain-worker.service`, including one whose program is `gbrain jobs
+   supervisor` or `gbrain jobs work`) through that service (`launchctl kickstart
+   -k` or `systemctl restart`), never a second `gbrain jobs supervisor start
+   --detach`; any other supervisor with `gbrain jobs supervisor stop` then
+   `start --detach` with the queue, concurrency and PID file it was launched
+   with (its worker, under tini or not, restarts with it). A serve or worker
+   started by hand, an
    autopilot without its service, a running `gbrain sync`, or an MCP server an agent
    harness started refuses the upgrade with `restart_refused` (exit 3), naming
    the exact step for each process; nothing is installed. For MCP servers the

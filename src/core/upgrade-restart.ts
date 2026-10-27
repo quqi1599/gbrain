@@ -19,12 +19,14 @@
  *   list as a gbrain process is stale and dropped. Read-only.
  * - `planRestart`: which processes are not on the installed build and how each
  *   restarts: serve and autopilot through their installed service, only when
- *   the service's own process runs them; the supervisor with `jobs supervisor
- *   stop` and `start --detach` with the options it was launched with (its
- *   worker restarts with it); an MCP stdio server by stopping it when
- *   `--stop-mcp` says so (its harness starts the new build on reconnect).
- *   Anything else is a manual step, and any manual step refuses the whole
- *   restart before anything changes.
+ *   the service's own process runs them; a jobs supervisor or `jobs work`
+ *   process that an installed worker service already runs (launchd agent or
+ *   systemd unit) through that service, never `jobs supervisor start
+ *   --detach`; any other supervisor with `jobs supervisor stop` and `start
+ *   --detach` with the options it was launched with (its worker restarts with
+ *   it); an MCP stdio server by stopping it when `--stop-mcp` says so (its
+ *   harness starts the new build on reconnect). Anything else is a manual
+ *   step, and any manual step refuses the whole restart before anything changes.
  * - `runRestartSteps` then `verifyRestart`: run the steps in that order, then
  *   poll until no restarted pid is alive, every process reports the installed
  *   build (or, reporting none, started after the restart from an install that
@@ -146,7 +148,7 @@ export async function collectHostProcesses(sources: ProcessSources): Promise<Hos
 }
 
 /** An installed service: its restart command and the pid its manager runs now (null when it is not running). */
-export interface ServiceHandle { argv: string[]; pid: number | null }
+export interface ServiceHandle { argv: string[]; pid: number | null; /** Worker service only: the queue its program runs (default when it names none). */ queue?: string }
 
 export interface RestartContext {
   /** The installed build every process must run. */
@@ -155,6 +157,12 @@ export interface RestartContext {
   serveService: ServiceHandle | null;
   /** The installed autopilot service; null when none is installed. */
   autopilotService: ServiceHandle | null;
+  /**
+   * The installed jobs worker service (launchd agent or systemd unit) when its
+   * manager is running it now; null when none is installed or it is not running.
+   * A supervisor or worker under it restarts through this command, never `start --detach`.
+   */
+  workerService: ServiceHandle | null;
   /** Stop MCP stdio servers (their harness starts the new build on reconnect) instead of refusing. */
   stopMcp: boolean;
   /** The package directory of the install this upgrade replaces (realpath); null when unknown (a compiled binary). */
@@ -185,8 +193,8 @@ export function copyFix(root: string, holds: string | null, expected: string): {
 }
 
 export type RestartStep =
-  | { kind: 'service'; role: 'serve' | 'autopilot'; argv: string[]; pids: number[] }
-  | { kind: 'supervisor'; pid: number; workers: number[]; stop: string[]; start: string[]; pid_file: string | null }
+  | { kind: 'service'; role: 'serve' | 'autopilot' | 'worker'; argv: string[]; pids: number[] }
+  | { kind: 'supervisor'; pid: number; workers: number[]; stop: string[]; start: string[]; pid_file: string | null; /** Set when a service manager owns this supervisor: that command restarts it, and `start` is not run. */ service?: string[] }
   | { kind: 'stop'; role: 'mcp'; pid: number; started_ms: number | null }
   | { kind: 'replace_copy'; root: string; bun_install: string; from: string | null; to: string; pids: number[] };
 
@@ -203,6 +211,41 @@ export interface RestartPlan {
 }
 
 const label = (p: Pick<HostProcess, 'role' | 'pid' | 'version'>) => `${p.role} pid ${p.pid} (${p.version ? `v${p.version}` : 'build not recorded'})`;
+
+/** A launchd label or systemd unit name gbrain ships for the jobs worker (`com.gbrain.worker`, `gbrain-worker.service`). */
+export function isWorkerServiceFileName(name: string): boolean {
+  const base = name.replace(/\.(plist|service)$/, '');
+  return /^(?:com\.gbrain\.worker|com\.user\.gbrain-worker)(?:\.|$)/.test(base) || /^gbrain-worker(?:@|$)/.test(base);
+}
+
+/** True when a launchd plist's program is `gbrain jobs supervisor` or `gbrain jobs work` (a comment outside ProgramArguments does not count). */
+export function launchdProgramInvokesJobsWorker(plist: string): boolean {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist)?.[1] ?? '';
+  return programInvokesJobsWorker([...block.matchAll(/<string>([^<]*)<\/string>/g)].map(m => m[1]!).join(' '));
+}
+
+/** True when a systemd unit's ExecStart is `gbrain jobs supervisor` or `gbrain jobs work`. */
+export function systemdExecInvokesJobsWorker(unit: string): boolean {
+  return programInvokesJobsWorker(/^ExecStart=(.+)$/m.exec(unit)?.[1] ?? '');
+}
+
+function programInvokesJobsWorker(program: string): boolean {
+  return /\bgbrain\b/.test(program) && /\bjobs\b/.test(program) && /\b(?:supervisor|work)\b/.test(program);
+}
+
+/** The queue a jobs worker program runs; `default` when it names none. */
+export function jobsWorkerQueue(program: string): string {
+  return /--queue(?:=|\s+)(\S+)/.exec(program)?.[1] ?? 'default';
+}
+
+/** The joined ProgramArguments (launchd) or ExecStart (systemd) a worker unit's queue is read from. */
+export function workerUnitProgram(text: string): string {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(text)?.[1];
+  if (block) return [...block.matchAll(/<string>([^<]*)<\/string>/g)].map(m => m[1]!).join(' ');
+  return /^ExecStart=(.+)$/m.exec(text)?.[1] ?? '';
+}
+
+const supervisorQueue = (args: readonly string[] | undefined) => jobsWorkerQueue(args?.join(' ') ?? '');
 
 /**
  * The supervisor's stop and start commands from the arguments it runs with, so the restart keeps its queue, concurrency and PID file.
@@ -225,13 +268,22 @@ export function planRestart(processes: readonly HostProcess[], ctx: RestartConte
   const stale = processes.filter(p => p.version !== ctx.expected);
   const current = processes.filter(p => p.version === ctx.expected);
   const manual: ManualStep[] = [];
-  const services = new Map<'serve' | 'autopilot', number[]>();
+  const services = new Map<'serve' | 'autopilot' | 'worker', number[]>();
   const supervisors = new Map<number, number[]>();
+  /** Supervisors the worker service already runs: restart the service, do not `start --detach`. */
+  const managedSupervisors = new Map<number, number[]>();
   const stops: RestartStep[] = [];
   const byPid = new Map(processes.map(p => [p.pid, p]));
-  const addService = (role: 'serve' | 'autopilot', pid: number) => services.set(role, [...(services.get(role) ?? []), pid]);
+  const addService = (role: 'serve' | 'autopilot' | 'worker', pid: number) => services.set(role, [...(services.get(role) ?? []), pid]);
   const runsUnder = (p: HostProcess, service: ServiceHandle | null) => !!service && service.pid !== null && (p.pid === service.pid || !!p.ancestors?.includes(service.pid));
   const kill = (p: HostProcess, instruction: string) => manual.push({ role: p.role, pid: p.pid, version: p.version, argv: ['kill', String(p.pid)], instruction });
+  const serviceQueue = ctx.workerService?.queue ?? 'default';
+  const duplicatesManagedWorker = (args: readonly string[] | undefined) => ctx.workerService?.pid != null && supervisorQueue(args) === serviceQueue;
+  const takeManaged = (supervisorPid: number, workerPid?: number) => {
+    const list = managedSupervisors.get(supervisorPid) ?? [];
+    if (workerPid !== undefined && !list.includes(workerPid)) list.push(workerPid);
+    managedSupervisors.set(supervisorPid, list);
+  };
 
   const copies = new Map<string, Extract<RestartStep, { kind: 'replace_copy' }>>();
   for (const p of stale) {
@@ -258,12 +310,17 @@ export function planRestart(processes: readonly HostProcess[], ctx: RestartConte
         else kill(p, `${label(p)} does not run under an installed autopilot service: stop it (\`kill ${p.pid}\`) and start it again the way it was launched (\`gbrain autopilot --install\` installs the service).`);
         break;
       case 'supervisor':
-        if (p.args) supervisors.set(p.pid, supervisors.get(p.pid) ?? []);
+        if (runsUnder(p, ctx.workerService)) takeManaged(p.pid);
+        else if (duplicatesManagedWorker(p.args)) kill(p, `${label(p)} is not the jobs worker the service manager already runs on queue '${serviceQueue}' (pid ${ctx.workerService!.pid}): this restart does not start a detached supervisor beside it. Stop it (\`gbrain jobs supervisor stop\`) and restart that service (\`${ctx.workerService!.argv.join(' ')}\`).`);
+        else if (p.args) supervisors.set(p.pid, supervisors.get(p.pid) ?? []);
         else kill(p, `${label(p)}: its launch options could not be read from the process table, so it is not restarted with defaults: stop it (\`gbrain jobs supervisor stop\`) and start it again the way it was launched.`);
         break;
       case 'worker':
-        if (parent?.role === 'supervisor' && parent.args) supervisors.set(parent.pid, [...(supervisors.get(parent.pid) ?? []), p.pid]);
+        if (parent?.role === 'supervisor' && runsUnder(parent, ctx.workerService)) takeManaged(parent.pid, p.pid);
+        else if (runsUnder(p, ctx.workerService)) addService('worker', p.pid);
+        else if (parent?.role === 'supervisor' && parent.args && !duplicatesManagedWorker(parent.args)) supervisors.set(parent.pid, [...(supervisors.get(parent.pid) ?? []), p.pid]);
         else if (parent?.role === 'autopilot' && runsUnder(parent, ctx.autopilotService)) addService('autopilot', parent.pid);
+        else if (parent?.role === 'supervisor' && duplicatesManagedWorker(parent.args)) break;
         else kill(p, `${label(p)} is not run by a jobs supervisor this restart can relaunch${parent?.role === 'autopilot' ? ' (its autopilot runs under no installed service)' : ''}: stop it (\`kill ${p.pid}\`, SIGTERM drains its jobs) and start \`gbrain jobs work\` again the way it was launched, or run workers under \`gbrain jobs supervisor start --detach\`.`);
         break;
       case 'mcp':
@@ -282,6 +339,12 @@ export function planRestart(processes: readonly HostProcess[], ctx: RestartConte
   if (serve && ctx.serveService) steps.push({ kind: 'service', role: 'serve', argv: ctx.serveService.argv, pids: [...new Set(serve)] });
   const autopilot = services.get('autopilot');
   if (autopilot && ctx.autopilotService) steps.push({ kind: 'service', role: 'autopilot', argv: ctx.autopilotService.argv, pids: [...new Set(autopilot)] });
+  const worker = services.get('worker');
+  if (worker && ctx.workerService) steps.push({ kind: 'service', role: 'worker', argv: ctx.workerService.argv, pids: [...new Set(worker)] });
+  for (const [pid, workers] of managedSupervisors) {
+    const argv = ctx.workerService!.argv;
+    steps.push({ kind: 'supervisor', pid, workers, stop: argv, start: argv, pid_file: null, service: argv });
+  }
   for (const [pid, workers] of supervisors) steps.push({ kind: 'supervisor', pid, workers, ...supervisorRestartArgv(byPid.get(pid)!.args!) });
   steps.push(...stops);
   return { expected: ctx.expected, current, stale, steps, manual };
@@ -319,6 +382,14 @@ export async function runRestartSteps(plan: RestartPlan, exec: RestartExecutor):
       const r = exec.run(step.argv);
       results.push({ step, ok: r.status === 0, detail: r.status === 0 ? `ran \`${step.argv.join(' ')}\`` : failed(step.argv, r) });
     } else if (step.kind === 'supervisor') {
+      // A service manager already owns this supervisor. `start --detach` would
+      // race its respawn (launchd's throttle and the shipped unit's RestartSec
+      // are both longer than the grace below) and leave two workers on one queue.
+      if (step.service) {
+        const restarted = exec.run(step.service);
+        results.push({ step, ok: restarted.status === 0, detail: restarted.status === 0 ? `restarted the managed jobs worker with \`${step.service.join(' ')}\`` : failed(step.service, restarted) });
+        continue;
+      }
       const stop = exec.run(step.stop);
       if (stop.status !== 0) { results.push({ step, ok: false, detail: failed(step.stop, stop) }); continue; }
       await exec.sleep(SUPERVISOR_RESPAWN_GRACE_MS);
@@ -379,7 +450,7 @@ export function restartProblems(plan: RestartPlan, processes: readonly HostProce
     if (!fresh.some(p => p.role === role)) {
       problems.push(`${role} did not come back after ${step.kind === 'service' ? `\`${step.argv.join(' ')}\`` : 'the supervisor restart'}.`);
     } else if (step.kind === 'supervisor' && step.workers.length && !fresh.some(p => p.role === 'worker' && live.get(p.ppid ?? -1)?.role === 'supervisor' && !restarted.has(p.ppid!))) {
-      problems.push(`the jobs worker did not come back under the restarted supervisor (\`${step.start.join(' ')}\`).`);
+      problems.push(`the jobs worker did not come back under the restarted supervisor (\`${(step.service ?? step.start).join(' ')}\`).`);
     }
   }
   if (warm.after.state === 'refused' && refusesThisBuild(warm.after)) problems.push(`The warm CLI socket refused this build (${warm.after.reason}${warm.after.mismatch ? `: ${warm.after.mismatch}` : ''}).`);

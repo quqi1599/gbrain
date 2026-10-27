@@ -8,7 +8,7 @@
  * onto the build already installed (doctor's `runtime_build_skew` fix);
  * `--dry-run` prints the plan and changes nothing.
  */
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { spawnSync } from '../core/spawn.ts';
@@ -25,7 +25,7 @@ import { parseEtimeToMs, readWorkers } from '../core/minions/worker-registry.ts'
 import { installedVersion, runtimeInstallRoot } from '../core/runtime-build.ts';
 import { VERSION } from '../version.ts';
 import {
-  classifyGbrainCommand, collectHostProcesses, copyFix, gbrainEntry, mismatchedBuilds, PENDING_BUILD, planRestart, runRestartSteps, verifyRestart,
+  classifyGbrainCommand, collectHostProcesses, copyFix, gbrainEntry, isWorkerServiceFileName, jobsWorkerQueue, launchdProgramInvokesJobsWorker, mismatchedBuilds, PENDING_BUILD, planRestart, runRestartSteps, systemdExecInvokesJobsWorker, verifyRestart, workerUnitProgram,
   type HostProcess, type ProcessSources, type ProcessTableRow, type RestartPlan, type ServiceHandle, type WarmSocketState,
 } from '../core/upgrade-restart.ts';
 
@@ -79,16 +79,85 @@ function installOf(command: string): { root: string | null; version: string | nu
 }
 
 /** The pid a service manager runs for a unit or label now; null when it is not running or cannot be read. */
-function servicePid(platform: string, unit: string, launchdLabel: string): number | null {
+function servicePid(platform: string, unit: string, launchdLabel: string, scope: 'user' | 'system' = 'user'): number | null {
   const r = platform === 'darwin' ? spawnSync('launchctl', ['list', launchdLabel], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })
-    : spawnSync('systemctl', ['--user', 'show', '-p', 'MainPID', '--value', unit], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
+    : spawnSync('systemctl', [...(scope === 'user' ? ['--user'] : []), 'show', '-p', 'MainPID', '--value', unit], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
   if (r.status !== 0 || typeof r.stdout !== 'string') return null;
   const pid = Number(platform === 'darwin' ? /"PID"\s*=\s*(\d+)/.exec(r.stdout)?.[1] : r.stdout.trim());
   return Number.isInteger(pid) && pid > 1 ? pid : null;
 }
 
+const SAFE_SERVICE_NAME = /^[A-Za-z0-9._@:-]+$/;
+
+interface WorkerUnitCandidate { argv: string[]; pid: number | null; canonical: boolean; queue: string }
+
+/**
+ * A launchd agent or systemd unit that runs the jobs worker, when its manager
+ * is running it now. Filename (`com.gbrain.worker`, `gbrain-worker.service`) or
+ * a program of `gbrain jobs supervisor` / `gbrain jobs work`. A stopped unit is
+ * not a managed worker: a hand-started supervisor may still be restarted with
+ * `start --detach`.
+ */
+export function discoverWorkerService(opts: {
+  platform: string;
+  home: string;
+  uid: number;
+  /** Defaults to `~/Library/LaunchAgents` and `/Library/LaunchAgents`. Tests pass their own. */
+  launchdDirs?: string[];
+  systemUnitDir?: string;
+  pidOf?: (spec: { scope: 'user' | 'system'; unit: string; label: string }) => number | null;
+}): ServiceHandle | null {
+  const pidOf = opts.pidOf ?? ((spec) => servicePid(opts.platform, spec.unit, spec.label, spec.scope));
+  const found: WorkerUnitCandidate[] = [];
+  const take = (file: string, scope: 'user' | 'system', fileLabel: string, unit: string, launchd: boolean) => {
+    let body = '';
+    try { body = readFileSync(file, 'utf8'); } catch { return; }
+    const label = launchd ? (/<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(body)?.[1] ?? fileLabel) : fileLabel;
+    const match = isWorkerServiceFileName(launchd ? fileLabel : unit) || isWorkerServiceFileName(label)
+      || (launchd ? launchdProgramInvokesJobsWorker(body) : systemdExecInvokesJobsWorker(body));
+    if (!match || !SAFE_SERVICE_NAME.test(label) || !SAFE_SERVICE_NAME.test(unit)) return;
+    found.push({
+      argv: opts.platform === 'darwin'
+        ? ['launchctl', 'kickstart', '-k', `gui/${opts.uid}/${label}`]
+        : ['systemctl', ...(scope === 'user' ? ['--user'] : []), 'restart', unit],
+      pid: pidOf({ scope, unit, label }),
+      canonical: isWorkerServiceFileName(label) || isWorkerServiceFileName(unit) || isWorkerServiceFileName(fileLabel),
+      queue: jobsWorkerQueue(workerUnitProgram(body)),
+    });
+  };
+  if (opts.platform === 'darwin') {
+    for (const dir of opts.launchdDirs ?? [join(opts.home, 'Library', 'LaunchAgents'), '/Library/LaunchAgents']) {
+      let names: string[] = [];
+      try { names = readdirSync(dir); } catch { continue; }
+      for (const name of names) {
+        if (!name.endsWith('.plist')) continue;
+        const label = name.slice(0, -'.plist'.length);
+        take(join(dir, name), 'user', label, label, true);
+      }
+    }
+  } else if (opts.platform === 'linux') {
+    const userDir = join(opts.home, '.config', 'systemd', 'user');
+    let userUnits: string[] = [];
+    try { userUnits = readdirSync(userDir); } catch { /* no user units */ }
+    for (const name of userUnits) {
+      if (!name.endsWith('.service')) continue;
+      take(join(userDir, name), 'user', name, name, false);
+    }
+    const systemDir = opts.systemUnitDir ?? '/etc/systemd/system';
+    let systemUnits: string[] = [];
+    try { systemUnits = readdirSync(systemDir); } catch { /* not readable */ }
+    for (const name of systemUnits) {
+      if (!name.endsWith('.service') || !isWorkerServiceFileName(name)) continue;
+      take(join(systemDir, name), 'system', name, name, false);
+    }
+  }
+  found.sort((a, b) => Number(b.canonical) - Number(a.canonical));
+  const chosen = found.find(c => c.pid !== null);
+  return chosen ? { argv: chosen.argv, pid: chosen.pid, queue: chosen.queue } : null;
+}
+
 /** The services this brain installed on this host: each one's restart command and the pid its manager runs. */
-export function hostServices(platform: string = process.platform, home: string = homedir(), uid: number = process.getuid?.() ?? 501): { serve: ServiceHandle | null; autopilot: ServiceHandle | null } {
+export function hostServices(platform: string = process.platform, home: string = homedir(), uid: number = process.getuid?.() ?? 501): { serve: ServiceHandle | null; autopilot: ServiceHandle | null; worker: ServiceHandle | null } {
   const job = resolveAutopilotJob();
   const autopilot = platform === 'darwin' && existsSync(plistPath(job.launchdLabel)) ? ['launchctl', 'kickstart', '-k', `gui/${uid}/${job.launchdLabel}`]
     : platform === 'linux' && existsSync(systemdUnitPath(job.systemdUnit)) ? ['systemctl', '--user', 'restart', job.systemdUnit] : null;
@@ -96,6 +165,7 @@ export function hostServices(platform: string = process.platform, home: string =
   return {
     serve: serve ? { argv: serve, pid: servicePid(platform, SERVE_SYSTEMD_UNIT, SERVE_LAUNCHD_LABEL) } : null,
     autopilot: autopilot ? { argv: autopilot, pid: servicePid(platform, job.systemdUnit, job.launchdLabel) } : null,
+    worker: discoverWorkerService({ platform, home, uid }),
   };
 }
 
@@ -152,7 +222,7 @@ function describeSteps(plan: RestartPlan): string[] {
   const byPid = new Map(plan.stale.map(p => [p.pid, p]));
   const name = (pid: number) => byPid.has(pid) ? describe(byPid.get(pid)!) : `pid ${pid}`;
   return plan.steps.map(step => step.kind === 'service' ? `${step.pids.map(name).join(', ')}: \`${step.argv.join(' ')}\``
-    : step.kind === 'supervisor' ? `${[step.pid, ...step.workers].map(name).join(', ')}: \`${step.stop.join(' ')}\`, then \`${step.start.join(' ')}\``
+    : step.kind === 'supervisor' ? `${[step.pid, ...step.workers].map(name).join(', ')}: ${step.service ? `\`${step.service.join(' ')}\`` : `\`${step.stop.join(' ')}\`, then \`${step.start.join(' ')}\``}`
     : step.kind === 'replace_copy' ? `${step.pids.map(name).join(', ')} run from the Bun global copy at ${step.root} (${step.from ? `v${step.from}` : 'version unknown'}): replace it with v${step.to} (BUN_INSTALL=${step.bun_install}: bun remove -g gbrain, then bun add -g the tag) before the restarts`
     : `${name(step.pid)}: stop it (reconnect gbrain in its harness afterwards)`);
 }
@@ -223,7 +293,7 @@ export async function preflightHostRestart(opts: HostRestartOptions): Promise<bo
   const { sources, close } = await hostSources();
   try {
     const services = hostServices();
-    const plan = planRestart(await collectHostProcesses(sources), { expected: PENDING_BUILD, serveService: services.serve, autopilotService: services.autopilot, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot() });
+    const plan = planRestart(await collectHostProcesses(sources), { expected: PENDING_BUILD, serveService: services.serve, autopilotService: services.autopilot, workerService: services.worker, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot() });
     const refusal = restartRefusal(plan, opts.rerunArgv, false);
     if (!refusal) return true;
     setCliExitVerdict(writeCliError(refusal, 'upgrade', { json: opts.json }));
@@ -239,7 +309,7 @@ export async function runHostRestart(opts: HostRestartOptions & { dryRun: boolea
   try {
     const services = hostServices();
     const before = await collectHostProcesses(sources);
-    const plan = planRestart(before, { expected: VERSION, serveService: services.serve, autopilotService: services.autopilot, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot() });
+    const plan = planRestart(before, { expected: VERSION, serveService: services.serve, autopilotService: services.autopilot, workerService: services.worker, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot() });
     const { probeCliSocket } = await import('../core/cli-socket/probe.ts');
     const warmBefore = await probeCliSocket();
     const planDoc = { expected: VERSION, processes: before, steps: plan.steps, manual: plan.manual, warm_socket: warmBefore, notes };

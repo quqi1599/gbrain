@@ -6,6 +6,9 @@
  * heartbeat rows, the service managers and the socket.
  */
 import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { EQUALS_READERS } from '../src/cli/flag-equals.ts';
 import { parseGlobalFlags } from '../src/core/cli-options.ts';
 import {
@@ -25,7 +28,7 @@ const AUTOPILOT_SERVICE = ['systemctl', '--user', 'restart', 'gbrain-autopilot.s
 const SERVE_PID = 9;
 const AUTOPILOT_PID = 29;
 const ctx = (over: Partial<RestartContext> = {}): RestartContext => ({
-  expected: NEW, serveService: { argv: SERVE_SERVICE, pid: SERVE_PID }, autopilotService: { argv: AUTOPILOT_SERVICE, pid: AUTOPILOT_PID }, stopMcp: false, ...over,
+  expected: NEW, serveService: { argv: SERVE_SERVICE, pid: SERVE_PID }, autopilotService: { argv: AUTOPILOT_SERVICE, pid: AUTOPILOT_PID }, workerService: null, stopMcp: false, ...over,
 });
 const SUP_ARGS = ['jobs', 'supervisor', 'start'];
 const DEFAULT_SUP = supervisorRestartArgv(SUP_ARGS);
@@ -196,6 +199,50 @@ describe('planRestart', () => {
     expect(plan.manual[4]!.instruction).toContain('not restarted with defaults');
   });
 
+  test('a jobs supervisor the worker service runs is restarted through that service, not start --detach', () => {
+    const service = ['launchctl', 'kickstart', '-k', 'gui/501/com.gbrain.worker'];
+    const plan = planRestart([
+      proc(20, 'supervisor', OLD, { args: ['jobs', 'supervisor', '--concurrency', '2'] }),
+      proc(21, 'worker', OLD, { ppid: 20, ancestors: [20] }),
+    ], ctx({ workerService: { argv: service, pid: 20, queue: 'default' } }));
+    expect(plan.manual).toEqual([]);
+    expect(plan.steps).toEqual([{ kind: 'supervisor', pid: 20, workers: [21], stop: service, start: service, pid_file: null, service }]);
+    expect(JSON.stringify(plan.steps)).not.toContain('--detach');
+  });
+
+  test('a jobs work process the worker service runs is restarted through that service', () => {
+    const service = ['launchctl', 'kickstart', '-k', 'gui/501/com.gbrain.worker'];
+    const plan = planRestart([proc(21, 'worker')], ctx({ workerService: { argv: service, pid: 21, queue: 'default' } }));
+    expect(plan.manual).toEqual([]);
+    expect(plan.steps).toEqual([{ kind: 'service', role: 'worker', argv: service, pids: [21] }]);
+  });
+
+  test('a second supervisor on the service queue is not detached beside the managed worker', () => {
+    const service = ['systemctl', '--user', 'restart', 'gbrain-worker.service'];
+    const plan = planRestart([
+      proc(20, 'supervisor'),
+      proc(21, 'worker', OLD, { ppid: 40, ancestors: [40] }),
+    ], ctx({ workerService: { argv: service, pid: 40, queue: 'default' } }));
+    expect(plan.steps.map(step => step.kind === 'supervisor' ? step.service ?? step.start : step.kind)).toEqual(['service']);
+    expect(plan.manual.map(m => m.pid)).toEqual([20]);
+    expect(plan.manual[0]!.instruction).toContain('does not start a detached supervisor');
+    expect(plan.manual[0]!.instruction).toContain('gbrain-worker.service');
+  });
+
+  test('a supervisor on another queue still restarts with start --detach beside the managed worker', () => {
+    const service = ['launchctl', 'kickstart', '-k', 'gui/501/com.gbrain.worker'];
+    const args = ['jobs', 'supervisor', '--queue', 'ingest'];
+    const plan = planRestart([
+      proc(20, 'supervisor', OLD, { args }),
+      proc(21, 'worker', OLD, { ppid: 40, ancestors: [40] }),
+    ], ctx({ workerService: { argv: service, pid: 40, queue: 'default' } }));
+    expect(plan.manual).toEqual([]);
+    expect(plan.steps).toEqual([
+      { kind: 'service', role: 'worker', argv: service, pids: [21] },
+      { kind: 'supervisor', pid: 20, workers: [], ...supervisorRestartArgv(args) },
+    ]);
+  });
+
   test('an MCP server refuses without --stop-mcp and is stopped with it', () => {
     expect(planRestart([proc(50, 'mcp')], ctx()).manual.map(m => m.role)).toEqual(['mcp']);
     const plan = planRestart([proc(50, 'mcp'), proc(10, 'serve')], ctx({ stopMcp: true }));
@@ -232,6 +279,20 @@ describe('runRestartSteps', () => {
     return { calls, exec };
   };
   const plan = planRestart([proc(10, 'serve'), proc(20, 'supervisor'), proc(21, 'worker', OLD, { ppid: 20 }), proc(50, 'mcp')], ctx({ stopMcp: true }));
+
+  test('a service-managed supervisor is restarted with the service command and never detached', async () => {
+    const service = ['launchctl', 'kickstart', '-k', 'gui/501/com.gbrain.worker'];
+    const managed = planRestart([
+      proc(20, 'supervisor', OLD, { args: ['jobs', 'supervisor', '--concurrency', '2'] }),
+      proc(21, 'worker', OLD, { ppid: 20 }),
+    ], ctx({ workerService: { argv: service, pid: 20, queue: 'default' } }));
+    const { calls, exec } = executor();
+    const results = await runRestartSteps(managed, exec);
+    expect(calls).toEqual([service.join(' ')]);
+    expect(results[0]).toMatchObject({ ok: true });
+    expect(results[0]!.detail).toContain('managed jobs worker');
+    expect(calls.join('\n')).not.toContain('--detach');
+  });
 
   test('runs serve first, then the supervisor stop and start, then stops MCP servers', async () => {
     const { calls, exec } = executor();
@@ -424,5 +485,85 @@ describe('--dry-run belongs to --restart-only (#2185)', () => {
   test('upgrade accepts --dry-run and post-upgrade, which shares its module, does not', () => {
     expect(CLI_FLAG_REGISTRY['upgrade']).toContain('--dry-run');
     expect(CLI_FLAG_REGISTRY['post-upgrade']).not.toContain('--dry-run');
+  });
+});
+
+describe('discoverWorkerService', () => {
+  const load = async () => {
+    const core = await import('../src/core/upgrade-restart.ts');
+    const host = await import('../src/commands/upgrade-restart.ts');
+    return { ...core, discoverWorkerService: host.discoverWorkerService };
+  };
+  const plist = (label: string, args: string[]) => `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>${label}</string>
+  <key>ProgramArguments</key><array>
+    ${args.map(arg => `<string>${arg}</string>`).join('\n    ')}
+  </array>
+</dict></plist>
+`;
+  const withHome = (run: (home: string, systemDir: string) => void) => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-worker-svc-'));
+    const home = join(root, 'home');
+    const systemDir = join(root, 'systemd-system');
+    mkdirSync(join(home, 'Library', 'LaunchAgents'), { recursive: true });
+    mkdirSync(join(home, '.config', 'systemd', 'user'), { recursive: true });
+    mkdirSync(systemDir, { recursive: true });
+    try { run(home, systemDir); } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+  const discover = (
+    discoverWorkerService: (opts: { platform: string; home: string; uid: number; launchdDirs: string[]; systemUnitDir: string; pidOf: (spec: { scope: 'user' | 'system'; unit: string; label: string }) => number | null }) => { argv: string[]; pid: number | null; queue?: string } | null,
+    platform: string, home: string, systemDir: string, pidOf: (spec: { scope: 'user' | 'system'; unit: string; label: string }) => number | null,
+  ) => discoverWorkerService({ platform, home, uid: 501, launchdDirs: [join(home, 'Library', 'LaunchAgents')], systemUnitDir: systemDir, pidOf });
+
+  test('a running launchd worker agent restarts with kickstart; a stopped one does not count', async () => {
+    const { discoverWorkerService } = await load();
+    withHome((home, systemDir) => {
+      writeFileSync(join(home, 'Library', 'LaunchAgents', 'com.gbrain.worker.plist'), plist('com.gbrain.worker', ['/usr/local/bin/gbrain', 'jobs', 'supervisor', '--concurrency', '2']));
+      writeFileSync(join(home, 'Library', 'LaunchAgents', 'com.gbrain.serve.plist'), plist('com.gbrain.serve', ['/usr/local/bin/gbrain', 'serve', '--http']));
+      const live = discover(discoverWorkerService, 'darwin', home, systemDir, () => 20);
+      expect(live).toEqual({ argv: ['launchctl', 'kickstart', '-k', 'gui/501/com.gbrain.worker'], pid: 20, queue: 'default' });
+      expect(discover(discoverWorkerService, 'darwin', home, systemDir, () => null)).toBeNull();
+    });
+  });
+
+  test('a custom-labeled agent whose program is gbrain jobs work is still the worker service, on its queue', async () => {
+    const { discoverWorkerService, launchdProgramInvokesJobsWorker } = await load();
+    withHome((home, systemDir) => {
+      const body = `${plist('com.example.brain-worker', ['/usr/local/bin/gbrain', 'jobs', 'work', '--queue', 'ingest'])}\n<!-- gbrain jobs supervisor -->\n`;
+      writeFileSync(join(home, 'Library', 'LaunchAgents', 'com.example.brain-worker.plist'), body);
+      expect(launchdProgramInvokesJobsWorker(body)).toBe(true);
+      expect(discover(discoverWorkerService, 'darwin', home, systemDir, () => 21)).toEqual({
+        argv: ['launchctl', 'kickstart', '-k', 'gui/501/com.example.brain-worker'], pid: 21, queue: 'ingest',
+      });
+    });
+  });
+
+  test('a running user systemd unit wins over a stopped namesake; a system unit is restarted without --user', async () => {
+    const { discoverWorkerService, systemdExecInvokesJobsWorker } = await load();
+    withHome((home, systemDir) => {
+      const userUnit = '[Service]\nExecStart=/usr/local/bin/gbrain jobs supervisor --concurrency 2\n# ExecStart=/usr/bin/gbrain jobs work --queue other\n';
+      writeFileSync(join(home, '.config', 'systemd', 'user', 'gbrain-worker.service'), userUnit);
+      expect(systemdExecInvokesJobsWorker(userUnit)).toBe(true);
+      expect(systemdExecInvokesJobsWorker('# ExecStart=/usr/bin/gbrain jobs supervisor\n')).toBe(false);
+      writeFileSync(join(systemDir, 'gbrain-worker.service'), '[Service]\nExecStart=/usr/local/bin/gbrain jobs supervisor --queue ingest --concurrency 2\n');
+      writeFileSync(join(systemDir, 'gbrain-autopilot.service'), '[Service]\nExecStart=/usr/local/bin/gbrain autopilot --no-worker\n');
+      const user = discover(discoverWorkerService, 'linux', home, systemDir, spec => spec.scope === 'user' ? 7 : null);
+      expect(user).toEqual({ argv: ['systemctl', '--user', 'restart', 'gbrain-worker.service'], pid: 7, queue: 'default' });
+      const system = discover(discoverWorkerService, 'linux', home, systemDir, spec => spec.scope === 'system' ? 8 : null);
+      expect(system).toEqual({ argv: ['systemctl', 'restart', 'gbrain-worker.service'], pid: 8, queue: 'ingest' });
+    });
+  });
+
+  test('worker service names and queue flags', async () => {
+    const { isWorkerServiceFileName, jobsWorkerQueue } = await load();
+    for (const name of ['com.gbrain.worker', 'com.gbrain.worker.plist', 'com.user.gbrain-worker.plist', 'gbrain-worker.service', 'gbrain-worker@.service']) {
+      expect(isWorkerServiceFileName(name)).toBe(true);
+    }
+    expect(isWorkerServiceFileName('com.gbrain.serve')).toBe(false);
+    expect(isWorkerServiceFileName('gbrain-autopilot.service')).toBe(false);
+    expect(jobsWorkerQueue('gbrain jobs supervisor --queue=ingest')).toBe('ingest');
+    expect(jobsWorkerQueue('gbrain jobs work --queue ingest')).toBe('ingest');
+    expect(jobsWorkerQueue('gbrain jobs supervisor --concurrency 2')).toBe('default');
   });
 });
