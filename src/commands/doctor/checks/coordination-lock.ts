@@ -10,6 +10,9 @@ const DOCS = 'docs/architecture/topologies.md#coordination-lock';
  * its reservation records, warn: the operator expects the lock under the
  * variable (often a mounted directory in a container) while every process keeps
  * using the recorded file. Read-only; names the recorded path and the move step.
+ * A coordination lock whose path is not stable (`coordination_path_unstable`:
+ * a symlink other than the gbrain home or its persistence directory) is warned
+ * here with the write-path's message instead of being skipped.
  */
 export async function checkCoordinationLockLocation(engine: BrainEngine): Promise<Check> {
   const name = 'coordination_lock_location';
@@ -21,21 +24,31 @@ export async function checkCoordinationLockLocation(engine: BrainEngine): Promis
     const roots = await engine.executeRaw<{ root: string; source_id: string | null }>(`
       SELECT DISTINCT local_path AS root,id AS source_id FROM sources WHERE local_path IS NOT NULL AND NOT COALESCE(archived,false)
       UNION SELECT DISTINCT h.local_path,NULL FROM persistence_host_bindings h WHERE h.host_id=$1::uuid`, [existingLocalHostId()]);
+    const { OperationError } = await import('../../../core/ops/contract.ts');
     const ignored: Array<{ root: string; source_id: string | null; configured_directory: string; recorded_path: string; move_step: string }> = [];
+    const unstable: Array<{ root: string; source_id: string | null; message: string }> = [];
     for (const { root, source_id } of roots) {
       if (!existsSync(root)) continue;
       let recorded: string | undefined;
-      try { recorded = readPhysicalRootReservation(root)?.coordinationPath; } catch { continue; }
+      try { recorded = readPhysicalRootReservation(root)?.coordinationPath; }
+      catch (error) {
+        if (error instanceof OperationError && error.detail === 'coordination_path_unstable' && !unstable.some(row => row.root === root)) {
+          unstable.push({ root, source_id, message: error.message });
+        }
+        continue;
+      }
       const mismatch = recorded ? coordinationHomeIgnored(root, recorded) : null;
       if (mismatch && !ignored.some(row => row.root === root)) ignored.push({ root, source_id, ...mismatch });
     }
-    const details = { count: ignored.length, checkouts: ignored, docs: DOCS };
-    if (!ignored.length) return { name, status: 'ok', details,
+    const details = { count: ignored.length + unstable.length, checkouts: ignored, ...(unstable.length ? { unstable } : {}), docs: DOCS };
+    const unstableText = unstable.map(row => `${row.source_id ?? row.root}: ${row.message}`).join(' ');
+    if (!ignored.length && !unstable.length) return { name, status: 'ok', details,
       message: 'Every checkout\'s recorded coordination lock agrees with GBRAIN_COORDINATION_HOME, or the variable does not apply.' };
+    if (!ignored.length) return { name, status: 'warn', details, fix_unavailable_reason: 'operator_judgement', message: unstableText };
     const first = ignored[0]!;
     return { name, status: 'warn', details, fix_unavailable_reason: 'operator_judgement',
       message: `GBRAIN_COORDINATION_HOME names ${first.configured_directory}, but ${ignored.map(row => `${row.source_id ?? row.root} records its lock at ${row.recorded_path}`).join('; ')}; `
-        + `the recorded lock wins. ${first.move_step}` };
+        + `the recorded lock wins. ${first.move_step}${unstableText ? ` ${unstableText}` : ''}` };
   } catch (error) {
     return { name, status: 'warn', details: { health: 'unknown' },
       message: `Coordination lock locations could not be read: ${error instanceof Error ? error.message : String(error)}. Health is unknown.` };

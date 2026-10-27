@@ -2,8 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative, sep } from 'node:path';
 import { digest } from './digest.ts';
-import { canonicalFilesystemPath } from './root-registry.ts';
-import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, physicalRootError,
+import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertStableCoordinationPath, physicalRootError,
   readPhysicalRootReservation, readPhysicalRootStamp, replacePhysicalRootReservation, restorePhysicalRootReservation,
   type PhysicalRootReservation, type PhysicalRootStamp } from './physical-root-record.ts';
 
@@ -27,8 +26,8 @@ export interface PhysicalRootRecovery {
 export function inspectPhysicalRootRecovery(root: string, identity: Identity & { token?: string }, opts: { relocated?: boolean } = {}): PhysicalRootRecovery {
   if (realpathSync(root) !== root || lstatSync(root).isSymbolicLink()) throw physicalRootError();
   const rel = relative(root, identity.coordinationPath);
-  if (canonicalFilesystemPath(identity.coordinationPath) !== identity.coordinationPath
-    || !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)) throw physicalRootError();
+  assertStableCoordinationPath(identity.coordinationPath);
+  if (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)) throw physicalRootError();
   const reservation = readPhysicalRootReservation(root), stamp = readPhysicalRootStamp(root), info = statSync(root, { bigint: true });
   if (!info.isDirectory()) throw physicalRootError();
   if (opts.relocated && !reservation) throw physicalRootError('No ownership reservation exists beside this checkout, so the relocation cannot be confirmed; a copied stamp alone is not authority.');

@@ -7,14 +7,14 @@ import { localHostId, persistenceHome } from './identity.ts';
 import type { SqlEngine } from './model.ts';
 import { acquireNativeLock } from './native-lock.ts';
 import { coordinationPathInsideRoot, physicalRootError, readWedgedPhysicalRootReservation, repairReservationCoordinationPath,
-  reservationRepairGuardPath } from './physical-root-record.ts';
+  reservationRepairGuardPath, stableCoordinationPath } from './physical-root-record.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 
 /**
  * #6765: where a worktree's native coordination lock lives. One resolver serves claim, physical-root reservation,
  * topology clone, writer transfer and writer status:
  *   reservation       the path the outside-root reservation already records (always wins over any env)
- *   binding           the host binding's recorded path, when it is absolute, canonical and outside the root (transfer)
+ *   binding           the host binding's recorded path, when it is absolute, stable and outside the root (transfer)
  *   persistence_home  persistenceHome()/locks, when that is outside the canonical root (every ordinary layout)
  *   coordination_home $GBRAIN_COORDINATION_HOME/locks/<namespace>, when persistenceHome() is inside the root
  *   home_default      ~/.gbrain/persistence/locks/<namespace>, the same case without GBRAIN_COORDINATION_HOME
@@ -53,7 +53,7 @@ export function coordinationLockDirectory(path: string, hostId: string | null): 
 export function resolveCoordinationLock(path: string, worktreeId: string, recorded: RecordedCoordinationLock = {}, hostId?: string): CoordinationLock {
   if (recorded.reservation) return { path: recorded.reservation, rule: 'reservation' };
   const root = canonicalFilesystemPath(path), binding = recorded.binding;
-  if (binding && isAbsolute(binding) && !binding.includes('\0') && canonicalFilesystemPath(binding) === binding && !coordinationPathInsideRoot(root, binding)) {
+  if (binding && isAbsolute(binding) && !binding.includes('\0') && stableCoordinationPath(binding) && !coordinationPathInsideRoot(root, binding)) {
     return { path: binding, rule: 'binding' };
   }
   const { directory, rule } = coordinationLockDirectory(root, hostId ?? localHostId());

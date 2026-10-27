@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from '../spawn.ts';
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
 import { gitChildEnv } from '../git-env.ts';
 import { flushDirectory } from '../fs-durable.ts';
 import { digest, sha256 } from './digest.ts';
+import { persistenceHome } from './identity.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { OWNERSHIP_MARKER_GLOBS, PHYSICAL_ROOT_MARKER } from './root-metadata.ts';
 
@@ -91,13 +92,99 @@ export function coordinationPathInsideRoot(root: string, path: string): boolean 
   const rel = relative(root, path);
   return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
 }
+const nfc = (path: string) => path.normalize('NFC');
+/** Logical path plus the same path with only its parent resolved, so a symlinked ancestor (`/tmp` → `/private/tmp`) matches the spelling recorded at claim time without following this path itself. */
+function directorySpellings(logical: string): string[] {
+  const out = new Set<string>([nfc(logical)]);
+  try { out.add(nfc(join(canonicalFilesystemPath(dirname(logical)), basename(logical)))); } catch { /* parent missing: the logical spelling stands */ }
+  return [...out];
+}
+function persistencePrefixes(): string[] {
+  const persistence = persistenceHome();
+  const home = dirname(persistence);
+  const prefixes = new Set<string>(directorySpellings(persistence));
+  const rest = relative(home, persistence);
+  if (rest && !isAbsolute(rest) && rest !== '..' && !rest.startsWith(`..${sep}`)) {
+    for (const spelling of directorySpellings(home)) prefixes.add(nfc(join(spelling, rest)));
+  }
+  return [...prefixes];
+}
+function allowedHomeSymlinks(): Set<string> {
+  const home = dirname(persistenceHome());
+  return new Set<string>([...directorySpellings(home), ...persistencePrefixes()]);
+}
+function pathUnderPersistence(path: string): boolean {
+  const spelled = nfc(path);
+  return persistencePrefixes().some(prefix => {
+    const rel = relative(prefix, spelled);
+    return rel !== '' && !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
+  });
+}
+/**
+ * Symlink components of `path`. A missing leaf is not one (the lock file is
+ * created on first acquire). Null when an earlier component cannot be inspected.
+ */
+function symlinkComponents(path: string): string[] | null {
+  const parts = path.split(sep).filter(Boolean);
+  const found: string[] = [];
+  let current = path.startsWith(sep) ? sep : '';
+  for (let i = 0; i < parts.length; i++) {
+    current = join(current, parts[i]!);
+    let info;
+    try { info = lstatSync(current); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' && i === parts.length - 1) return found;
+      return null;
+    }
+    if (info.isSymbolicLink()) found.push(current);
+  }
+  return found;
+}
+/**
+ * A recorded coordination lock may stay in use when its spelling is no longer
+ * what realpath returns. Two differences still name the same lock:
+ * the gbrain home or its `persistence` directory is a symlink (the operator
+ * moved that directory onto another volume and left the recorded path in
+ * place, including a non-ASCII volume name), or the only difference is
+ * Unicode normalization and no component is a symlink (APFS returns the
+ * on-disk NFD entry for an NFC request). A symlink under `persistence/locks`,
+ * or anywhere else, can be retargeted onto a different file and refuses.
+ */
+export function stableCoordinationPath(path: string): boolean {
+  if (!isAbsolute(path) || path.includes('\0')) return false;
+  let canonical: string;
+  try { canonical = canonicalFilesystemPath(path); }
+  catch { return false; }
+  if (canonical === path) return true;
+  const symlinks = symlinkComponents(path);
+  if (symlinks === null) return false;
+  if (symlinks.length === 0) return nfc(canonical) === nfc(path);
+  if (!symlinks.every(component => allowedHomeSymlinks().has(nfc(component)))) return false;
+  return pathUnderPersistence(path);
+}
+/** The refusal for a coordination path {@link stableCoordinationPath} rejects. */
+export function assertStableCoordinationPath(path: string): void {
+  if (stableCoordinationPath(path)) return;
+  let resolved = 'an unreadable location';
+  try { resolved = canonicalFilesystemPath(path); }
+  catch (error) { resolved = `an unreadable location (${(error as NodeJS.ErrnoException).code ?? 'error'})`; }
+  const persistence = persistenceHome();
+  const home = dirname(persistence);
+  const error = physicalRootError(
+    `The coordination lock recorded at ${path} resolves to ${resolved}. Writes are refused because a symlink along that path can point later writers at a different file. `
+    + `The gbrain home (${home}) and its persistence directory (${persistence}) may be symlinks, including a link onto another volume; a symlink inside ${join(persistence, 'locks')} may not. `
+    + 'A spelling difference that is only Unicode normalization is accepted when nothing is a symlink.');
+  error.detail = 'coordination_path_unstable';
+  error.suggestion = `On the brain host, run gbrain doctor (check coordination_lock_location). To keep a moved home, symlink ${home} or ${persistence} and leave ${join(persistence, 'locks')} a real directory. Do not delete the ownership reservation beside the checkout.`;
+  throw error;
+}
 function readReservationRecord(root: string, allowInsideLock = false): PhysicalRootReservation | null {
   const value = readPrivate(physicalRootReservationPath(root)) as PhysicalRootReservation | null;
   if (value === null) return null;
   if (value.version !== 1 || ![value.token,value.brainId,value.worktreeId,value.hostId].every(uuid)
     || value.root !== root || typeof value.coordinationPath !== 'string' || !isAbsolute(value.coordinationPath) || value.coordinationPath.includes('\0')
     || ![value.initialDevice,value.initialInode,value.initialBirth].every(part => part === null || typeof part === 'string' && /^\d+$/.test(part))) throw physicalRootError();
-  if (canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath) throw physicalRootError();
+  assertStableCoordinationPath(value.coordinationPath);
   if (!allowInsideLock && coordinationPathInsideRoot(root, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout. '
     + 'A reservation an older release wrote with its lock inside the checkout (GBRAIN_HOME inside the source root) is repaired by the next claim of this checkout on the host that reserved it; do not delete it.');
   return value;

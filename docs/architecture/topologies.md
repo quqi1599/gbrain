@@ -595,7 +595,10 @@ the first match wins:
    recorded path always wins over the environment, so two processes with
    different settings still lock the same file.
 2. `binding`: on a transfer, the accepting host binding's recorded path, when it
-   is absolute, canonical and outside the successor checkout.
+   is absolute, stable and outside the successor checkout. Stable means the
+   path is its own canonical spelling, or the only symlink on it is the gbrain
+   home or its `persistence` directory, or the only difference is Unicode
+   normalization and nothing is a symlink.
 3. `persistence_home`: `<persistence home>/locks/<worktree id>.lock`
    (`$GBRAIN_HOME/.gbrain/persistence`, else `~/.gbrain/persistence`) when that
    is outside the checkout. This is every ordinary layout.
@@ -627,6 +630,17 @@ to a checkout (rule 4) and names another directory than the recorded lock's,
 lock's directory survive container recreation (mount it), and unset the variable
 for that checkout's processes if it was meant to move the lock. No gbrain command
 relocates a recorded lock yet; never edit or delete the reservation to force one.
+
+Moving `~/.gbrain` (or the directory `GBRAIN_HOME` names) onto another volume
+and leaving a symlink at that path keeps every recorded lock, and so does a
+symlink of only the `persistence` directory. The reservation still names the
+original path; opening it follows the symlink, including when the volume name
+is non-ASCII and the filesystem spells that name in a different Unicode
+normalization. A symlink inside `persistence/locks`, or of the lock file
+itself, is a substituted lock: writes refuse `recovery_required` with detail
+`coordination_path_unstable`, and doctor `coordination_lock_location` names
+the checkout. Leave `persistence/locks` a real directory. A symlink of the
+checkout itself is a different case: `gbrain sources set-path` converges it.
 
 A reservation written before this rule existed, for a checkout that contains
 `GBRAIN_HOME`, records its lock inside the checkout, so every claim refused with
